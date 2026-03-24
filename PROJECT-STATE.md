@@ -2,13 +2,13 @@
 
 **Owner:** Tim (tim@ltvspot.com)
 **Last Updated:** 2026-03-24
-**Status:** Active Development (Prompt 01 Complete)
+**Status:** Active Development (Prompts 01 and 04 Complete)
 
 ---
 
 ## Current State
 
-Prompt 01 is implemented. The project now has a FastAPI scaffold, SQLite schema, pytest coverage for the initial backend surface, and a buildable React frontend shell. The `Formatted Manuscripts/` folder contains 873 manuscript folders, each with DOCX/EPUB/PDF files. Three Qwen3-TTS MLX models (1.7B 8-bit) are downloaded in `models/`.
+Prompts 01 and 04 are implemented. The project now has a FastAPI scaffold, SQLite schema, pytest coverage for the initial backend surface, and a functional React library view with book cards, search, status filtering, sorting, scan refresh, and frontend test coverage. The `Formatted Manuscripts/` folder contains 873 manuscript folders, each with DOCX/EPUB/PDF files. Three Qwen3-TTS MLX models (1.7B 8-bit) are downloaded in `models/`.
 
 ### What Exists
 - `main.py` — Compatibility runner that boots the FastAPI app
@@ -40,7 +40,7 @@ Prompt 01 is implemented. The project now has a FastAPI scaffold, SQLite schema,
 | 01 | Project Scaffolding | COMPLETE | FastAPI + React skeleton, DB schema committed |
 | 02 | DOCX Manuscript Parser | NOT STARTED | Chapter detection, text cleaning |
 | 03 | Parser API Integration | NOT STARTED | REST endpoints for parsing |
-| 04 | Library UI | NOT STARTED | Book grid, search, filter |
+| 04 | Library UI | COMPLETE | Book grid, search, filter, sorting, stats, frontend tests |
 | 05 | Book Detail UI | NOT STARTED | Chapter list, text preview |
 | 06 | TTS Engine + Qwen3 Adapter | NOT STARTED | Abstract interface, MLX adapter |
 | 07 | Voice Lab UI | NOT STARTED | Test voices, A/B compare |
