@@ -344,6 +344,9 @@ async def update_chapter_text(
 ) -> ChapterResponse:
     """Update the stored text for a parsed chapter and refresh its word count."""
 
+    if not request.text_content.strip():
+        raise HTTPException(status_code=400, detail="Chapter text cannot be empty.")
+
     chapter = (
         db.query(Chapter)
         .filter(Chapter.book_id == book_id, Chapter.number == chapter_number)

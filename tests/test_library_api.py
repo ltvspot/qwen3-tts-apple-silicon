@@ -214,6 +214,13 @@ def test_parse_book_flow_and_chapter_updates(
     assert update_response.json()["word_count"] == 8
     assert update_response.json()["text_content"] == "The revised chapter text now has five words."
 
+    blank_update_response = client.put(
+        f"/api/book/{book.id}/chapter/2/text",
+        json={"text_content": "   "},
+    )
+    assert blank_update_response.status_code == 400
+    assert blank_update_response.json() == {"detail": "Chapter text cannot be empty."}
+
     overwrite_response = client.post(f"/api/book/{book.id}/parse", json={"overwrite": True})
     assert overwrite_response.status_code == 200
     assert overwrite_response.json()["chapters_detected"] == 4
