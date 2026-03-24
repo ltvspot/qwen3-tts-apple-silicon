@@ -10,7 +10,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from src.database import Base
+from src.database import Base, get_db
 from src.main import app
 
 
@@ -34,8 +34,13 @@ def test_db() -> Generator[Session, None, None]:
 
 
 @pytest.fixture(scope="function")
-def client() -> Generator[TestClient, None, None]:
+def client(test_db: Session) -> Generator[TestClient, None, None]:
     """Create an application test client."""
 
+    def override_get_db() -> Generator[Session, None, None]:
+        yield test_db
+
+    app.dependency_overrides[get_db] = override_get_db
     with TestClient(app) as test_client:
         yield test_client
+    app.dependency_overrides.clear()

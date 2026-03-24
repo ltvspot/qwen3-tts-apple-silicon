@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import RequestResponseEndpoint
 
 from src import __version__
+from src.api.routes import router as api_router
 from src.api.schemas import HealthCheckResponse
 from src.config import settings
 from src.database import init_db
@@ -65,6 +66,7 @@ app.add_middleware(
     allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["*"],
 )
+app.include_router(api_router)
 
 
 @app.middleware("http")
