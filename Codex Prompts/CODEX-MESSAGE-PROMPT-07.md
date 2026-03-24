@@ -1,0 +1,1 @@
+Read `CLAUDE.md` and `PROJECT-STATE.md` first, then read and implement `Codex Prompts/PROMPT-07-*.md`. Follow all conventions in CLAUDE.md. Commit with message: `[PROMPT-07] VOICE LAB UI`. Run tests before committing.

@@ -1,0 +1,1 @@
+Read `CLAUDE.md` and `PROJECT-STATE.md` first, then read and implement `Codex Prompts/PROMPT-06-*.md`. Follow all conventions in CLAUDE.md. Commit with message: `[PROMPT-06] TTS ENGINE ADAPTER`. Run tests before committing.

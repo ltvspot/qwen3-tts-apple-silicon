@@ -1,0 +1,1 @@
+Read `CLAUDE.md` and `PROJECT-STATE.md` first, then read and implement `Codex Prompts/PROMPT-09-*.md`. Follow all conventions in CLAUDE.md. Commit with message: `[PROMPT-09] GENERATION UI`. Run tests before committing.

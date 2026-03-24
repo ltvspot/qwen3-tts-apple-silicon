@@ -1,0 +1,1 @@
+Read `CLAUDE.md` and `PROJECT-STATE.md` first, then read and implement `Codex Prompts/PROMPT-01-PROJECT-SCAFFOLDING.md`. This is the first prompt in a 16-prompt series to build the Alexandria Audiobook Narrator. Follow all conventions in CLAUDE.md. Commit with message: `[PROMPT-01] Initial project scaffolding — FastAPI + React + SQLite`. Run tests before committing.

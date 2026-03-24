@@ -1,0 +1,1 @@
+Read `CLAUDE.md` and `PROJECT-STATE.md` first, then read and implement `Codex Prompts/PROMPT-12-*.md`. Follow all conventions in CLAUDE.md. Commit with message: `[PROMPT-12] EXPORT PIPELINE`. Run tests before committing.

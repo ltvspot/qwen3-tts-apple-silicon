@@ -1,0 +1,1 @@
+Read `CLAUDE.md` and `PROJECT-STATE.md` first, then read and implement `Codex Prompts/PROMPT-02-*.md`. Follow all conventions in CLAUDE.md. Commit with message: `[PROMPT-02] DOCX PARSER`. Run tests before committing.

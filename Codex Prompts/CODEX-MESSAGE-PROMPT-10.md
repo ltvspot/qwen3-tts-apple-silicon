@@ -1,0 +1,1 @@
+Read `CLAUDE.md` and `PROJECT-STATE.md` first, then read and implement `Codex Prompts/PROMPT-10-*.md`. Follow all conventions in CLAUDE.md. Commit with message: `[PROMPT-10] PRODUCTION QUEUE`. Run tests before committing.
