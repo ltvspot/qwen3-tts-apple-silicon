@@ -7,7 +7,18 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import Generator
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, create_engine
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    create_engine,
+    inspect,
+    text,
+)
 from sqlalchemy import Enum as SqlEnum
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
@@ -56,6 +67,14 @@ class ChapterStatus(str, Enum):
     FAILED = "failed"
 
 
+class BookGenerationStatus(str, Enum):
+    """Real-time generation panel state for a book."""
+
+    IDLE = "idle"
+    GENERATING = "generating"
+    ERROR = "error"
+
+
 class QAStatus(str, Enum):
     """QA review states for a chapter."""
 
@@ -99,6 +118,13 @@ class Book(Base):
         default=utc_now,
         onupdate=utc_now,
     )
+    generation_status: Mapped[BookGenerationStatus] = mapped_column(
+        SqlEnum(BookGenerationStatus, native_enum=False, validate_strings=True),
+        nullable=False,
+        default=BookGenerationStatus.IDLE,
+    )
+    generation_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    generation_eta_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     chapters: Mapped[list["Chapter"]] = relationship(
         back_populates="book",
@@ -139,6 +165,10 @@ class Chapter(Base):
         default=QAStatus.NOT_REVIEWED,
     )
     qa_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    audio_file_size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -188,6 +218,7 @@ class GenerationJob(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    force: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
 
     book: Mapped["Book"] = relationship(back_populates="generation_jobs")
@@ -211,6 +242,41 @@ def init_db() -> None:
 
     logger.info("Initializing database schema.")
     Base.metadata.create_all(bind=engine)
+    _migrate_sqlite_schema()
+
+
+def _migrate_sqlite_schema() -> None:
+    """Apply lightweight additive schema migrations for the local SQLite database."""
+
+    if engine.dialect.name != "sqlite":
+        return
+
+    required_columns = {
+        "books": {
+            "generation_status": "VARCHAR(32) NOT NULL DEFAULT 'idle'",
+            "generation_started_at": "DATETIME",
+            "generation_eta_seconds": "INTEGER",
+        },
+        "chapters": {
+            "started_at": "DATETIME",
+            "completed_at": "DATETIME",
+            "error_message": "TEXT",
+            "audio_file_size_bytes": "INTEGER",
+        },
+        "generation_jobs": {
+            "force": "BOOLEAN NOT NULL DEFAULT 0",
+        },
+    }
+
+    with engine.begin() as connection:
+        inspector = inspect(connection)
+        for table_name, columns in required_columns.items():
+            existing_columns = {column["name"] for column in inspector.get_columns(table_name)}
+            for column_name, ddl in columns.items():
+                if column_name in existing_columns:
+                    continue
+                logger.info("Applying SQLite schema migration: %s.%s", table_name, column_name)
+                connection.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl}"))
 
 
 def get_db() -> Generator[Session, None, None]:

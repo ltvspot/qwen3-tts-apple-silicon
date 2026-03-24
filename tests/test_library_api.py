@@ -119,6 +119,9 @@ def test_scan_library_and_get_library(
                 "chapter_count": 0,
                 "created_at": stored_books[0].created_at.isoformat(),
                 "updated_at": stored_books[0].updated_at.isoformat(),
+                "generation_status": "idle",
+                "generation_started_at": None,
+                "generation_eta_seconds": None,
             },
             {
                 "id": stored_books[1].id,
@@ -133,6 +136,9 @@ def test_scan_library_and_get_library(
                 "chapter_count": 0,
                 "created_at": stored_books[1].created_at.isoformat(),
                 "updated_at": stored_books[1].updated_at.isoformat(),
+                "generation_status": "idle",
+                "generation_started_at": None,
+                "generation_eta_seconds": None,
             },
         ],
         "stats": {

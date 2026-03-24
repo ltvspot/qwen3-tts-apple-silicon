@@ -1,22 +1,33 @@
 import React, { useEffect, useRef, useState } from "react";
+import PropTypes from "prop-types";
+import { formatClock } from "./generationStatus";
 
-const WAVEFORM_BARS = [
+const DEFAULT_WAVEFORM_BARS = [
   28, 42, 56, 34, 62, 46, 30, 54, 68, 38,
   52, 44, 26, 58, 40, 64, 32, 48, 60, 36,
   55, 41, 29, 63, 47, 35, 57, 43, 31, 66,
 ];
 
-function formatTime(seconds) {
-  if (!seconds || Number.isNaN(seconds)) {
-    return "0:00";
+function buildWaveformBars(channelData, barCount = 40) {
+  const bars = [];
+  const blockSize = Math.max(1, Math.floor(channelData.length / barCount));
+
+  for (let index = 0; index < barCount; index += 1) {
+    const start = index * blockSize;
+    const end = Math.min(start + blockSize, channelData.length);
+    let peak = 0;
+
+    for (let cursor = start; cursor < end; cursor += 1) {
+      peak = Math.max(peak, Math.abs(channelData[cursor]));
+    }
+
+    bars.push(Math.max(12, Math.round(peak * 100)));
   }
 
-  const minutes = Math.floor(seconds / 60);
-  const remainder = Math.floor(seconds % 60);
-  return `${minutes}:${String(remainder).padStart(2, "0")}`;
+  return bars;
 }
 
-export default function AudioPlayer({ audioUrl, title, duration = 0 }) {
+export default function AudioPlayer({ audioUrl, duration = 0, title }) {
   const audioRef = useRef(null);
 
   const [audioLoaded, setAudioLoaded] = useState(false);
@@ -24,6 +35,7 @@ export default function AudioPlayer({ audioUrl, title, duration = 0 }) {
   const [currentTime, setCurrentTime] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
   const [resolvedDuration, setResolvedDuration] = useState(0);
+  const [waveformBars, setWaveformBars] = useState(DEFAULT_WAVEFORM_BARS);
 
   useEffect(() => {
     setAudioLoaded(false);
@@ -31,6 +43,49 @@ export default function AudioPlayer({ audioUrl, title, duration = 0 }) {
     setCurrentTime(0);
     setIsPlaying(false);
     setResolvedDuration(0);
+    setWaveformBars(DEFAULT_WAVEFORM_BARS);
+  }, [audioUrl]);
+
+  useEffect(() => {
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) {
+      return undefined;
+    }
+
+    const controller = new AbortController();
+    const audioContext = new AudioContextClass();
+    let cancelled = false;
+
+    async function loadWaveform() {
+      try {
+        const response = await fetch(audioUrl, { signal: controller.signal });
+        if (!response.ok) {
+          throw new Error("Waveform audio fetch failed.");
+        }
+
+        const buffer = await response.arrayBuffer();
+        const decodedBuffer = await audioContext.decodeAudioData(buffer.slice(0));
+        if (cancelled || decodedBuffer.numberOfChannels === 0) {
+          return;
+        }
+
+        setWaveformBars(buildWaveformBars(decodedBuffer.getChannelData(0)));
+      } catch (error) {
+        if (controller.signal.aborted || cancelled) {
+          return;
+        }
+
+        setWaveformBars(DEFAULT_WAVEFORM_BARS);
+      }
+    }
+
+    void loadWaveform();
+
+    return () => {
+      cancelled = true;
+      controller.abort();
+      void audioContext.close().catch(() => {});
+    };
   }, [audioUrl]);
 
   const totalDuration = resolvedDuration || duration || 0;
@@ -48,7 +103,6 @@ export default function AudioPlayer({ audioUrl, title, duration = 0 }) {
         setIsPlaying(true);
       } catch (error) {
         setAudioError("Playback is unavailable in this browser.");
-        console.error("Playback failed:", error);
       }
       return;
     }
@@ -100,8 +154,8 @@ export default function AudioPlayer({ audioUrl, title, duration = 0 }) {
           style={{ width: `${progress}%` }}
         />
         <div className="relative flex h-full items-end gap-[3px]">
-          {WAVEFORM_BARS.map((barHeight, index) => {
-            const completed = (index + 1) / WAVEFORM_BARS.length <= progress / 100;
+          {waveformBars.map((barHeight, index) => {
+            const completed = (index + 1) / waveformBars.length <= progress / 100;
 
             return (
               <div
@@ -142,7 +196,7 @@ export default function AudioPlayer({ audioUrl, title, duration = 0 }) {
               Timeline
             </p>
             <p className="mt-1 font-mono text-sm text-slate-700">
-              {formatTime(currentTime)} / {formatTime(totalDuration)}
+              {formatClock(currentTime)} / {formatClock(totalDuration)}
             </p>
           </div>
         </div>
@@ -186,3 +240,9 @@ export default function AudioPlayer({ audioUrl, title, duration = 0 }) {
     </section>
   );
 }
+
+AudioPlayer.propTypes = {
+  audioUrl: PropTypes.string.isRequired,
+  duration: PropTypes.number,
+  title: PropTypes.string.isRequired,
+};

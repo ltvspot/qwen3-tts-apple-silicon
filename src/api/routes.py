@@ -14,6 +14,7 @@ from src.api.library import LibraryScanner
 from src.config import settings
 from src.database import (
     Book,
+    BookGenerationStatus,
     BookStatus,
     Chapter,
     ChapterStatus,
@@ -43,6 +44,9 @@ class BookResponse(BaseModel):
     chapter_count: int
     created_at: datetime
     updated_at: datetime
+    generation_status: BookGenerationStatus
+    generation_started_at: datetime | None
+    generation_eta_seconds: int | None
 
 
 class ChapterResponse(BaseModel):
@@ -62,6 +66,10 @@ class ChapterResponse(BaseModel):
     duration_seconds: float | None
     qa_status: QAStatus | None
     qa_notes: str | None
+    started_at: datetime | None
+    completed_at: datetime | None
+    error_message: str | None
+    audio_file_size_bytes: int | None
     created_at: datetime
     updated_at: datetime
 
@@ -134,6 +142,9 @@ def _serialize_book(book: Book) -> BookResponse:
         chapter_count=len(book.chapters),
         created_at=book.created_at,
         updated_at=book.updated_at,
+        generation_status=book.generation_status,
+        generation_started_at=book.generation_started_at,
+        generation_eta_seconds=book.generation_eta_seconds,
     )
 
 

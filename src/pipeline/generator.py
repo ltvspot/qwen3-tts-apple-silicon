@@ -12,7 +12,7 @@ from typing import Any
 from sqlalchemy.orm import Session, selectinload
 
 from src.config import settings
-from src.database import Book, BookStatus, Chapter, ChapterStatus, ChapterType
+from src.database import Book, BookGenerationStatus, BookStatus, Chapter, ChapterStatus, ChapterType, utc_now
 from src.engines import AudioStitcher, TTSEngine, TextChunker
 
 logger = logging.getLogger(__name__)
@@ -52,6 +52,7 @@ class AudiobookGenerator:
         db_session: Session,
         progress_callback: Callable[[int, float], Awaitable[None]] | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        force: bool = False,
     ) -> dict[str, Any]:
         """
         Generate all chapters for a parsed book.
@@ -76,6 +77,9 @@ class AudiobookGenerator:
 
         logger.info("Starting generation for book %s with %s chapters", book_id, len(chapters))
         book.status = BookStatus.GENERATING
+        book.generation_status = BookGenerationStatus.GENERATING
+        book.generation_started_at = utc_now()
+        book.generation_eta_seconds = None
         db_session.commit()
 
         errors: list[str] = []
@@ -85,6 +89,11 @@ class AudiobookGenerator:
 
         for chapter_index, chapter in enumerate(chapters):
             self._raise_if_cancelled(should_cancel)
+
+            if chapter.status == ChapterStatus.GENERATED and not force:
+                if progress_callback is not None:
+                    await progress_callback(chapter.number, ((chapter_index + 1) / len(chapters)) * 100)
+                continue
 
             async def chapter_progress_callback(chunk_progress: float) -> None:
                 if progress_callback is None:
@@ -99,6 +108,7 @@ class AudiobookGenerator:
                     db_session,
                     progress_callback=chapter_progress_callback,
                     should_cancel=should_cancel,
+                    force=force,
                 )
                 generated_chapters += 1
 
@@ -106,6 +116,8 @@ class AudiobookGenerator:
                     await progress_callback(chapter.number, ((chapter_index + 1) / len(chapters)) * 100)
             except GenerationCancelled:
                 book.status = BookStatus.PARSED
+                book.generation_status = BookGenerationStatus.IDLE
+                book.generation_eta_seconds = None
                 db_session.commit()
                 raise
             except Exception as exc:
@@ -119,6 +131,10 @@ class AudiobookGenerator:
             final_status = "failed" if generated_chapters == 0 else "partial"
 
         book.status = BookStatus.GENERATED if not failed_chapters else BookStatus.PARSED
+        book.generation_status = (
+            BookGenerationStatus.IDLE if not failed_chapters else BookGenerationStatus.ERROR
+        )
+        book.generation_eta_seconds = 0 if not failed_chapters else None
         db_session.commit()
 
         logger.info(
@@ -146,6 +162,7 @@ class AudiobookGenerator:
         db_session: Session,
         progress_callback: Callable[[float], Awaitable[None]] | None = None,
         should_cancel: Callable[[], bool] | None = None,
+        force: bool = False,
     ) -> float:
         """Generate and persist audio for a single chapter."""
 
@@ -154,6 +171,8 @@ class AudiobookGenerator:
         text_content = (chapter.text_content or "").strip()
         if not text_content:
             raise ValueError(f"Chapter {chapter.number} has no text content")
+        if chapter.status == ChapterStatus.GENERATED and not force:
+            raise ValueError(f"Chapter {chapter.number} already has generated audio")
 
         logger.info(
             "Generating audio for book %s chapter %s (%s words)",
@@ -163,8 +182,9 @@ class AudiobookGenerator:
         )
 
         chapter.status = ChapterStatus.GENERATING
-        chapter.audio_path = None
-        chapter.duration_seconds = None
+        chapter.started_at = utc_now()
+        chapter.completed_at = None
+        chapter.error_message = None
         db_session.commit()
 
         try:
@@ -198,6 +218,8 @@ class AudiobookGenerator:
             chapter.audio_path = str(audio_path.relative_to(self.output_path))
             chapter.duration_seconds = duration
             chapter.status = ChapterStatus.GENERATED
+            chapter.completed_at = utc_now()
+            chapter.audio_file_size_bytes = audio_path.stat().st_size
             db_session.commit()
 
             logger.info(
@@ -211,10 +233,15 @@ class AudiobookGenerator:
             return duration
         except GenerationCancelled:
             chapter.status = ChapterStatus.PENDING
+            chapter.started_at = None
+            chapter.completed_at = None
+            chapter.error_message = None
             db_session.commit()
             raise
-        except Exception:
+        except Exception as exc:
             chapter.status = ChapterStatus.FAILED
+            chapter.completed_at = utc_now()
+            chapter.error_message = str(exc)
             db_session.commit()
             raise
 

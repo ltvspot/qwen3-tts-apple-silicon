@@ -1,27 +1,11 @@
 import React from "react";
-
-const CHAPTER_STATUS_META = {
-  failed: {
-    colorClass: "text-rose-300",
-    icon: "×",
-    tooltip: "Generation failed",
-  },
-  generated: {
-    colorClass: "text-emerald-300",
-    icon: "✓",
-    tooltip: "Audio generated",
-  },
-  generating: {
-    colorClass: "animate-pulse text-sky-300",
-    icon: "◔",
-    tooltip: "Generation in progress",
-  },
-  pending: {
-    colorClass: "text-slate-400",
-    icon: "○",
-    tooltip: "Not started",
-  },
-};
+import PropTypes from "prop-types";
+import {
+  GENERATION_STATUS_META,
+  formatCompactDuration,
+  getChapterLabel,
+  mapChapterGenerationState,
+} from "./generationStatus";
 
 const CHAPTER_QA_META = {
   approved: {
@@ -41,39 +25,19 @@ const CHAPTER_QA_META = {
   },
 };
 
-function formatDuration(durationSeconds) {
-  if (!durationSeconds && durationSeconds !== 0) {
-    return null;
-  }
-
-  const totalSeconds = Math.max(0, Math.round(durationSeconds));
-  const minutes = Math.floor(totalSeconds / 60);
-  const seconds = totalSeconds % 60;
-
-  if (minutes === 0) {
-    return `${seconds}s`;
-  }
-
-  return `${minutes}m ${seconds}s`;
+function chapterActionLabel(status) {
+  return status === "completed" ? "Re-generate" : "Generate This Chapter";
 }
 
-function getChapterLabel(chapter) {
-  if (chapter.type === "opening_credits") {
-    return "Opening Credits";
-  }
-
-  if (chapter.type === "closing_credits") {
-    return "Closing Credits";
-  }
-
-  if (chapter.type === "introduction") {
-    return chapter.title ? `Introduction: ${chapter.title}` : "Introduction";
-  }
-
-  return chapter.title ? `Chapter ${chapter.number}: ${chapter.title}` : `Chapter ${chapter.number}`;
-}
-
-export default function ChapterList({ chapters, onSelectChapter, selectedChapterId }) {
+export default function ChapterList({
+  chapters,
+  generationDisabled = false,
+  loadingChapterNumber = null,
+  onGenerateChapter,
+  onPreviewChapter,
+  onSelectChapter,
+  selectedChapterId = null,
+}) {
   return (
     <section className="flex h-full min-h-[24rem] flex-col overflow-hidden rounded-[2rem] border border-white/10 bg-white/[0.04] shadow-2xl shadow-slate-950/20">
       <div className="border-b border-white/10 bg-slate-950/35 px-5 py-4">
@@ -82,7 +46,7 @@ export default function ChapterList({ chapters, onSelectChapter, selectedChapter
         </div>
         <h2 className="mt-2 text-xl font-semibold text-white">Chapters ({chapters.length})</h2>
         <p className="mt-2 text-sm text-slate-400">
-          Select a segment to review its text and generation settings.
+          Review text, trigger generation, and jump straight into completed audio.
         </p>
       </div>
 
@@ -102,68 +66,117 @@ export default function ChapterList({ chapters, onSelectChapter, selectedChapter
           <ul className="divide-y divide-white/8">
             {chapters.map((chapter) => {
               const isSelected = chapter.id === selectedChapterId;
+              const generationStatus = mapChapterGenerationState(
+                chapter.generation_status ?? chapter.status,
+              );
               const qaMeta = CHAPTER_QA_META[chapter.qa_status ?? "not_reviewed"] ?? CHAPTER_QA_META.not_reviewed;
-              const statusMeta = CHAPTER_STATUS_META[chapter.status ?? "pending"] ?? CHAPTER_STATUS_META.pending;
-              const durationLabel = formatDuration(chapter.duration_seconds);
+              const statusMeta = GENERATION_STATUS_META[generationStatus] ?? GENERATION_STATUS_META.pending;
+              const durationLabel = formatCompactDuration(
+                chapter.audio_duration_seconds ?? chapter.duration_seconds,
+              );
+              const isChapterLoading = loadingChapterNumber === chapter.number;
 
               return (
-                <li key={chapter.id}>
-                  <button
-                    className={`w-full border-l-4 px-4 py-4 text-left transition ${
+                <li key={chapter.id} className="px-4 py-4">
+                  <div
+                    className={`rounded-[1.5rem] border transition ${
                       isSelected
-                        ? "border-amber-300 bg-amber-300/10"
-                        : "border-transparent hover:bg-white/[0.05]"
+                        ? "border-amber-300/35 bg-amber-300/10"
+                        : "border-white/10 bg-slate-950/20 hover:border-white/15 hover:bg-white/[0.05]"
                     }`}
-                    data-chapter-id={chapter.id}
-                    onClick={() => onSelectChapter(chapter)}
-                    type="button"
                   >
-                    <div className="flex items-start gap-3">
-                      <div className="mt-0.5 flex shrink-0 items-center gap-2 rounded-full border border-white/10 bg-slate-950/45 px-2 py-1 text-xs">
-                        <span
-                          aria-label={statusMeta.tooltip}
-                          className={statusMeta.colorClass}
-                          title={statusMeta.tooltip}
-                        >
-                          {statusMeta.icon}
-                        </span>
-                        <span
-                          aria-label={qaMeta.tooltip}
-                          className={qaMeta.colorClass}
-                          title={qaMeta.tooltip}
-                        >
-                          {qaMeta.icon}
-                        </span>
-                      </div>
-
-                      <div className="min-w-0 flex-1">
-                        <div className="flex items-start justify-between gap-3">
-                          <div className="min-w-0">
-                            <div className="truncate text-sm font-semibold text-white">
-                              {getChapterLabel(chapter)}
-                            </div>
-                            <div className="mt-1 text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-500">
-                              {chapter.type.replaceAll("_", " ")}
-                            </div>
-                          </div>
-                          <div className="rounded-full border border-white/10 bg-slate-950/40 px-2 py-1 text-[11px] font-semibold uppercase tracking-[0.22em] text-slate-400">
-                            #{chapter.number}
-                          </div>
-                        </div>
-
-                        <div className="mt-3 flex flex-wrap gap-2 text-xs text-slate-300">
-                          <span className="rounded-full border border-white/10 bg-white/[0.04] px-2 py-1">
-                            {chapter.word_count ?? 0} words
+                    <button
+                      className="w-full px-4 pb-3 pt-4 text-left"
+                      data-chapter-id={chapter.id}
+                      onClick={() => onSelectChapter(chapter)}
+                      type="button"
+                    >
+                      <div className="flex items-start gap-3">
+                        <div className="mt-0.5 flex shrink-0 items-center gap-2 rounded-full border border-white/10 bg-slate-950/45 px-2 py-1 text-xs">
+                          <span
+                            aria-label={statusMeta.tooltip}
+                            className={statusMeta.colorClass}
+                            title={chapter.error_message || statusMeta.tooltip}
+                          >
+                            {statusMeta.icon}
                           </span>
-                          {durationLabel ? (
+                          <span
+                            aria-label={qaMeta.tooltip}
+                            className={qaMeta.colorClass}
+                            title={qaMeta.tooltip}
+                          >
+                            {qaMeta.icon}
+                          </span>
+                        </div>
+
+                        <div className="min-w-0 flex-1">
+                          <div className="flex items-start justify-between gap-3">
+                            <div className="min-w-0">
+                              <div className="truncate text-sm font-semibold text-white">
+                                {getChapterLabel(chapter)}
+                              </div>
+                              <div className="mt-1 text-[11px] font-semibold uppercase tracking-[0.24em] text-slate-500">
+                                {chapter.type.replaceAll("_", " ")}
+                              </div>
+                            </div>
+                            <div className="rounded-full border border-white/10 bg-slate-950/40 px-2 py-1 text-[11px] font-semibold uppercase tracking-[0.22em] text-slate-400">
+                              #{chapter.number}
+                            </div>
+                          </div>
+
+                          <div className="mt-3 flex flex-wrap gap-2 text-xs text-slate-300">
                             <span className="rounded-full border border-white/10 bg-white/[0.04] px-2 py-1">
-                              {durationLabel}
+                              {chapter.word_count ?? 0} words
                             </span>
-                          ) : null}
+                            {durationLabel ? (
+                              <span className="rounded-full border border-white/10 bg-white/[0.04] px-2 py-1">
+                                {durationLabel}
+                              </span>
+                            ) : null}
+                            <span
+                              className={`rounded-full border px-2 py-1 font-semibold ${statusMeta.accentClass}`}
+                              title={chapter.error_message || statusMeta.tooltip}
+                            >
+                              {statusMeta.icon} {statusMeta.label}
+                            </span>
+                          </div>
                         </div>
                       </div>
+                    </button>
+
+                    <div className="flex flex-wrap items-center gap-2 border-t border-white/8 px-4 py-3">
+                      {generationStatus === "completed" ? (
+                        <button
+                          className="inline-flex items-center rounded-full border border-white/10 bg-white/[0.04] px-3 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-slate-200 transition hover:border-sky-300/35 hover:text-sky-100"
+                          onClick={() => onPreviewChapter(chapter)}
+                          type="button"
+                        >
+                          Preview Audio
+                        </button>
+                      ) : null}
+
+                      <button
+                        className="inline-flex items-center gap-2 rounded-full border border-amber-300/25 bg-amber-400/10 px-3 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-amber-100 transition hover:bg-amber-400/20 disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/[0.04] disabled:text-slate-500"
+                        disabled={generationDisabled}
+                        onClick={() => onGenerateChapter(chapter, generationStatus === "completed")}
+                        type="button"
+                      >
+                        {isChapterLoading ? (
+                          <span
+                            aria-hidden="true"
+                            className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-current border-r-transparent"
+                          />
+                        ) : null}
+                        {isChapterLoading ? "Queueing..." : chapterActionLabel(generationStatus)}
+                      </button>
+
+                      {chapter.error_message ? (
+                        <div className="text-xs text-amber-100/85" title={chapter.error_message}>
+                          {chapter.error_message}
+                        </div>
+                      ) : null}
                     </div>
-                  </button>
+                  </div>
                 </li>
               );
             })}
@@ -173,3 +186,26 @@ export default function ChapterList({ chapters, onSelectChapter, selectedChapter
     </section>
   );
 }
+
+ChapterList.propTypes = {
+  chapters: PropTypes.arrayOf(PropTypes.shape({
+    audio_duration_seconds: PropTypes.number,
+    duration_seconds: PropTypes.number,
+    error_message: PropTypes.string,
+    generation_status: PropTypes.string,
+    id: PropTypes.number.isRequired,
+    number: PropTypes.number.isRequired,
+    qa_status: PropTypes.string,
+    status: PropTypes.string,
+    text_content: PropTypes.string,
+    title: PropTypes.string,
+    type: PropTypes.string.isRequired,
+    word_count: PropTypes.number,
+  })).isRequired,
+  generationDisabled: PropTypes.bool,
+  loadingChapterNumber: PropTypes.number,
+  onGenerateChapter: PropTypes.func.isRequired,
+  onPreviewChapter: PropTypes.func.isRequired,
+  onSelectChapter: PropTypes.func.isRequired,
+  selectedChapterId: PropTypes.number,
+};

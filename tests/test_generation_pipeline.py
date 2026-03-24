@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,9 @@ from src.database import (
     Chapter,
     ChapterStatus,
     ChapterType,
+    GenerationJob,
+    GenerationJobStatus,
+    utc_now,
 )
 from src.engines.qwen3_tts import Qwen3TTS
 from src.pipeline.generator import AudiobookGenerator, GenerationCancelled
@@ -72,7 +76,15 @@ def create_chapter(
 class SlowGenerator:
     """A deliberately slow generator stub used to exercise queue cancellation."""
 
-    async def generate_book(self, book_id, db_session, progress_callback=None, should_cancel=None):
+    async def generate_book(
+        self,
+        book_id,
+        db_session,
+        progress_callback=None,
+        should_cancel=None,
+        force=False,
+    ):
+        del force
         for chapter_number in range(1, 5):
             if should_cancel and should_cancel():
                 raise GenerationCancelled("Generation cancelled.")
@@ -95,8 +107,16 @@ class SlowGenerator:
             "errors": [],
         }
 
-    async def generate_chapter(self, book_id, chapter, db_session, progress_callback=None, should_cancel=None):
-        del book_id, db_session
+    async def generate_chapter(
+        self,
+        book_id,
+        chapter,
+        db_session,
+        progress_callback=None,
+        should_cancel=None,
+        force=False,
+    ):
+        del book_id, db_session, force
         for index in range(4):
             if should_cancel and should_cancel():
                 raise GenerationCancelled("Generation cancelled.")
@@ -277,3 +297,148 @@ def test_generation_api_queues_job_tracks_status_and_serves_audio(client, test_d
     assert audio_response.status_code == 200
     assert audio_response.headers["content-type"] == "audio/wav"
     assert chapter.audio_path is not None
+
+
+def test_book_status_endpoint_returns_idle_shape(client, test_db: Session) -> None:
+    """Idle status should include all chapters in prompt-09 polling shape."""
+
+    book = create_book(test_db, title="Idle Status Book")
+    create_chapter(
+        test_db,
+        book_id=book.id,
+        number=0,
+        title="Opening Credits",
+        chapter_type=ChapterType.OPENING_CREDITS,
+        text="Opening credits text.",
+    )
+    create_chapter(
+        test_db,
+        book_id=book.id,
+        number=1,
+        title="Chapter One",
+        chapter_type=ChapterType.CHAPTER,
+        text="Body text for idle polling shape verification.",
+    )
+
+    response = client.get(f"/api/book/{book.id}/status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["book_id"] == book.id
+    assert payload["status"] == "idle"
+    assert payload["current_chapter_n"] is None
+    assert payload["eta_seconds"] is None
+    assert [chapter["status"] for chapter in payload["chapters"]] == ["pending", "pending"]
+    assert payload["chapters"][1]["expected_total_seconds"] == 2.8
+
+
+def test_status_endpoints_return_generating_progress_and_eta(client, test_db: Session) -> None:
+    """Status polling should expose per-chapter progress and ETA using recent completions."""
+
+    book = create_book(test_db, title="Progress Status Book")
+    now = utc_now()
+
+    completed_one = create_chapter(
+        test_db,
+        book_id=book.id,
+        number=0,
+        title="Opening Credits",
+        chapter_type=ChapterType.OPENING_CREDITS,
+        text=("one two three " * 25).strip(),
+    )
+    completed_two = create_chapter(
+        test_db,
+        book_id=book.id,
+        number=1,
+        title="Chapter One",
+        chapter_type=ChapterType.CHAPTER,
+        text=("one two three " * 25).strip(),
+    )
+    generating = create_chapter(
+        test_db,
+        book_id=book.id,
+        number=2,
+        title="Chapter Two",
+        chapter_type=ChapterType.CHAPTER,
+        text=("one two three " * 25).strip(),
+    )
+    create_chapter(
+        test_db,
+        book_id=book.id,
+        number=3,
+        title="Chapter Three",
+        chapter_type=ChapterType.CHAPTER,
+        text=("one two three " * 25).strip(),
+    )
+
+    completed_one.status = ChapterStatus.GENERATED
+    completed_one.started_at = now - timedelta(seconds=120)
+    completed_one.completed_at = now - timedelta(seconds=90)
+    completed_one.duration_seconds = 30.0
+
+    completed_two.status = ChapterStatus.GENERATED
+    completed_two.started_at = now - timedelta(seconds=80)
+    completed_two.completed_at = now - timedelta(seconds=50)
+    completed_two.duration_seconds = 30.0
+
+    generating.status = ChapterStatus.GENERATING
+    generating.started_at = now - timedelta(seconds=10)
+
+    test_db.add(
+        GenerationJob(
+            book_id=book.id,
+            chapter_id=generating.id,
+            status=GenerationJobStatus.RUNNING,
+            progress=50.0,
+            started_at=now - timedelta(seconds=10),
+            force=False,
+        ),
+    )
+    test_db.commit()
+
+    book_status_response = client.get(f"/api/book/{book.id}/status")
+    chapter_status_response = client.get(f"/api/book/{book.id}/chapter/{generating.number}/status")
+
+    assert book_status_response.status_code == 200
+    book_payload = book_status_response.json()
+    assert book_payload["status"] == "generating"
+    assert book_payload["current_chapter_n"] == generating.number
+    assert book_payload["eta_seconds"] == 45
+
+    generating_payload = next(
+        chapter for chapter in book_payload["chapters"] if chapter["chapter_n"] == generating.number
+    )
+    assert generating_payload["status"] == "generating"
+    assert generating_payload["expected_total_seconds"] == 30.0
+    assert generating_payload["progress_seconds"] == 15.0
+
+    assert chapter_status_response.status_code == 200
+    chapter_payload = chapter_status_response.json()
+    assert chapter_payload["status"] == "generating"
+    assert chapter_payload["progress_seconds"] == 15.0
+    assert chapter_payload["expected_total_seconds"] == 30.0
+
+
+def test_status_endpoints_surface_generation_errors(client, test_db: Session) -> None:
+    """Failed chapter state should be surfaced through the new polling endpoints."""
+
+    book = create_book(test_db, title="Error Status Book")
+    failed_chapter = create_chapter(
+        test_db,
+        book_id=book.id,
+        number=1,
+        title="Broken Chapter",
+        chapter_type=ChapterType.CHAPTER,
+        text="This chapter fails in a controlled test.",
+    )
+    failed_chapter.status = ChapterStatus.FAILED
+    failed_chapter.error_message = "Synthetic generation failure."
+    test_db.commit()
+
+    response = client.get(f"/api/book/{book.id}/status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "error"
+    assert payload["chapters"][0]["status"] == "error"
+    assert payload["chapters"][0]["error_message"] == "Synthetic generation failure."

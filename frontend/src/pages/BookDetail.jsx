@@ -1,8 +1,11 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
+import AudioPlayerPanel from "../components/AudioPlayerPanel";
 import ChapterList from "../components/ChapterList";
+import GenerationProgress from "../components/GenerationProgress";
 import NarrationSettings from "../components/NarrationSettings";
 import TextPreview from "../components/TextPreview";
+import { mapChapterGenerationState } from "../components/generationStatus";
 
 const DEFAULT_NARRATION_SETTINGS = {
   voice: "Ethan",
@@ -19,6 +22,28 @@ function chapterHasUnsavedChanges(selectedChapter, draftText, editMode) {
   return draftText !== (selectedChapter.text_content ?? "");
 }
 
+function mergeChaptersWithGeneration(chapters, generationSnapshot) {
+  const statusMap = new Map(
+    (generationSnapshot?.chapters ?? []).map((chapter) => [chapter.chapter_n, chapter]),
+  );
+
+  return chapters.map((chapter) => {
+    const chapterStatus = statusMap.get(chapter.number);
+
+    return {
+      ...chapter,
+      audio_duration_seconds: chapterStatus?.audio_duration_seconds ?? chapter.duration_seconds ?? null,
+      audio_file_size_bytes: chapterStatus?.audio_file_size_bytes ?? chapter.audio_file_size_bytes ?? null,
+      error_message: chapterStatus?.error_message ?? chapter.error_message ?? null,
+      generated_at: chapterStatus?.generated_at ?? chapter.completed_at ?? null,
+      generation_seconds: chapterStatus?.generation_seconds ?? null,
+      generation_status: chapterStatus?.status ?? mapChapterGenerationState(chapter.status),
+      progress_seconds: chapterStatus?.progress_seconds ?? null,
+      started_at: chapterStatus?.started_at ?? chapter.started_at ?? null,
+    };
+  });
+}
+
 export default function BookDetail() {
   const navigate = useNavigate();
   const requestRef = useRef(0);
@@ -26,18 +51,31 @@ export default function BookDetail() {
 
   const [book, setBook] = useState(null);
   const [chapters, setChapters] = useState([]);
-  const [selectedChapterId, setSelectedChapterId] = useState(null);
   const [draftText, setDraftText] = useState("");
   const [editMode, setEditMode] = useState(false);
-  const [loading, setLoading] = useState(true);
-  const [notFound, setNotFound] = useState(false);
-  const [saving, setSaving] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
-  const [saveErrorMessage, setSaveErrorMessage] = useState("");
+  const [generationAction, setGenerationAction] = useState(null);
+  const [generationErrorMessage, setGenerationErrorMessage] = useState("");
+  const [generationSnapshot, setGenerationSnapshot] = useState(null);
+  const [loading, setLoading] = useState(true);
   const [narrationSettings, setNarrationSettings] = useState(DEFAULT_NARRATION_SETTINGS);
+  const [notFound, setNotFound] = useState(false);
+  const [playerChapterNumber, setPlayerChapterNumber] = useState(null);
+  const [playerVisible, setPlayerVisible] = useState(false);
+  const [saveErrorMessage, setSaveErrorMessage] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [selectedChapterId, setSelectedChapterId] = useState(null);
 
-  const selectedChapter = chapters.find((chapter) => chapter.id === selectedChapterId) ?? null;
+  const mergedChapters = useMemo(
+    () => mergeChaptersWithGeneration(chapters, generationSnapshot),
+    [chapters, generationSnapshot],
+  );
+  const selectedChapter = mergedChapters.find((chapter) => chapter.id === selectedChapterId) ?? null;
   const hasUnsavedChanges = chapterHasUnsavedChanges(selectedChapter, draftText, editMode);
+  const completedChapters = mergedChapters.filter((chapter) => chapter.generation_status === "completed");
+  const hasRemainingChapters = mergedChapters.some((chapter) => chapter.generation_status !== "completed");
+  const generationActive = generationAction !== null || generationSnapshot?.status === "generating";
+  const generationDisabled = generationActive;
 
   useEffect(() => {
     if (!editMode) {
@@ -49,6 +87,38 @@ export default function BookDetail() {
     void fetchBookData();
   }, [id]);
 
+  useEffect(() => {
+    if (!generationSnapshot || generationSnapshot.status === "generating") {
+      return;
+    }
+
+    setGenerationAction(null);
+  }, [generationSnapshot]);
+
+  async function fetchGenerationStatus(currentRequestId) {
+    try {
+      const statusResponse = await fetch(`/api/book/${id}/status`);
+      if (!statusResponse.ok) {
+        throw new Error("Failed to fetch generation status.");
+      }
+
+      const statusPayload = await statusResponse.json();
+      if (requestRef.current !== currentRequestId) {
+        return;
+      }
+
+      setGenerationSnapshot(statusPayload);
+      return statusPayload;
+    } catch (error) {
+      if (requestRef.current !== currentRequestId) {
+        return null;
+      }
+
+      setGenerationSnapshot(null);
+      return null;
+    }
+  }
+
   async function fetchBookData() {
     const requestId = requestRef.current + 1;
     requestRef.current = requestId;
@@ -56,12 +126,15 @@ export default function BookDetail() {
     setLoading(true);
     setNotFound(false);
     setErrorMessage("");
-    setSaveErrorMessage("");
+    setGenerationErrorMessage("");
     setBook(null);
     setChapters([]);
     setSelectedChapterId(null);
     setDraftText("");
     setEditMode(false);
+    setGenerationSnapshot(null);
+    setPlayerVisible(false);
+    setPlayerChapterNumber(null);
 
     try {
       const bookResponse = await fetch(`/api/book/${id}`);
@@ -99,6 +172,8 @@ export default function BookDetail() {
         }
         return chaptersPayload[0]?.id ?? null;
       });
+
+      await fetchGenerationStatus(requestId);
     } catch (error) {
       if (requestRef.current !== requestId) {
         return;
@@ -107,7 +182,6 @@ export default function BookDetail() {
       setErrorMessage(
         error instanceof Error ? error.message : "Unable to load this book right now.",
       );
-      console.error("Error fetching book detail:", error);
     } finally {
       if (requestRef.current === requestId) {
         setLoading(false);
@@ -117,6 +191,10 @@ export default function BookDetail() {
 
   function handleChapterSelect(chapter) {
     if (chapter.id === selectedChapterId) {
+      if (chapter.generation_status === "completed") {
+        setPlayerChapterNumber(chapter.number);
+        setPlayerVisible(true);
+      }
       return;
     }
 
@@ -131,6 +209,11 @@ export default function BookDetail() {
     setEditMode(false);
     setSelectedChapterId(chapter.id);
     setDraftText(chapter.text_content ?? "");
+
+    if (chapter.generation_status === "completed") {
+      setPlayerChapterNumber(chapter.number);
+      setPlayerVisible(true);
+    }
   }
 
   function handleBeginEdit() {
@@ -199,10 +282,58 @@ export default function BookDetail() {
       setSaveErrorMessage(
         error instanceof Error ? error.message : "Failed to save chapter text.",
       );
-      console.error("Error saving chapter text:", error);
     } finally {
       setSaving(false);
     }
+  }
+
+  async function queueGeneration(url, nextAction) {
+    setGenerationAction(nextAction);
+    setGenerationErrorMessage("");
+
+    try {
+      const response = await fetch(url, {
+        method: "POST",
+      });
+
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null);
+        const detail = typeof payload?.detail === "string"
+          ? payload.detail
+          : "Failed to queue generation.";
+        throw new Error(detail);
+      }
+
+      const requestId = requestRef.current;
+      const nextSnapshot = await fetchGenerationStatus(requestId);
+      if (nextSnapshot?.status !== "generating") {
+        setGenerationAction(null);
+      }
+    } catch (error) {
+      setGenerationAction(null);
+      setGenerationErrorMessage(
+        error instanceof Error ? error.message : "Failed to queue generation.",
+      );
+    }
+  }
+
+  function handleGenerateChapter(chapter, force) {
+    const search = force ? "?force=true" : "";
+    void queueGeneration(
+      `/api/book/${id}/chapter/${chapter.number}/generate${search}`,
+      { chapterNumber: chapter.number, scope: "chapter" },
+    );
+  }
+
+  function handleGenerateAll() {
+    const shouldContinue = window.confirm(
+      "This will generate all remaining chapters. Continue?",
+    );
+    if (!shouldContinue) {
+      return;
+    }
+
+    void queueGeneration(`/api/book/${id}/generate-all`, { scope: "all" });
   }
 
   function handleNarrationSettingsChange(nextSettings) {
@@ -268,7 +399,7 @@ export default function BookDetail() {
                   {book?.page_count ?? "?"} pages
                 </span>
                 <span className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1 text-slate-300">
-                  {chapters.length} segments
+                  {mergedChapters.length} segments
                 </span>
                 <span className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1 text-slate-300">
                   Narrated by {book?.narrator}
@@ -286,19 +417,52 @@ export default function BookDetail() {
               </p>
             </div>
 
-            <div className="rounded-[1.75rem] border border-white/10 bg-white/[0.05] p-4 text-sm text-slate-300 shadow-xl shadow-slate-950/20 lg:max-w-sm">
-              <div className="text-xs font-semibold uppercase tracking-[0.28em] text-slate-500">
-                Editorial Focus
+            <div className="w-full rounded-[1.75rem] border border-white/10 bg-white/[0.05] p-4 text-sm text-slate-300 shadow-xl shadow-slate-950/20 lg:max-w-md">
+              <div className="flex flex-col gap-4">
+                <div>
+                  <div className="text-xs font-semibold uppercase tracking-[0.28em] text-slate-500">
+                    Generation Controls
+                  </div>
+                  <p className="mt-3 leading-7">
+                    Review parsed chapters, correct manuscript text, and then generate either a single chapter or the remaining audiobook in one pass.
+                  </p>
+                </div>
+
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    className="inline-flex items-center gap-2 rounded-full border border-amber-300/25 bg-amber-400/10 px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-amber-100 transition hover:bg-amber-400/20 disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/[0.04] disabled:text-slate-500"
+                    disabled={generationDisabled || !hasRemainingChapters}
+                    onClick={handleGenerateAll}
+                    type="button"
+                  >
+                    {generationAction?.scope === "all" ? (
+                      <span
+                        aria-hidden="true"
+                        className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-current border-r-transparent"
+                      />
+                    ) : null}
+                    {generationAction?.scope === "all" ? "Queueing..." : "Generate All"}
+                  </button>
+
+                  <div className="inline-flex items-center rounded-full border border-white/10 bg-slate-950/45 px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-slate-300">
+                    {generationSnapshot?.status === "generating"
+                      ? "Generation active"
+                      : hasRemainingChapters
+                        ? "Ready to generate"
+                        : "All chapters complete"}
+                  </div>
+                </div>
               </div>
-              <p className="mt-3 leading-7">
-                Review parsed chapters, correct manuscript text, and tune narration before generation.
-              </p>
             </div>
           </div>
         </div>
       </header>
 
-      <main className="mx-auto max-w-[110rem] px-4 pb-8 pt-6 sm:px-6 lg:px-8">
+      <main
+        className={`mx-auto max-w-[110rem] px-4 pt-6 sm:px-6 lg:px-8 ${
+          playerVisible ? "pb-36" : "pb-8"
+        }`}
+      >
         {errorMessage ? (
           <div className="mb-6 flex flex-col gap-4 rounded-[1.75rem] border border-rose-400/30 bg-rose-500/10 p-4 text-sm text-rose-100 md:flex-row md:items-center md:justify-between">
             <div>
@@ -319,9 +483,43 @@ export default function BookDetail() {
           </div>
         ) : null}
 
-        <div className="grid gap-6 xl:h-[calc(100vh-15rem)] xl:grid-cols-[minmax(18rem,22rem)_minmax(0,1fr)_minmax(18rem,22rem)]">
+        {generationErrorMessage ? (
+          <div className="mb-6 rounded-[1.75rem] border border-amber-300/25 bg-amber-400/10 px-4 py-3 text-sm text-amber-100">
+            {generationErrorMessage}
+          </div>
+        ) : null}
+
+        {generationActive ? (
+          <div className="mb-6">
+            <GenerationProgress
+              active={generationActive}
+              bookId={id}
+              chapters={mergedChapters}
+              onChapterCompleted={(chapterStatus) => {
+                if (!chapterStatus) {
+                  return;
+                }
+
+                setPlayerChapterNumber(chapterStatus.chapter_n);
+                setPlayerVisible(true);
+              }}
+              onStatusUpdate={(nextSnapshot) => {
+                setGenerationSnapshot(nextSnapshot);
+              }}
+            />
+          </div>
+        ) : null}
+
+        <div className="grid gap-6 xl:h-[calc(100vh-15rem)] xl:grid-cols-[minmax(18rem,24rem)_minmax(0,1fr)_minmax(18rem,22rem)]">
           <ChapterList
-            chapters={chapters}
+            chapters={mergedChapters}
+            generationDisabled={generationDisabled}
+            loadingChapterNumber={generationAction?.chapterNumber ?? null}
+            onGenerateChapter={handleGenerateChapter}
+            onPreviewChapter={(chapter) => {
+              setPlayerChapterNumber(chapter.number);
+              setPlayerVisible(true);
+            }}
             onSelectChapter={handleChapterSelect}
             selectedChapterId={selectedChapterId}
           />
@@ -346,6 +544,22 @@ export default function BookDetail() {
           />
         </div>
       </main>
+
+      <AudioPlayerPanel
+        bookId={id}
+        chapterNumber={playerChapterNumber}
+        completedChapters={completedChapters}
+        onClose={() => setPlayerVisible(false)}
+        onSelectChapter={(chapterNumber) => {
+          const chapter = mergedChapters.find((candidate) => candidate.number === chapterNumber);
+          if (chapter) {
+            setSelectedChapterId(chapter.id);
+          }
+          setPlayerChapterNumber(chapterNumber);
+          setPlayerVisible(true);
+        }}
+        visible={playerVisible && completedChapters.length > 0}
+      />
     </div>
   );
 }

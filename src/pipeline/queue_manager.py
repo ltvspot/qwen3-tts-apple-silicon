@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from src.database import (
     Book,
+    BookGenerationStatus,
     BookStatus,
     Chapter,
     ChapterStatus,
@@ -118,7 +119,7 @@ class GenerationQueue:
             self._started = False
             logger.info("Stopped generation queue")
 
-    async def enqueue_book(self, book_id: int, db_session: Session) -> int:
+    async def enqueue_book(self, book_id: int, db_session: Session, *, force: bool = False) -> int:
         """Create and enqueue a full-book generation job."""
 
         self._ensure_started()
@@ -132,8 +133,11 @@ class GenerationQueue:
             chapter_id=None,
             status=GenerationJobStatus.QUEUED,
             progress=0.0,
+            force=force,
         )
         db_session.add(job)
+        book.generation_status = BookGenerationStatus.GENERATING
+        book.generation_eta_seconds = None
         db_session.commit()
         db_session.refresh(job)
 
@@ -143,7 +147,14 @@ class GenerationQueue:
         logger.info("Enqueued book %s as generation job %s", book_id, job.id)
         return job.id
 
-    async def enqueue_chapter(self, book_id: int, chapter_number: int, db_session: Session) -> int:
+    async def enqueue_chapter(
+        self,
+        book_id: int,
+        chapter_number: int,
+        db_session: Session,
+        *,
+        force: bool = False,
+    ) -> int:
         """Create and enqueue a single-chapter generation job."""
 
         self._ensure_started()
@@ -161,8 +172,13 @@ class GenerationQueue:
             chapter_id=chapter.id,
             status=GenerationJobStatus.QUEUED,
             progress=0.0,
+            force=force,
         )
         db_session.add(job)
+        book = db_session.query(Book).filter(Book.id == book_id).first()
+        if book is not None:
+            book.generation_status = BookGenerationStatus.GENERATING
+            book.generation_eta_seconds = None
         db_session.commit()
         db_session.refresh(job)
 
@@ -284,6 +300,11 @@ class GenerationQueue:
             db_job.status = GenerationJobStatus.RUNNING
             db_job.started_at = started_at
             db_job.error_message = None
+            book = db_session.query(Book).filter(Book.id == db_job.book_id).first()
+            if book is not None:
+                book.generation_status = BookGenerationStatus.GENERATING
+                book.generation_started_at = started_at
+                book.generation_eta_seconds = None
             db_session.commit()
 
             self.active_jobs.add(job_id)
@@ -307,6 +328,7 @@ class GenerationQueue:
                     db_session,
                     progress_callback=update_book_progress,
                     should_cancel=cancel_event.is_set,
+                    force=db_job.force,
                 )
                 if result["status"] != "success":
                     raise RuntimeError("; ".join(result["errors"]) or "Generation completed with failures.")
@@ -321,6 +343,7 @@ class GenerationQueue:
                     db_session,
                     progress_callback=update_chapter_progress,
                     should_cancel=cancel_event.is_set,
+                    force=db_job.force,
                 )
                 self._update_book_status_after_single_chapter(db_job.book_id, db_session)
 
@@ -348,8 +371,11 @@ class GenerationQueue:
             db_job.completed_at = completed_at
 
             book = db_session.query(Book).filter(Book.id == db_job.book_id).first()
-            if book is not None and book.status == BookStatus.GENERATING:
-                book.status = BookStatus.PARSED
+            if book is not None:
+                if book.status == BookStatus.GENERATING:
+                    book.status = BookStatus.PARSED
+                book.generation_status = BookGenerationStatus.ERROR
+                book.generation_eta_seconds = None
 
             db_session.commit()
             logger.error("Generation job %s failed: %s", job_id, exc)
@@ -373,8 +399,11 @@ class GenerationQueue:
         db_job.completed_at = completed_at
 
         book = db_session.query(Book).filter(Book.id == db_job.book_id).first()
-        if book is not None and book.status == BookStatus.GENERATING:
-            book.status = BookStatus.PARSED
+        if book is not None:
+            if book.status == BookStatus.GENERATING:
+                book.status = BookStatus.PARSED
+            book.generation_status = BookGenerationStatus.IDLE
+            book.generation_eta_seconds = None
 
         if db_job.chapter_id is not None:
             chapter = db_session.query(Chapter).filter(Chapter.id == db_job.chapter_id).first()
@@ -394,4 +423,9 @@ class GenerationQueue:
         chapters = db_session.query(Chapter).filter(Chapter.book_id == book_id).all()
         if chapters and all(chapter.status == ChapterStatus.GENERATED for chapter in chapters):
             book.status = BookStatus.GENERATED
-            db_session.commit()
+        elif book.status == BookStatus.GENERATING:
+            book.status = BookStatus.PARSED
+
+        book.generation_status = BookGenerationStatus.IDLE
+        book.generation_eta_seconds = 0
+        db_session.commit()
