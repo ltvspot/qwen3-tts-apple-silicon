@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import RequestResponseEndpoint
 
 from src import __version__
+from src.api.voice_lab import release_engine, router as voice_lab_router
 from src.api.routes import router as api_router
 from src.api.schemas import HealthCheckResponse
 from src.config import settings
@@ -56,6 +57,7 @@ async def lifespan(_: FastAPI):
     ensure_runtime_directories()
     init_db()
     yield
+    release_engine()
 
 
 app = FastAPI(title="Alexandria Audiobook Narrator", version=__version__, lifespan=lifespan)
@@ -67,6 +69,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(api_router)
+app.include_router(voice_lab_router)
 
 
 @app.middleware("http")

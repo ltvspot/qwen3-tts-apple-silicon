@@ -1,0 +1,441 @@
+"""Qwen3-TTS adapter with MLX and synthetic test backends."""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+from pydub.audio_segment import AudioSegment
+from pydub.generators import Sine
+
+from src.config import settings
+from src.engines.base import AudioGenerationConfig, TTSEngine, Voice
+
+logger = logging.getLogger(__name__)
+
+MODEL_DIR_NAME = "Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit"
+BASE_MODEL_DIR_NAME = "Qwen3-TTS-12Hz-1.7B-Base-8bit"
+DEFAULT_SAMPLE_RATE = 22050
+VOICE_PRESETS: dict[str, dict[str, str]] = {
+    "Ethan": {
+        "speaker": "aiden",
+        "description": "Default audiobook narration mapped to Qwen speaker Aiden.",
+    },
+    "Nova": {
+        "speaker": "ryan",
+        "description": "Clean contemporary narration mapped to Qwen speaker Ryan.",
+    },
+    "Aria": {
+        "speaker": "vivian",
+        "description": "Warm expressive narration mapped to Qwen speaker Vivian.",
+    },
+    "Leo": {
+        "speaker": "uncle_fu",
+        "description": "Lower-register narration mapped to Qwen speaker Uncle_Fu.",
+    },
+}
+EMOTION_INSTRUCTIONS: dict[str, str] = {
+    "warm": "Warm, reassuring audiobook narration with gentle energy.",
+    "dramatic": "Dramatic audiobook narration with tension and controlled intensity.",
+    "energetic": "Energetic, upbeat narration with a lively cadence.",
+    "contemplative": "Reflective, thoughtful narration with measured pacing.",
+    "authoritative": "Confident, authoritative narration with clear emphasis.",
+    "emotional": "Emotionally rich narration that feels intimate and human.",
+}
+SYNTHETIC_VOICE_FREQUENCIES: dict[str, int] = {
+    "Ethan": 190,
+    "Nova": 220,
+    "Aria": 250,
+    "Leo": 175,
+}
+
+
+class Qwen3TTS(TTSEngine):
+    """TTS engine adapter for the local Qwen3-TTS MLX model family."""
+
+    def __init__(self, model_path: str | Path | None = None, backend: str | None = None) -> None:
+        """
+        Initialize the adapter.
+
+        ``backend`` accepts ``mlx``, ``synthetic``, or ``auto``. ``auto`` uses
+        the synthetic backend under pytest and the MLX backend otherwise.
+        """
+
+        configured_path = Path(model_path or settings.MODELS_PATH)
+        self.model_path = configured_path if (configured_path / "config.json").exists() else configured_path / MODEL_DIR_NAME
+        self.base_model_path = self.model_path.parent / BASE_MODEL_DIR_NAME
+        self.backend = (backend or settings.TTS_BACKEND).strip().lower()
+        self.model: Any | None = None
+        self.base_model: Any | None = None
+        self.loaded = False
+        self.sample_rate = DEFAULT_SAMPLE_RATE
+        self._resolved_backend: str | None = None
+        self._supported_speakers: set[str] = set()
+        self._cloned_voices: dict[str, dict[str, str]] = {}
+
+    @property
+    def name(self) -> str:
+        """Return the stable engine identifier."""
+
+        return "qwen3_tts"
+
+    @property
+    def max_chunk_chars(self) -> int:
+        """Return a conservative max chunk size for stable generation."""
+
+        return 500
+
+    @property
+    def supports_emotion(self) -> bool:
+        """CustomVoice models support style instructions."""
+
+        return True
+
+    @property
+    def supports_cloning(self) -> bool:
+        """Qwen3-TTS supports voice cloning through its Base model family."""
+
+        return True
+
+    def load(self) -> None:
+        """Load or prepare the engine backend."""
+
+        if self.loaded:
+            return
+
+        if not self.model_path.exists():
+            raise RuntimeError(
+                f"Model not found at {self.model_path}. "
+                "Please download Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit."
+            )
+
+        self._supported_speakers = set(self._discover_supported_speakers())
+        self._resolved_backend = self._resolve_backend()
+
+        if self._resolved_backend == "synthetic":
+            logger.info("Using synthetic Qwen3-TTS backend for test-friendly audio generation")
+            self.sample_rate = DEFAULT_SAMPLE_RATE
+            self.loaded = True
+            return
+
+        self.model = self._load_mlx_model(self.model_path)
+        self.sample_rate = int(getattr(self.model, "sample_rate", DEFAULT_SAMPLE_RATE))
+        model_speakers = getattr(self.model, "supported_speakers", None)
+        if model_speakers:
+            self._supported_speakers = {str(speaker).lower() for speaker in model_speakers}
+        self.loaded = True
+        logger.info("Loaded Qwen3-TTS model from %s", self.model_path)
+
+    def unload(self) -> None:
+        """Unload any loaded MLX models and clear transient voice state."""
+
+        self.model = None
+        self.base_model = None
+        self._cloned_voices.clear()
+        self.loaded = False
+        self._resolved_backend = None
+        self.sample_rate = DEFAULT_SAMPLE_RATE
+        logger.info("Qwen3-TTS engine unloaded")
+
+    def list_voices(self) -> list[Voice]:
+        """Return app-facing voice presets and any runtime cloned voices."""
+
+        voices = [
+            Voice(name=name, description=profile["description"])
+            for name, profile in VOICE_PRESETS.items()
+        ]
+        for clone_name in sorted(self._cloned_voices):
+            voices.append(
+                Voice(
+                    name=clone_name,
+                    description="Cloned runtime voice from a reference sample.",
+                )
+            )
+        return voices
+
+    def generate(
+        self,
+        text: str,
+        voice: str,
+        emotion: str | None = None,
+        speed: float = 1.0,
+    ) -> AudioSegment:
+        """Generate audio for the provided text, voice, emotion, and speed."""
+
+        if not self.loaded:
+            raise RuntimeError("Model not loaded. Call load() first.")
+
+        cleaned_text = text.strip()
+        if not cleaned_text:
+            raise ValueError("Text cannot be empty.")
+        if not 0.8 <= speed <= 1.3:
+            raise ValueError("Speed must be between 0.8 and 1.3.")
+
+        config = AudioGenerationConfig(
+            text=cleaned_text,
+            voice=voice,
+            emotion=emotion,
+            speed=speed,
+            sample_rate=self.sample_rate,
+        )
+        voice_kind, resolved_voice = self._resolve_voice(voice)
+
+        if self._resolved_backend == "synthetic":
+            audio = self._generate_synthetic_audio(config, resolved_voice)
+        elif voice_kind == "clone":
+            audio = self._generate_cloned_audio(config, resolved_voice)
+        else:
+            audio = self._generate_mlx_audio(config, resolved_voice)
+
+        audio = audio.set_channels(1)
+        audio = self._normalize_audio(audio)
+        return audio
+
+    def estimate_duration(self, text: str, speed: float = 1.0) -> float:
+        """Estimate narration duration using a simple words-per-second heuristic."""
+
+        if speed <= 0:
+            raise ValueError("Speed must be greater than zero.")
+        word_count = len(text.split())
+        base_words_per_second = 2.6
+        estimated = word_count / base_words_per_second if word_count else 0.0
+        return estimated / speed
+
+    def clone_voice(self, ref_audio_path: str, transcript: str, output_voice_name: str) -> str:
+        """Register a reference sample for later voice-cloned generation."""
+
+        ref_path = Path(ref_audio_path)
+        if not ref_path.exists():
+            raise ValueError(f"Reference audio not found: {ref_audio_path}")
+
+        cleaned_transcript = transcript.strip()
+        if not cleaned_transcript:
+            raise ValueError("Transcript cannot be empty.")
+
+        cleaned_name = output_voice_name.strip()
+        if not cleaned_name:
+            raise ValueError("Output voice name cannot be empty.")
+
+        self._cloned_voices[cleaned_name] = {
+            "ref_audio_path": str(ref_path),
+            "transcript": cleaned_transcript,
+        }
+        logger.info("Registered cloned voice '%s' using %s", cleaned_name, ref_path)
+        return cleaned_name
+
+    def _resolve_backend(self) -> str:
+        """Resolve the backend mode for the current runtime."""
+
+        if self.backend in {"mlx", "synthetic"}:
+            return self.backend
+        if self.backend != "auto":
+            raise RuntimeError(f"Unsupported TTS backend: {self.backend}")
+        return "synthetic" if os.environ.get("PYTEST_CURRENT_TEST") else "mlx"
+
+    def _discover_supported_speakers(self) -> list[str]:
+        """Read the shipped model config to discover supported speaker IDs."""
+
+        config_path = self.model_path / "config.json"
+        if not config_path.exists():
+            return [profile["speaker"] for profile in VOICE_PRESETS.values()]
+
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            logger.warning("Unable to parse model config at %s", config_path)
+            return [profile["speaker"] for profile in VOICE_PRESETS.values()]
+
+        spk_id = config.get("talker_config", {}).get("spk_id") or {}
+        return [str(speaker).lower() for speaker in spk_id]
+
+    def _load_mlx_model(self, path: Path) -> Any:
+        """Load an MLX model instance from disk."""
+
+        try:
+            from mlx_audio.tts.utils import load_model
+        except ImportError as exc:
+            raise RuntimeError(
+                "mlx-audio is not installed. Install it with `pip install -U mlx-audio`."
+            ) from exc
+
+        return load_model(path, lazy=True)
+
+    def _ensure_base_model_loaded(self) -> Any:
+        """Load the Base model on demand for voice-cloned synthesis."""
+
+        if self.base_model is not None:
+            return self.base_model
+
+        if not self.base_model_path.exists():
+            raise RuntimeError(
+                f"Base model not found at {self.base_model_path}. "
+                "Voice cloning requires Qwen3-TTS-12Hz-1.7B-Base-8bit."
+            )
+
+        self.base_model = self._load_mlx_model(self.base_model_path)
+        return self.base_model
+
+    def _resolve_voice(self, voice: str) -> tuple[str, str]:
+        """Resolve a request voice into either a preset speaker or a registered clone."""
+
+        normalized = voice.strip()
+        if not normalized:
+            raise ValueError("Voice cannot be empty.")
+
+        clone_match = next(
+            (clone_name for clone_name in self._cloned_voices if clone_name.lower() == normalized.lower()),
+            None,
+        )
+        if clone_match is not None:
+            return ("clone", clone_match)
+
+        for alias, profile in VOICE_PRESETS.items():
+            if alias.lower() == normalized.lower():
+                return ("speaker", profile["speaker"])
+
+        supported_lookup = {speaker.lower(): speaker for speaker in self._supported_speakers}
+        if normalized.lower() in supported_lookup:
+            return ("speaker", supported_lookup[normalized.lower()])
+
+        available = ", ".join(voice_option.name for voice_option in self.list_voices())
+        raise ValueError(f"Unknown voice: {voice}. Available voices: {available}")
+
+    def _generate_mlx_audio(self, config: AudioGenerationConfig, speaker: str) -> AudioSegment:
+        """Generate real audio using the CustomVoice MLX model."""
+
+        if self.model is None:
+            raise RuntimeError("Qwen3-TTS model is not available.")
+
+        try:
+            results = list(
+                self.model.generate(
+                    text=config.text,
+                    voice=speaker,
+                    instruct=self._emotion_instruction(config.emotion),
+                    speed=1.0,
+                    lang_code="english",
+                    verbose=False,
+                )
+            )
+        except Exception as exc:
+            logger.exception("MLX generation failed")
+            raise RuntimeError(f"Qwen3-TTS generation failed: {exc}") from exc
+
+        if not results:
+            raise RuntimeError("Qwen3-TTS generation returned no audio.")
+
+        return self._results_to_audio_segment(results, config.speed)
+
+    def _generate_cloned_audio(self, config: AudioGenerationConfig, clone_name: str) -> AudioSegment:
+        """Generate audio using the Base model and a stored voice reference."""
+
+        clone_config = self._cloned_voices[clone_name]
+        model = self._ensure_base_model_loaded()
+
+        try:
+            results = list(
+                model.generate(
+                    text=config.text,
+                    speed=1.0,
+                    lang_code="english",
+                    ref_audio=clone_config["ref_audio_path"],
+                    ref_text=clone_config["transcript"],
+                    verbose=False,
+                )
+            )
+        except Exception as exc:
+            logger.exception("Cloned voice generation failed")
+            raise RuntimeError(f"Qwen3-TTS cloned voice generation failed: {exc}") from exc
+
+        if not results:
+            raise RuntimeError("Qwen3-TTS cloned voice generation returned no audio.")
+
+        return self._results_to_audio_segment(results, config.speed)
+
+    def _results_to_audio_segment(self, results: list[Any], speed: float) -> AudioSegment:
+        """Convert MLX generation results into a single AudioSegment."""
+
+        sample_rate = int(getattr(results[0], "sample_rate", self.sample_rate))
+        audio_arrays = [np.asarray(result.audio, dtype=np.float32).reshape(-1) for result in results]
+        waveform = np.concatenate(audio_arrays, axis=0)
+        audio = self._float_audio_to_segment(waveform, sample_rate)
+        if speed != 1.0:
+            audio = self._apply_speed(audio, speed)
+        return audio
+
+    def _generate_synthetic_audio(self, config: AudioGenerationConfig, resolved_voice: str) -> AudioSegment:
+        """Generate a deterministic tone-backed segment for fast local tests."""
+
+        alias = self._canonical_voice_alias(config.voice)
+        frequency = SYNTHETIC_VOICE_FREQUENCIES.get(alias or resolved_voice.title(), 200)
+        duration_ms = max(
+            350,
+            int(
+                self.estimate_duration(
+                    self._enhance_prompt(config.text, config.emotion),
+                    speed=1.0,
+                )
+                * 1000
+            ),
+        )
+        audio = Sine(frequency).to_audio_segment(duration=duration_ms, volume=-14.0)
+        audio = audio.fade_in(12).fade_out(20).set_frame_rate(config.sample_rate).set_channels(1)
+        if config.speed != 1.0:
+            audio = self._apply_speed(audio, config.speed)
+        return audio
+
+    def _canonical_voice_alias(self, requested_voice: str) -> str | None:
+        """Return the configured alias for a voice request when one exists."""
+
+        normalized = requested_voice.strip().lower()
+        for alias in VOICE_PRESETS:
+            if alias.lower() == normalized:
+                return alias
+        return None
+
+    def _emotion_instruction(self, emotion: str | None) -> str | None:
+        """Translate the UI emotion label into a Qwen style instruction."""
+
+        if emotion is None or emotion.strip().lower() == "neutral":
+            return None
+        return EMOTION_INSTRUCTIONS.get(emotion.strip().lower(), emotion.strip())
+
+    def _enhance_prompt(self, text: str, emotion: str | None) -> str:
+        """Return a prompt-like representation used by the synthetic backend."""
+
+        instruction = self._emotion_instruction(emotion)
+        if instruction is None:
+            return text
+        return f"[{instruction}] {text}"
+
+    def _apply_speed(self, audio: AudioSegment, speed: float) -> AudioSegment:
+        """Apply a simple speed adjustment by changing playback rate."""
+
+        if speed == 1.0:
+            return audio
+        adjusted = audio._spawn(audio.raw_data, overrides={"frame_rate": int(audio.frame_rate * speed)})
+        return adjusted.set_frame_rate(audio.frame_rate)
+
+    def _normalize_audio(self, audio: AudioSegment) -> AudioSegment:
+        """Normalize audio toward a consistent output level."""
+
+        if audio.dBFS == float("-inf"):
+            return audio
+        target_dbfs = -18.0
+        return audio.apply_gain(target_dbfs - audio.dBFS)
+
+    def _float_audio_to_segment(self, waveform: np.ndarray, sample_rate: int) -> AudioSegment:
+        """Convert a float waveform in [-1, 1] to a mono 16-bit AudioSegment."""
+
+        clipped = np.clip(waveform, -1.0, 1.0)
+        int_samples = (clipped * np.iinfo(np.int16).max).astype(np.int16)
+        return AudioSegment(
+            data=int_samples.tobytes(),
+            sample_width=2,
+            frame_rate=sample_rate,
+            channels=1,
+        )

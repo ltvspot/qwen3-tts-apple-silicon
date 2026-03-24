@@ -13,6 +13,7 @@ class Settings(BaseSettings):
     MODELS_PATH: str = "./models/"
     FRONTEND_URL: str = "http://localhost:3000"
     TTS_ENGINE: str = "qwen3_tts"
+    TTS_BACKEND: str = "auto"
     NARRATOR_NAME: str = "Kent Zimering"
     LOG_LEVEL: str = "INFO"
 
