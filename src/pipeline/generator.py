@@ -53,6 +53,9 @@ class AudiobookGenerator:
         progress_callback: Callable[[int, float], Awaitable[None]] | None = None,
         should_cancel: Callable[[], bool] | None = None,
         force: bool = False,
+        voice_name: str = "Ethan",
+        emotion: str | None = None,
+        speed: float = 1.0,
     ) -> dict[str, Any]:
         """
         Generate all chapters for a parsed book.
@@ -109,6 +112,9 @@ class AudiobookGenerator:
                     progress_callback=chapter_progress_callback,
                     should_cancel=should_cancel,
                     force=force,
+                    voice_name=voice_name,
+                    emotion=emotion,
+                    speed=speed,
                 )
                 generated_chapters += 1
 
@@ -163,6 +169,9 @@ class AudiobookGenerator:
         progress_callback: Callable[[float], Awaitable[None]] | None = None,
         should_cancel: Callable[[], bool] | None = None,
         force: bool = False,
+        voice_name: str = "Ethan",
+        emotion: str | None = None,
+        speed: float = 1.0,
     ) -> float:
         """Generate and persist audio for a single chapter."""
 
@@ -190,7 +199,7 @@ class AudiobookGenerator:
         try:
             chunks = TextChunker.chunk_text(text_content, self.engine.max_chunk_chars)
             audio_chunks = []
-            speed = self._chapter_speed(chapter)
+            chapter_speed = speed * self._chapter_speed(chapter)
 
             for chunk_index, chunk in enumerate(chunks):
                 self._raise_if_cancelled(should_cancel)
@@ -198,9 +207,9 @@ class AudiobookGenerator:
                 audio = await asyncio.to_thread(
                     self.engine.generate,
                     chunk,
-                    "Ethan",
-                    None,
-                    speed,
+                    voice_name,
+                    emotion,
+                    chapter_speed,
                 )
                 audio_chunks.append(audio)
 

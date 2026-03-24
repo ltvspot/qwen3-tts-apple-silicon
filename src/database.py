@@ -88,9 +88,18 @@ class GenerationJobStatus(str, Enum):
 
     QUEUED = "queued"
     RUNNING = "running"
+    PAUSED = "paused"
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
+
+class GenerationJobType(str, Enum):
+    """Supported generation job scopes."""
+
+    SINGLE_CHAPTER = "single_chapter"
+    FULL_BOOK = "full_book"
+    BATCH_ALL = "batch_all"
 
 
 class Book(Base):
@@ -125,6 +134,7 @@ class Book(Base):
     )
     generation_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     generation_eta_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    current_job_id: Mapped[int | None] = mapped_column(ForeignKey("generation_jobs.id"), nullable=True)
 
     chapters: Mapped[list["Chapter"]] = relationship(
         back_populates="book",
@@ -134,6 +144,11 @@ class Book(Base):
     generation_jobs: Mapped[list["GenerationJob"]] = relationship(
         back_populates="book",
         cascade="all, delete-orphan",
+        foreign_keys="GenerationJob.book_id",
+    )
+    current_job: Mapped["GenerationJob | None"] = relationship(
+        foreign_keys=[current_job_id],
+        post_update=True,
     )
 
 
@@ -210,19 +225,59 @@ class GenerationJob(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     book_id: Mapped[int] = mapped_column(ForeignKey("books.id"), nullable=False, index=True)
     chapter_id: Mapped[int | None] = mapped_column(ForeignKey("chapters.id"), nullable=True, index=True)
+    job_type: Mapped[GenerationJobType] = mapped_column(
+        SqlEnum(GenerationJobType, native_enum=False, validate_strings=True),
+        nullable=False,
+        default=GenerationJobType.FULL_BOOK,
+    )
     status: Mapped[GenerationJobStatus] = mapped_column(
         SqlEnum(GenerationJobStatus, native_enum=False, validate_strings=True),
         nullable=False,
     )
     progress: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    current_chapter_progress: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    chapters_total: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    chapters_completed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    chapters_failed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    current_chapter_n: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    paused_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    eta_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    avg_seconds_per_chapter: Mapped[float | None] = mapped_column(Float, nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     force: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    voice_name: Mapped[str] = mapped_column(String(255), nullable=False, default="Ethan")
+    emotion: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    speed: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    pause_requested: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    cancel_requested: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
 
-    book: Mapped["Book"] = relationship(back_populates="generation_jobs")
+    book: Mapped["Book"] = relationship(back_populates="generation_jobs", foreign_keys=[book_id])
     chapter: Mapped[Chapter | None] = relationship(back_populates="generation_jobs")
+    history_entries: Mapped[list["JobHistory"]] = relationship(
+        back_populates="job",
+        cascade="all, delete-orphan",
+        order_by="JobHistory.timestamp",
+    )
+
+
+class JobHistory(Base):
+    """Audit trail for queue control actions."""
+
+    __tablename__ = "job_history"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    job_id: Mapped[int] = mapped_column(ForeignKey("generation_jobs.id"), nullable=False, index=True)
+    book_id: Mapped[int] = mapped_column(ForeignKey("books.id"), nullable=False, index=True)
+    action: Mapped[str] = mapped_column(String(64), nullable=False)
+    details: Mapped[str | None] = mapped_column(Text, nullable=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+
+    job: Mapped["GenerationJob"] = relationship(back_populates="history_entries")
+    book: Mapped["Book"] = relationship()
 
 
 def _sqlite_connect_args(database_url: str) -> dict[str, bool]:
@@ -256,6 +311,7 @@ def _migrate_sqlite_schema() -> None:
             "generation_status": "VARCHAR(32) NOT NULL DEFAULT 'idle'",
             "generation_started_at": "DATETIME",
             "generation_eta_seconds": "INTEGER",
+            "current_job_id": "INTEGER",
         },
         "chapters": {
             "started_at": "DATETIME",
@@ -264,7 +320,22 @@ def _migrate_sqlite_schema() -> None:
             "audio_file_size_bytes": "INTEGER",
         },
         "generation_jobs": {
+            "job_type": "VARCHAR(32) NOT NULL DEFAULT 'full_book'",
+            "current_chapter_progress": "FLOAT NOT NULL DEFAULT 0.0",
+            "chapters_total": "INTEGER NOT NULL DEFAULT 1",
+            "chapters_completed": "INTEGER NOT NULL DEFAULT 0",
+            "chapters_failed": "INTEGER NOT NULL DEFAULT 0",
+            "current_chapter_n": "INTEGER",
+            "priority": "INTEGER NOT NULL DEFAULT 0",
+            "paused_at": "DATETIME",
+            "eta_seconds": "INTEGER",
+            "avg_seconds_per_chapter": "FLOAT",
             "force": "BOOLEAN NOT NULL DEFAULT 0",
+            "voice_name": "VARCHAR(255) NOT NULL DEFAULT 'Ethan'",
+            "emotion": "VARCHAR(100)",
+            "speed": "FLOAT NOT NULL DEFAULT 1.0",
+            "pause_requested": "BOOLEAN NOT NULL DEFAULT 0",
+            "cancel_requested": "BOOLEAN NOT NULL DEFAULT 0",
         },
     }
 

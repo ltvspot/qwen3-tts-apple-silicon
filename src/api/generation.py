@@ -8,10 +8,11 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, ConfigDict
-from sqlalchemy.orm import Session, sessionmaker
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
 from src.config import settings
+from src.api.generation_runtime import ensure_queue_started, get_queue
 from src.database import (
     Book,
     BookGenerationStatus,
@@ -22,9 +23,7 @@ from src.database import (
     GenerationJobStatus,
     get_db,
 )
-from src.engines.qwen3_tts import Qwen3TTS
-from src.pipeline.generator import AudiobookGenerator
-from src.pipeline.queue_manager import GenerationQueue, JobInfo
+from src.pipeline.queue_manager import JobInfo
 
 logger = logging.getLogger(__name__)
 
@@ -34,10 +33,6 @@ ACTIVE_JOB_STATUSES = (
     GenerationJobStatus.QUEUED,
     GenerationJobStatus.RUNNING,
 )
-
-_generator: AudiobookGenerator | None = None
-_queue: GenerationQueue | None = None
-
 
 class QueueJobResponse(BaseModel):
     """Response returned when a generation job is queued."""
@@ -92,53 +87,6 @@ class BookGenerationStatusResponse(BaseModel):
     current_chapter_n: int | None = None
     eta_seconds: int | None = None
     started_at: datetime | None = None
-
-
-def get_generator() -> AudiobookGenerator:
-    """Return the lazily constructed audiobook generator singleton."""
-
-    global _generator
-    if _generator is None:
-        _generator = AudiobookGenerator(Qwen3TTS())
-    return _generator
-
-
-def get_queue() -> GenerationQueue:
-    """Return the process-local generation queue singleton."""
-
-    global _queue
-    if _queue is None:
-        _queue = GenerationQueue(max_workers=1)
-    return _queue
-
-
-async def ensure_queue_started(db: Session) -> GenerationQueue:
-    """Start the generation queue using the current session bind when needed."""
-
-    queue = get_queue()
-    session_factory = sessionmaker(
-        bind=db.get_bind(),
-        autoflush=False,
-        autocommit=False,
-        expire_on_commit=False,
-    )
-    await queue.start(session_factory, get_generator())
-    return queue
-
-
-async def shutdown_generation_runtime() -> None:
-    """Stop queue workers and release the cached generator."""
-
-    global _generator, _queue
-
-    if _queue is not None:
-        await _queue.stop()
-        _queue = None
-
-    if _generator is not None:
-        _generator.close()
-        _generator = None
-
 
 def _serialize_job(job: JobInfo) -> JobStatusResponse:
     """Convert in-memory queue job state into an API response model."""

@@ -12,6 +12,7 @@ from src.database import (
     ChapterType,
     GenerationJob,
     GenerationJobStatus,
+    JobHistory,
     VoicePreset,
 )
 
@@ -24,6 +25,7 @@ def test_database_schema_and_basic_crud(test_db: Session) -> None:
         "books",
         "chapters",
         "generation_jobs",
+        "job_history",
         "voice_presets",
     }
 
@@ -65,11 +67,22 @@ def test_database_schema_and_basic_crud(test_db: Session) -> None:
     )
     test_db.add(generation_job)
     test_db.commit()
+    test_db.refresh(generation_job)
+
+    history_entry = JobHistory(
+        job_id=generation_job.id,
+        book_id=book.id,
+        action="queued",
+        details="Initial queue entry.",
+    )
+    test_db.add(history_entry)
+    test_db.commit()
 
     stored_book = test_db.query(Book).one()
     stored_chapter = test_db.query(Chapter).one()
     stored_voice_preset = test_db.query(VoicePreset).one()
     stored_generation_job = test_db.query(GenerationJob).one()
+    stored_history_entry = test_db.query(JobHistory).one()
 
     assert stored_book.narrator == "Kent Zimering"
     assert stored_book.status == "not_started"
@@ -78,3 +91,4 @@ def test_database_schema_and_basic_crud(test_db: Session) -> None:
     assert stored_voice_preset.is_default is True
     assert stored_generation_job.book_id == stored_book.id
     assert stored_generation_job.chapter_id == stored_chapter.id
+    assert stored_history_entry.job_id == stored_generation_job.id

@@ -18,7 +18,9 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import RequestResponseEndpoint
 
 from src import __version__
-from src.api.generation import router as generation_router, shutdown_generation_runtime
+from src.api.generation import router as generation_router
+from src.api.generation_runtime import shutdown_generation_runtime
+from src.api.queue_routes import router as queue_router
 from src.api.voice_lab import release_engine, router as voice_lab_router
 from src.api.routes import router as api_router
 from src.api.schemas import HealthCheckResponse
@@ -72,6 +74,7 @@ app.add_middleware(
 )
 app.include_router(api_router)
 app.include_router(generation_router)
+app.include_router(queue_router)
 app.include_router(voice_lab_router)
 
 
