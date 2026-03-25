@@ -1,0 +1,400 @@
+"""Tests for the Gate 3 whole-book quality checks."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+from pydub import AudioSegment
+from pydub.generators import Sine
+from sqlalchemy.orm import Session
+
+from src.config import settings
+from src.database import (
+    Book,
+    BookStatus,
+    Chapter,
+    ChapterQARecord,
+    ChapterStatus,
+    ChapterType,
+    QAAutomaticStatus,
+)
+from src.pipeline.book_qa import (
+    check_acx_compliance,
+    check_chapter_transitions,
+    check_cross_chapter_loudness,
+    check_cross_chapter_pacing,
+    check_cross_chapter_voice,
+    run_book_qa,
+)
+
+FRAME_RATE = 44100
+
+
+@pytest.fixture(autouse=True)
+def book_quality_outputs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Route test audio into a private outputs directory."""
+
+    monkeypatch.setattr(settings, "OUTPUTS_PATH", str(tmp_path / "outputs"))
+
+
+def _create_book(test_db: Session, *, title: str = "Book QA Test") -> Book:
+    """Create a generated book."""
+
+    book = Book(
+        title=title,
+        author="Test Author",
+        folder_path=title.lower().replace(" ", "-"),
+        status=BookStatus.GENERATED,
+    )
+    test_db.add(book)
+    test_db.commit()
+    test_db.refresh(book)
+    return book
+
+
+def _tone(duration_ms: int, frequency: int = 220, *, gain_db: float = -18.0) -> AudioSegment:
+    """Create a deterministic mono sine-wave chapter."""
+
+    return (
+        Sine(frequency)
+        .to_audio_segment(duration=duration_ms)
+        .apply_gain(gain_db)
+        .set_frame_rate(FRAME_RATE)
+        .set_channels(1)
+    )
+
+
+def _with_edges(audio: AudioSegment, *, lead_ms: int = 750, trail_ms: int = 1500) -> AudioSegment:
+    """Wrap spoken audio in ACX-friendly edge silence."""
+
+    return (
+        AudioSegment.silent(duration=lead_ms, frame_rate=FRAME_RATE).set_channels(1)
+        + audio
+        + AudioSegment.silent(duration=trail_ms, frame_rate=FRAME_RATE).set_channels(1)
+    )
+
+
+def _write_chapter_audio(path: Path, audio: AudioSegment) -> None:
+    """Export one WAV fixture."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    audio.export(path, format="wav")
+
+
+def _create_chapter(
+    test_db: Session,
+    *,
+    book: Book,
+    number: int,
+    title: str,
+    audio: AudioSegment,
+    word_count: int = 120,
+) -> Chapter:
+    """Persist one generated chapter row plus a WAV file."""
+
+    relative_audio_path = f"{book.id}-{book.title.lower().replace(' ', '-')}/chapters/{number:02d}-{title.lower().replace(' ', '-')}.wav"
+    absolute_audio_path = Path(settings.OUTPUTS_PATH) / relative_audio_path
+    _write_chapter_audio(absolute_audio_path, audio)
+
+    chapter = Chapter(
+        book_id=book.id,
+        number=number,
+        title=title,
+        type=ChapterType.CHAPTER,
+        text_content=f"{title} narration text.",
+        word_count=word_count,
+        status=ChapterStatus.GENERATED,
+        audio_path=relative_audio_path,
+        duration_seconds=len(audio) / 1000.0,
+        audio_file_size_bytes=absolute_audio_path.stat().st_size,
+    )
+    test_db.add(chapter)
+    test_db.commit()
+    test_db.refresh(chapter)
+    return chapter
+
+
+def _store_qa_record(
+    test_db: Session,
+    chapter: Chapter,
+    *,
+    overall_status: QAAutomaticStatus = QAAutomaticStatus.PASS,
+    grade: str = "A",
+) -> None:
+    """Persist the chapter-level QA record required by Gate 3."""
+
+    record = ChapterQARecord(
+        book_id=chapter.book_id,
+        chapter_n=chapter.number,
+        overall_status=overall_status,
+        qa_details=json.dumps(
+            {
+                "chapter_n": chapter.number,
+                "book_id": chapter.book_id,
+                "timestamp": "2026-03-25T00:00:00Z",
+                "checks": [],
+                "overall_status": overall_status.value,
+                "chapter_report": {
+                    "overall_grade": grade,
+                },
+            }
+        ),
+    )
+    test_db.add(record)
+    test_db.commit()
+
+
+def _create_ready_chapter(
+    test_db: Session,
+    *,
+    book: Book,
+    number: int,
+    title: str,
+    audio: AudioSegment,
+    word_count: int = 120,
+    grade: str = "A",
+) -> Chapter:
+    """Create a chapter that already passed Gate 2."""
+
+    chapter = _create_chapter(
+        test_db,
+        book=book,
+        number=number,
+        title=title,
+        audio=audio,
+        word_count=word_count,
+    )
+    _store_qa_record(test_db, chapter, grade=grade)
+    return chapter
+
+
+def test_loudness_consistency_pass(test_db: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Chapters inside the ±1.5 LU band should pass."""
+
+    book = _create_book(test_db, title="Loudness Pass")
+    chapter_one = _create_ready_chapter(test_db, book=book, number=1, title="One", audio=_with_edges(_tone(3000)))
+    chapter_two = _create_ready_chapter(test_db, book=book, number=2, title="Two", audio=_with_edges(_tone(3000)))
+    chapter_three = _create_ready_chapter(test_db, book=book, number=3, title="Three", audio=_with_edges(_tone(3000)))
+
+    lufs_map = {
+        chapter_one.number: -20.2,
+        chapter_two.number: -19.6,
+        chapter_three.number: -20.1,
+    }
+    monkeypatch.setattr(
+        "src.pipeline.book_qa.measure_integrated_lufs",
+        lambda audio_path: lufs_map[int(Path(audio_path).stem.split("-")[0])],
+    )
+
+    result = check_cross_chapter_loudness(book.id, test_db)
+
+    assert result.status == "pass"
+    assert result.details["max_deviation_lu"] <= 1.5
+
+
+def test_loudness_consistency_fail(test_db: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A chapter more than 3 LU away should fail."""
+
+    book = _create_book(test_db, title="Loudness Fail")
+    chapter_one = _create_ready_chapter(test_db, book=book, number=1, title="One", audio=_with_edges(_tone(3000)))
+    chapter_two = _create_ready_chapter(test_db, book=book, number=2, title="Two", audio=_with_edges(_tone(3000)))
+    chapter_three = _create_ready_chapter(test_db, book=book, number=3, title="Three", audio=_with_edges(_tone(3000)))
+
+    lufs_map = {
+        chapter_one.number: -20.0,
+        chapter_two.number: -20.2,
+        chapter_three.number: -14.0,
+    }
+    monkeypatch.setattr(
+        "src.pipeline.book_qa.measure_integrated_lufs",
+        lambda audio_path: lufs_map[int(Path(audio_path).stem.split("-")[0])],
+    )
+
+    result = check_cross_chapter_loudness(book.id, test_db)
+
+    assert result.status == "fail"
+    assert result.blockers
+
+
+def test_voice_consistency_stable(test_db: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stable voice fingerprints should pass."""
+
+    book = _create_book(test_db, title="Voice Stable")
+    chapters = [
+        _create_ready_chapter(test_db, book=book, number=1, title="One", audio=_with_edges(_tone(3000))),
+        _create_ready_chapter(test_db, book=book, number=2, title="Two", audio=_with_edges(_tone(3000))),
+        _create_ready_chapter(test_db, book=book, number=3, title="Three", audio=_with_edges(_tone(3000))),
+    ]
+    fingerprints = iter(
+        [
+            {"mean_pitch_hz": 142.0, "pitch_range_hz": 5.0, "spectral_centroid": 2300.0, "speech_rate_wpm": 154.0, "mean_rms_db": -20.0, "spectral_bandwidth": 700.0},
+            {"mean_pitch_hz": 143.0, "pitch_range_hz": 5.5, "spectral_centroid": 2320.0, "speech_rate_wpm": 155.0, "mean_rms_db": -20.1, "spectral_bandwidth": 705.0},
+            {"mean_pitch_hz": 141.5, "pitch_range_hz": 5.2, "spectral_centroid": 2295.0, "speech_rate_wpm": 153.0, "mean_rms_db": -19.9, "spectral_bandwidth": 698.0},
+        ]
+    )
+    monkeypatch.setattr("src.pipeline.book_qa.compute_voice_fingerprint", lambda *args, **kwargs: next(fingerprints))
+
+    result = check_cross_chapter_voice(book.id, test_db)
+
+    assert len(chapters) == 3
+    assert result.status == "pass"
+    assert result.details["outlier_chapters"] == []
+
+
+def test_voice_consistency_drift(test_db: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pitch drift beyond the threshold should be surfaced."""
+
+    book = _create_book(test_db, title="Voice Drift")
+    _create_ready_chapter(test_db, book=book, number=1, title="One", audio=_with_edges(_tone(3000)))
+    _create_ready_chapter(test_db, book=book, number=2, title="Two", audio=_with_edges(_tone(3000)))
+    _create_ready_chapter(test_db, book=book, number=3, title="Three", audio=_with_edges(_tone(3000)))
+    fingerprints = iter(
+        [
+            {"mean_pitch_hz": 142.0, "pitch_range_hz": 5.0, "spectral_centroid": 2300.0, "speech_rate_wpm": 154.0, "mean_rms_db": -20.0, "spectral_bandwidth": 700.0},
+            {"mean_pitch_hz": 141.0, "pitch_range_hz": 5.4, "spectral_centroid": 2290.0, "speech_rate_wpm": 153.0, "mean_rms_db": -20.0, "spectral_bandwidth": 698.0},
+            {"mean_pitch_hz": 170.0, "pitch_range_hz": 8.2, "spectral_centroid": 2295.0, "speech_rate_wpm": 154.0, "mean_rms_db": -20.1, "spectral_bandwidth": 701.0},
+        ]
+    )
+    monkeypatch.setattr("src.pipeline.book_qa.compute_voice_fingerprint", lambda *args, **kwargs: next(fingerprints))
+
+    result = check_cross_chapter_voice(book.id, test_db)
+
+    assert result.status == "warning"
+    assert result.details["outlier_chapters"] == [3]
+
+
+def test_pacing_consistency_even(test_db: Session) -> None:
+    """Similar chapter WPM values should pass."""
+
+    book = _create_book(test_db, title="Pacing Pass")
+    _create_ready_chapter(test_db, book=book, number=1, title="One", audio=_with_edges(_tone(30_000)), word_count=75)
+    _create_ready_chapter(test_db, book=book, number=2, title="Two", audio=_with_edges(_tone(32_000)), word_count=80)
+    _create_ready_chapter(test_db, book=book, number=3, title="Three", audio=_with_edges(_tone(28_000)), word_count=70)
+
+    result = check_cross_chapter_pacing(book.id, test_db)
+
+    assert result.status == "pass"
+    assert result.details["max_deviation_pct"] <= 10.0
+
+
+def test_pacing_consistency_outlier(test_db: Session) -> None:
+    """A chapter 25% faster than the rest should fail."""
+
+    book = _create_book(test_db, title="Pacing Fail")
+    _create_ready_chapter(test_db, book=book, number=1, title="One", audio=_with_edges(_tone(30_000)), word_count=75)
+    _create_ready_chapter(test_db, book=book, number=2, title="Two", audio=_with_edges(_tone(30_000)), word_count=75)
+    _create_ready_chapter(test_db, book=book, number=3, title="Three", audio=_with_edges(_tone(20_000)), word_count=75)
+
+    result = check_cross_chapter_pacing(book.id, test_db)
+
+    assert result.status == "fail"
+    assert result.blockers
+
+
+def test_chapter_transition_smooth(test_db: Session) -> None:
+    """Matching chapter edges should pass transition QA."""
+
+    book = _create_book(test_db, title="Transitions Pass")
+    _create_ready_chapter(test_db, book=book, number=1, title="One", audio=_with_edges(_tone(4000, 220, gain_db=-18.0)))
+    _create_ready_chapter(test_db, book=book, number=2, title="Two", audio=_with_edges(_tone(4000, 220, gain_db=-18.5)))
+
+    result = check_chapter_transitions(book.id, test_db)
+
+    assert result.status == "pass"
+    assert result.details["issues"][0]["status"] == "pass"
+
+
+def test_chapter_transition_jarring(test_db: Session) -> None:
+    """A large chapter-edge energy jump should fail."""
+
+    book = _create_book(test_db, title="Transitions Fail")
+    _create_ready_chapter(test_db, book=book, number=1, title="One", audio=_with_edges(_tone(4000, 220, gain_db=-24.0)))
+    _create_ready_chapter(test_db, book=book, number=2, title="Two", audio=_with_edges(_tone(4000, 220, gain_db=-8.0), lead_ms=100, trail_ms=1500))
+
+    result = check_chapter_transitions(book.id, test_db)
+
+    assert result.status == "fail"
+    assert result.blockers
+
+
+def test_acx_compliance_pass(test_db: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A properly shaped chapter should satisfy ACX validation."""
+
+    book = _create_book(test_db, title="ACX Pass")
+    _create_ready_chapter(test_db, book=book, number=1, title="One", audio=_with_edges(_tone(3000, 220, gain_db=-18.0)))
+    monkeypatch.setattr("src.pipeline.book_qa.measure_integrated_lufs", lambda *_args, **_kwargs: -20.0)
+
+    result = check_acx_compliance(book.id, test_db)
+
+    assert result.status == "pass"
+    assert result.details["violations"] == []
+
+
+def test_acx_compliance_peak_violation(test_db: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Peak levels above the ACX ceiling should fail."""
+
+    book = _create_book(test_db, title="ACX Fail")
+    _create_ready_chapter(test_db, book=book, number=1, title="One", audio=_with_edges(_tone(3000, 220, gain_db=-0.2)))
+    monkeypatch.setattr("src.pipeline.book_qa.measure_integrated_lufs", lambda *_args, **_kwargs: -20.0)
+
+    result = check_acx_compliance(book.id, test_db)
+
+    assert result.status == "fail"
+    assert any(violation["issue"] == "true_peak_db" for violation in result.details["violations"])
+
+
+def test_book_qa_api_endpoint(client, test_db: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The book-level QA endpoint should return the expected Gate 3 payload."""
+
+    book = _create_book(test_db, title="Book API")
+    _create_ready_chapter(test_db, book=book, number=1, title="One", audio=_with_edges(_tone(3000)), grade="A")
+    _create_ready_chapter(test_db, book=book, number=2, title="Two", audio=_with_edges(_tone(3000)), grade="B")
+    monkeypatch.setattr("src.pipeline.book_qa.measure_integrated_lufs", lambda *_args, **_kwargs: -20.0)
+    monkeypatch.setattr(
+        "src.pipeline.book_qa.compute_voice_fingerprint",
+        lambda *args, **kwargs: {
+            "mean_pitch_hz": 142.0,
+            "pitch_range_hz": 5.0,
+            "spectral_centroid": 2300.0,
+            "speech_rate_wpm": 154.0,
+            "mean_rms_db": -20.0,
+            "spectral_bandwidth": 700.0,
+        },
+    )
+
+    response = client.get(f"/api/book/{book.id}/qa/book-report")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["book_id"] == book.id
+    assert payload["title"] == book.title
+    assert "cross_chapter_checks" in payload
+    assert "loudness_consistency" in payload["cross_chapter_checks"]
+
+
+def test_book_report_aggregates_grades_and_blockers(test_db: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The aggregate report should summarize chapter grades and export readiness."""
+
+    book = _create_book(test_db, title="Book Summary")
+    _create_ready_chapter(test_db, book=book, number=1, title="One", audio=_with_edges(_tone(3000)), grade="A")
+    _create_ready_chapter(test_db, book=book, number=2, title="Two", audio=_with_edges(_tone(3000)), grade="C")
+    monkeypatch.setattr("src.pipeline.book_qa.measure_integrated_lufs", lambda *_args, **_kwargs: -20.0)
+    monkeypatch.setattr(
+        "src.pipeline.book_qa.compute_voice_fingerprint",
+        lambda *args, **kwargs: {
+            "mean_pitch_hz": 142.0,
+            "pitch_range_hz": 5.0,
+            "spectral_centroid": 2300.0,
+            "speech_rate_wpm": 154.0,
+            "mean_rms_db": -20.0,
+            "spectral_bandwidth": 700.0,
+        },
+    )
+
+    report = run_book_qa(book.id, test_db)
+
+    assert report.chapters_grade_a == 1
+    assert report.chapters_grade_c == 1
+    assert report.ready_for_export is True

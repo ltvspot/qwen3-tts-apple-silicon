@@ -13,9 +13,10 @@ class StubBatchOrchestrator:
 
     payload: dict
 
-    async def start_batch(self, book_ids, priority: str, skip_already_exported: bool):
+    async def start_batch(self, book_ids, priority: str, skip_already_exported: bool, strategy):
         self.payload["total_books"] = len(book_ids)
         self.payload["status"] = "running"
+        self.payload["scheduling_strategy"] = strategy.value
         return self.payload
 
     async def pause(self, reason: str):

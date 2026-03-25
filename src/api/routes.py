@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session, selectinload
 
 from src.api.cache import invalidate_library_cache, library_cache
@@ -23,6 +25,8 @@ from src.database import (
     QAStatus,
     get_db,
 )
+from src.pipeline.manuscript_validator import ManuscriptValidationReport, ManuscriptValidator
+from src.pipeline.pronunciation_watchlist import PronunciationWatchlist
 from src.parser import CreditsGenerator, ManuscriptParserFactory
 
 logger = logging.getLogger(__name__)
@@ -84,6 +88,47 @@ class LibraryScanResponse(BaseModel):
     errors: list[str]
 
 
+class ManuscriptIssueResponse(BaseModel):
+    """One pre-generation manuscript issue."""
+
+    severity: str
+    chapter: int | None
+    description: str
+    suggestion: str
+
+
+class ManuscriptIssueSummaryResponse(BaseModel):
+    """Counts of manuscript issues by severity."""
+
+    errors: int = 0
+    warnings: int = 0
+    info: int = 0
+
+
+class ManuscriptValidationResponse(BaseModel):
+    """Serialized manuscript validation payload."""
+
+    book_id: int
+    title: str
+    total_chapters: int
+    total_words: int
+    difficulty_score: float
+    ready_for_generation: bool
+    issues: list[ManuscriptIssueResponse]
+    issue_summary: ManuscriptIssueSummaryResponse
+
+
+class LibraryScanProgressResponse(BaseModel):
+    """Live scan progress payload for the library page."""
+
+    scanning: bool
+    files_found: int
+    files_processed: int
+    elapsed_seconds: int
+    new_books: int = 0
+    errors: list[str] = Field(default_factory=list)
+
+
 class ParseBookRequest(BaseModel):
     """Request payload for parsing a book's manuscript."""
 
@@ -124,7 +169,63 @@ class LibraryResponse(BaseModel):
     stats: LibraryStats
 
 
+class PronunciationWatchlistEntry(BaseModel):
+    """One pronunciation watchlist entry."""
+
+    word: str
+    pronunciation_guide: str
+    context: str
+
+
+class PronunciationWatchlistResponse(BaseModel):
+    """Serialized pronunciation watchlist payload."""
+
+    entries: list[PronunciationWatchlistEntry]
+
+
+class PronunciationWatchlistAddRequest(BaseModel):
+    """Request payload for adding or updating a watchlist word."""
+
+    word: str = Field(min_length=1, max_length=255)
+    guide: str = Field(min_length=1, max_length=255)
+
+
 router = APIRouter(prefix="/api", tags=["library"])
+_library_scan_lock = threading.RLock()
+_library_scan_progress: dict[str, object] = {
+    "elapsed_seconds": 0,
+    "errors": [],
+    "files_found": 0,
+    "files_processed": 0,
+    "new_books": 0,
+    "scanning": False,
+    "started_monotonic": None,
+}
+
+
+def _set_library_scan_progress(**updates: object) -> None:
+    """Mutate the shared scan progress state under the module lock."""
+
+    with _library_scan_lock:
+        _library_scan_progress.update(updates)
+
+
+def _snapshot_library_scan_progress() -> LibraryScanProgressResponse:
+    """Return the current scan progress payload."""
+
+    with _library_scan_lock:
+        started_monotonic = _library_scan_progress.get("started_monotonic")
+        elapsed_seconds = int(
+            max(time.monotonic() - started_monotonic, 0)
+        ) if isinstance(started_monotonic, (int, float)) else int(_library_scan_progress.get("elapsed_seconds", 0))
+        return LibraryScanProgressResponse(
+            scanning=bool(_library_scan_progress.get("scanning", False)),
+            files_found=int(_library_scan_progress.get("files_found", 0)),
+            files_processed=int(_library_scan_progress.get("files_processed", 0)),
+            elapsed_seconds=elapsed_seconds,
+            new_books=int(_library_scan_progress.get("new_books", 0)),
+            errors=list(_library_scan_progress.get("errors", [])),
+        )
 
 
 def _serialize_book(book: Book) -> BookResponse:
@@ -153,6 +254,61 @@ def _serialize_chapter(chapter: Chapter) -> ChapterResponse:
     """Convert a Chapter ORM instance into an API response model."""
 
     return ChapterResponse.model_validate(chapter)
+
+
+def _serialize_manuscript_report(report: ManuscriptValidationReport) -> ManuscriptValidationResponse:
+    """Convert manuscript validation dataclasses into API payloads."""
+
+    issue_summary = ManuscriptIssueSummaryResponse()
+    for issue in report.issues:
+        if issue.severity == "error":
+            issue_summary.errors += 1
+        elif issue.severity == "warning":
+            issue_summary.warnings += 1
+        else:
+            issue_summary.info += 1
+
+    return ManuscriptValidationResponse(
+        book_id=report.book_id,
+        title=report.title,
+        total_chapters=report.total_chapters,
+        total_words=report.total_words,
+        difficulty_score=report.difficulty_score,
+        ready_for_generation=report.ready_for_generation,
+        issues=[
+            ManuscriptIssueResponse(
+                severity=issue.severity,
+                chapter=issue.chapter,
+                description=issue.description,
+                suggestion=issue.suggestion,
+            )
+            for issue in report.issues
+        ],
+        issue_summary=issue_summary,
+    )
+
+
+def _pronunciation_watchlist() -> PronunciationWatchlist:
+    """Return the pronunciation watchlist helper."""
+
+    return PronunciationWatchlist()
+
+
+def _build_manuscript_validation(book: Book, chapters: list[Chapter]) -> ManuscriptValidationResponse:
+    """Run manuscript validation for a loaded book."""
+
+    report = ManuscriptValidator.validate(
+        book.id,
+        [
+            {
+                "book_title": book.title,
+                "number": chapter.number,
+                "text": chapter.text_content or "",
+            }
+            for chapter in chapters
+        ],
+    )
+    return _serialize_manuscript_report(report)
 
 
 def _build_library_stats(db: Session) -> LibraryStats:
@@ -186,21 +342,93 @@ def _apply_library_sort(query, sort: str):
 
 
 @router.post("/library/scan", response_model=LibraryScanResponse)
-async def scan_library(db: Session = Depends(get_db)) -> LibraryScanResponse:
+def scan_library(db: Session = Depends(get_db)) -> LibraryScanResponse:
     """Scan the manuscript root and index any newly discovered book folders."""
 
+    with _library_scan_lock:
+        if bool(_library_scan_progress.get("scanning", False)):
+            raise HTTPException(status_code=409, detail="A library scan is already in progress.")
+        _library_scan_progress.update(
+            {
+                "elapsed_seconds": 0,
+                "errors": [],
+                "files_found": 0,
+                "files_processed": 0,
+                "new_books": 0,
+                "scanning": True,
+                "started_monotonic": time.monotonic(),
+            }
+        )
+
     scanner = LibraryScanner()
-    result = scanner.scan(db)
-    db.commit()
-    logger.info(
-        "Library scan complete: found=%s indexed=%s new=%s errors=%s",
-        result["total_found"],
-        result["total_indexed"],
-        result["new_books"],
-        len(result["errors"]),
-    )
-    invalidate_library_cache()
-    return LibraryScanResponse(**result)
+    try:
+        result = scanner.scan(
+            db,
+            progress_callback=lambda progress: _set_library_scan_progress(**progress),
+        )
+        db.commit()
+        elapsed_seconds = _snapshot_library_scan_progress().elapsed_seconds
+        _set_library_scan_progress(
+            scanning=False,
+            started_monotonic=None,
+            elapsed_seconds=elapsed_seconds,
+            files_found=result["total_found"],
+            files_processed=result["total_found"],
+            new_books=result["new_books"],
+            errors=list(result["errors"]),
+        )
+        logger.info(
+            "Library scan complete: found=%s indexed=%s new=%s errors=%s",
+            result["total_found"],
+            result["total_indexed"],
+            result["new_books"],
+            len(result["errors"]),
+        )
+        invalidate_library_cache()
+        return LibraryScanResponse(**result)
+    except Exception:
+        db.rollback()
+        elapsed_seconds = _snapshot_library_scan_progress().elapsed_seconds
+        _set_library_scan_progress(
+            scanning=False,
+            started_monotonic=None,
+            elapsed_seconds=elapsed_seconds,
+        )
+        raise
+
+
+@router.get("/library/scan/progress", response_model=LibraryScanProgressResponse)
+def get_library_scan_progress() -> LibraryScanProgressResponse:
+    """Return the current library scan progress snapshot."""
+
+    return _snapshot_library_scan_progress()
+
+
+@router.get("/pronunciation-watchlist", response_model=PronunciationWatchlistResponse)
+def get_pronunciation_watchlist() -> PronunciationWatchlistResponse:
+    """Return the current pronunciation watchlist."""
+
+    return PronunciationWatchlistResponse(entries=_pronunciation_watchlist().entries())
+
+
+@router.post("/pronunciation-watchlist", response_model=PronunciationWatchlistResponse)
+def add_pronunciation_watchlist_word(
+    request: PronunciationWatchlistAddRequest,
+) -> PronunciationWatchlistResponse:
+    """Add or update a pronunciation watchlist entry."""
+
+    watchlist = _pronunciation_watchlist()
+    watchlist.add_word(request.word.strip(), request.guide.strip())
+    return PronunciationWatchlistResponse(entries=watchlist.entries())
+
+
+@router.delete("/pronunciation-watchlist/{word}", response_model=PronunciationWatchlistResponse)
+def delete_pronunciation_watchlist_word(word: str) -> PronunciationWatchlistResponse:
+    """Remove a pronunciation watchlist entry when present."""
+
+    watchlist = _pronunciation_watchlist()
+    watchlist.remove_word(word)
+    return PronunciationWatchlistResponse(entries=watchlist.entries())
 
 
 @router.get("/library", response_model=LibraryResponse)
@@ -248,6 +476,21 @@ async def get_book(book_id: int, db: Session = Depends(get_db)) -> BookResponse:
     if book is None:
         raise HTTPException(status_code=404, detail=f"Book {book_id} not found")
     return _serialize_book(book)
+
+
+@router.get("/book/{book_id}/validate-manuscript", response_model=ManuscriptValidationResponse)
+async def validate_manuscript(book_id: int, db: Session = Depends(get_db)) -> ManuscriptValidationResponse:
+    """Return the pre-generation manuscript validation report for one book."""
+
+    book = (
+        db.query(Book)
+        .options(selectinload(Book.chapters))
+        .filter(Book.id == book_id)
+        .first()
+    )
+    if book is None:
+        raise HTTPException(status_code=404, detail=f"Book {book_id} not found")
+    return _build_manuscript_validation(book, list(book.chapters))
 
 
 @router.get("/book/{book_id}/chapters", response_model=list[ChapterResponse])

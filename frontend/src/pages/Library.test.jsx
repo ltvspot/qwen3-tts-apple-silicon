@@ -204,7 +204,7 @@ describe("Library page", () => {
 
     const searchInput = container.querySelector('input[type="text"]');
     await act(async () => {
-      setFormValue(searchInput, "le guin", "input");
+      setFormValue(searchInput, "LE GUIN", "input");
     });
 
     await waitFor(() => {
@@ -229,6 +229,50 @@ describe("Library page", () => {
     });
 
     expect(mockNavigate).toHaveBeenCalledWith("/book/2");
+  });
+
+  test("shows determinate progress while loading paginated library batches", async () => {
+    const deferredSecondPage = createDeferredResponse();
+    const stats = {
+      not_started: 3,
+      parsed: 0,
+      generating: 0,
+      generated: 0,
+      qa: 0,
+      qa_approved: 0,
+      exported: 0,
+    };
+
+    fetchMock
+      .mockResolvedValueOnce(
+        createJsonResponse({
+          books: [
+            createBook({ id: 1, title: "One" }),
+            createBook({ id: 2, title: "Two" }),
+          ],
+          stats,
+          total: 3,
+        }),
+      )
+      .mockImplementationOnce(() => deferredSecondPage.promise);
+
+    await renderLibrary();
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("Loading library... 2 / 3 books");
+    });
+
+    deferredSecondPage.resolve(
+      createJsonResponse({
+        books: [createBook({ id: 3, title: "Three" })],
+        stats,
+        total: 3,
+      }),
+    );
+
+    await waitFor(() => {
+      expect(getBookIds()).toEqual([1, 2, 3]);
+    });
   });
 
   test("refetches on status filter changes and refreshes the filtered list after scanning", async () => {
@@ -282,30 +326,44 @@ describe("Library page", () => {
     });
 
     const deferredScan = createDeferredResponse();
+    let latestLibraryPayload = {
+      books: [draftBook, parsedBook],
+      stats: initialStats,
+      total: 2,
+    };
+    let scanProgressPayload = {
+      elapsed_seconds: 12,
+      files_found: 3,
+      files_processed: 2,
+      new_books: 1,
+      scanning: true,
+    };
 
-    fetchMock
-      .mockResolvedValueOnce(
-        createJsonResponse({
-          books: [draftBook, parsedBook],
-          stats: initialStats,
-          total: 2,
-        }),
-      )
-      .mockResolvedValueOnce(
-        createJsonResponse({
-          books: [parsedBook],
-          stats: initialStats,
-          total: 1,
-        }),
-      )
-      .mockImplementationOnce(() => deferredScan.promise)
-      .mockResolvedValueOnce(
-        createJsonResponse({
-          books: [parsedBook, scannedBook],
-          stats: updatedStats,
-          total: 2,
-        }),
-      );
+    fetchMock.mockImplementation((url) => {
+      if (url === "/api/library?limit=500&offset=0") {
+        return Promise.resolve(createJsonResponse(latestLibraryPayload));
+      }
+
+      if (url === "/api/library?limit=500&offset=0&status_filter=parsed") {
+        return Promise.resolve(
+          createJsonResponse({
+            books: latestLibraryPayload.books.filter((book) => book.status === "parsed"),
+            stats: latestLibraryPayload.stats,
+            total: latestLibraryPayload.books.filter((book) => book.status === "parsed").length,
+          }),
+        );
+      }
+
+      if (url === "/api/library/scan") {
+        return deferredScan.promise;
+      }
+
+      if (url === "/api/library/scan/progress") {
+        return Promise.resolve(createJsonResponse(scanProgressPayload));
+      }
+
+      throw new Error(`Unhandled fetch: ${url}`);
+    });
 
     await renderLibrary();
 
@@ -326,8 +384,9 @@ describe("Library page", () => {
     );
 
     const scanButton = getButtonByText("Scan Library");
-    act(() => {
+    await act(async () => {
       scanButton.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await Promise.resolve();
     });
 
     expect(scanButton.disabled).toBe(true);
@@ -336,17 +395,35 @@ describe("Library page", () => {
       "/api/library/scan",
       { method: "POST" },
     ]);
+    expect(fetchMock.mock.calls[3][0]).toBe("/api/library/scan/progress");
+    expect(container.textContent).toContain("Scanning library... 2 / 3 files");
 
-    deferredScan.resolve(createJsonResponse({ errors: [], new_books: 1, total_found: 3, total_indexed: 3 }));
+    latestLibraryPayload = {
+      books: [parsedBook, scannedBook],
+      stats: updatedStats,
+      total: 2,
+    };
+    scanProgressPayload = {
+      elapsed_seconds: 14,
+      files_found: 3,
+      files_processed: 3,
+      new_books: 1,
+      scanning: false,
+    };
+    await act(async () => {
+      deferredScan.resolve(createJsonResponse({ errors: [], new_books: 1, total_found: 3, total_indexed: 3 }));
+      await Promise.resolve();
+    });
 
     await waitFor(() => {
       expect(getBookIds()).toEqual([102, 103]);
     });
-    expect(fetchMock.mock.calls[3][0]).toBe(
+    expect(fetchMock.mock.calls[4][0]).toBe(
       "/api/library?limit=500&offset=0&status_filter=parsed",
     );
     expect(scanButton.disabled).toBe(false);
     expect(scanButton.textContent).toBe("Scan Library");
+    expect(container.textContent).toContain("Scan complete! Found 1 new books.");
   });
 
   test("shows a retry action when the library request fails and recovers on retry", async () => {

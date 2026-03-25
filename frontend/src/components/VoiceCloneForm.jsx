@@ -1,4 +1,5 @@
 import React, { useMemo, useRef, useState } from "react";
+import ProgressHeartbeat from "./ProgressHeartbeat";
 
 const ACCEPTED_SUFFIXES = [".wav", ".mp3", ".m4a"];
 
@@ -12,6 +13,7 @@ function isAcceptedAudioFile(file) {
 }
 
 export default function VoiceCloneForm({ onCloned }) {
+  const [cloneProgress, setCloneProgress] = useState(null);
   const [displayName, setDisplayName] = useState("");
   const [errorMessage, setErrorMessage] = useState("");
   const [isDragActive, setIsDragActive] = useState(false);
@@ -69,6 +71,12 @@ export default function VoiceCloneForm({ onCloned }) {
     setErrorMessage("");
     setSuccessMessage("");
     setIsSubmitting(true);
+    const startedAt = Date.now();
+    setCloneProgress({
+      phase: "upload",
+      progressPercent: 0,
+      startTime: startedAt,
+    });
 
     const formData = new FormData();
     formData.append("voice_name", trimmedVoiceName);
@@ -78,17 +86,53 @@ export default function VoiceCloneForm({ onCloned }) {
     formData.append("notes", notes.trim());
 
     try {
-      const response = await fetch("/api/voice-lab/clone", {
-        body: formData,
-        method: "POST",
+      const payload = await new Promise((resolve, reject) => {
+        const request = new XMLHttpRequest();
+        request.open("POST", "/api/voice-lab/clone");
+        request.responseType = "json";
+
+        request.upload.onprogress = (event) => {
+          if (!event.lengthComputable) {
+            setCloneProgress({
+              phase: "upload",
+              progressPercent: null,
+              startTime: startedAt,
+            });
+            return;
+          }
+
+          setCloneProgress({
+            phase: "upload",
+            progressPercent: (event.loaded / event.total) * 100,
+            startTime: startedAt,
+          });
+        };
+
+        request.upload.onloadend = () => {
+          setCloneProgress({
+            phase: "processing",
+            progressPercent: null,
+            startTime: startedAt,
+          });
+        };
+
+        request.onerror = () => {
+          reject(new Error("Clone failed."));
+        };
+
+        request.onload = () => {
+          const responsePayload = request.response
+            ?? JSON.parse(request.responseText || "null");
+          if (request.status >= 200 && request.status < 300) {
+            resolve(responsePayload);
+            return;
+          }
+
+          reject(new Error(responsePayload?.detail ?? "Clone failed."));
+        };
+
+        request.send(formData);
       });
-
-      if (!response.ok) {
-        const payload = await response.json().catch(() => null);
-        throw new Error(payload?.detail ?? "Clone failed.");
-      }
-
-      const payload = await response.json();
       setSuccessMessage(`${payload.display_name} is ready for audition and generation.`);
       setVoiceName("");
       setDisplayName("");
@@ -103,6 +147,7 @@ export default function VoiceCloneForm({ onCloned }) {
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : "Clone failed.");
     } finally {
+      setCloneProgress(null);
       setIsSubmitting(false);
     }
   }
@@ -133,6 +178,23 @@ export default function VoiceCloneForm({ onCloned }) {
       {errorMessage ? (
         <div className="mt-6 rounded-[1.5rem] border border-rose-200 bg-rose-50 px-5 py-4 text-sm text-rose-700">
           {errorMessage}
+        </div>
+      ) : null}
+
+      {cloneProgress ? (
+        <div className="mt-6">
+          <ProgressHeartbeat
+            isActive={isSubmitting}
+            progressPercent={cloneProgress.progressPercent}
+            showETA={null}
+            size="md"
+            stage={
+              cloneProgress.phase === "upload"
+                ? "Uploading reference audio..."
+                : "Processing voice clone..."
+            }
+            startTime={cloneProgress.startTime}
+          />
         </div>
       ) : null}
 

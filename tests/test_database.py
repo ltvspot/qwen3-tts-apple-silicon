@@ -36,6 +36,7 @@ def test_database_schema_and_basic_crud(test_db: Session) -> None:
         "export_jobs",
         "generation_jobs",
         "job_history",
+        "quality_snapshots",
         "qa_status",
         "settings",
         "voice_presets",

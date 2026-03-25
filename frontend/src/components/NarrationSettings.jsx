@@ -57,6 +57,7 @@ function getChapterSummary(selectedChapter) {
 
 export default function NarrationSettings({
   loadingVoices = false,
+  loadingMessage = "",
   onChange,
   selectedChapter,
   settings,
@@ -146,7 +147,9 @@ export default function NarrationSettings({
             Voice
           </label>
           {loadingVoices ? (
-            <div className="mt-3 text-sm text-slate-400">Loading voices...</div>
+            <div className="mt-3 text-sm text-slate-400">
+              {loadingMessage || "Loading voices..."}
+            </div>
           ) : (
             <VoiceSelector
               ariaLabel="Narration voice"

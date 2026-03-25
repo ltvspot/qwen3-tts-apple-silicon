@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import BookCard from "../components/BookCard";
+import ProgressHeartbeat from "../components/ProgressHeartbeat";
 
 const PAGE_SIZE = 500;
 
@@ -112,10 +113,11 @@ async function fetchLibraryBatch(statusFilter, offset) {
   return response.json();
 }
 
-async function fetchAllBooks(statusFilter) {
+async function fetchAllBooks(statusFilter, onProgress = () => {}) {
   const firstPage = await fetchLibraryBatch(statusFilter, 0);
   const books = [...firstPage.books];
   const total = firstPage.total ?? books.length;
+  onProgress({ loaded: books.length, total });
 
   while (books.length < total) {
     const nextPage = await fetchLibraryBatch(statusFilter, books.length);
@@ -123,6 +125,7 @@ async function fetchAllBooks(statusFilter) {
       break;
     }
     books.push(...nextPage.books);
+    onProgress({ loaded: books.length, total });
   }
 
   return {
@@ -135,10 +138,23 @@ async function fetchAllBooks(statusFilter) {
 export default function Library() {
   const navigate = useNavigate();
   const requestRef = useRef(0);
+  const scanPollTimeoutRef = useRef(null);
 
   const [books, setBooks] = useState([]);
   const [totalBooks, setTotalBooks] = useState(0);
+  const [libraryLoadProgress, setLibraryLoadProgress] = useState({
+    loaded: 0,
+    startTime: null,
+    total: 0,
+  });
   const [loading, setLoading] = useState(true);
+  const [scanMessage, setScanMessage] = useState("");
+  const [scanProgress, setScanProgress] = useState({
+    filesFound: 0,
+    filesProcessed: 0,
+    isActive: false,
+    startTime: null,
+  });
   const [searchTerm, setSearchTerm] = useState("");
   const [statusFilter, setStatusFilter] = useState("");
   const [sortBy, setSortBy] = useState("id");
@@ -152,9 +168,11 @@ export default function Library() {
         return true;
       }
 
+      const normalizedTitle = String(book.title ?? "").toLowerCase();
+      const normalizedAuthor = String(book.author ?? "").toLowerCase();
       return (
-        book.title.toLowerCase().includes(search) ||
-        book.author.toLowerCase().includes(search)
+        normalizedTitle.includes(search) ||
+        normalizedAuthor.includes(search)
       );
     })
     .sort((leftBook, rightBook) => {
@@ -176,15 +194,62 @@ export default function Library() {
     ? `${catalogTotal}-title catalog`
     : "Publishing catalog";
 
+  function stopScanPolling() {
+    if (scanPollTimeoutRef.current !== null) {
+      window.clearTimeout(scanPollTimeoutRef.current);
+      scanPollTimeoutRef.current = null;
+    }
+  }
+
+  async function pollScanProgress() {
+    try {
+      const response = await fetch("/api/library/scan/progress");
+      if (!response.ok) {
+        throw new Error("Failed to fetch scan progress.");
+      }
+
+      const payload = await response.json();
+      setScanProgress((currentState) => ({
+        filesFound: payload.files_found ?? currentState.filesFound,
+        filesProcessed: payload.files_processed ?? currentState.filesProcessed,
+        isActive: payload.scanning,
+        startTime: currentState.startTime ?? Date.now(),
+      }));
+
+      if (payload.scanning) {
+        scanPollTimeoutRef.current = window.setTimeout(() => {
+          void pollScanProgress();
+        }, 2000);
+      }
+    } catch (error) {
+      stopScanPolling();
+    }
+  }
+
   const fetchLibrary = async (selectedStatus = statusFilter) => {
     const requestId = requestRef.current + 1;
     requestRef.current = requestId;
 
     setLoading(true);
     setErrorMessage("");
+    setLibraryLoadProgress({
+      loaded: 0,
+      startTime: Date.now(),
+      total: 0,
+    });
 
     try {
-      const payload = await fetchAllBooks(selectedStatus);
+      const payload = await fetchAllBooks(selectedStatus, ({ loaded, total }) => {
+        if (requestRef.current !== requestId) {
+          return;
+        }
+
+        setLibraryLoadProgress((currentState) => ({
+          loaded,
+          startTime: currentState.startTime ?? Date.now(),
+          total,
+        }));
+      });
       if (requestRef.current !== requestId) {
         return;
       }
@@ -207,6 +272,10 @@ export default function Library() {
     } finally {
       if (requestRef.current === requestId) {
         setLoading(false);
+        setLibraryLoadProgress((currentState) => ({
+          ...currentState,
+          loaded: currentState.total || currentState.loaded,
+        }));
       }
     }
   };
@@ -214,6 +283,10 @@ export default function Library() {
   useEffect(() => {
     void fetchLibrary(statusFilter);
   }, [statusFilter]);
+
+  useEffect(() => () => {
+    stopScanPolling();
+  }, []);
 
   const handleCardClick = (bookId) => {
     navigate(`/book/${bookId}`);
@@ -225,18 +298,42 @@ export default function Library() {
 
     setLoading(true);
     setErrorMessage("");
+    setScanMessage("");
+    setScanProgress({
+      filesFound: 0,
+      filesProcessed: 0,
+      isActive: true,
+      startTime: Date.now(),
+    });
+    stopScanPolling();
 
     try {
-      const response = await fetch("/api/library/scan", { method: "POST" });
+      const scanRequest = fetch("/api/library/scan", { method: "POST" });
+      void pollScanProgress();
+      const response = await scanRequest;
       if (!response.ok) {
         throw new Error("Failed to scan library");
       }
 
+      const payload = await response.json();
+      stopScanPolling();
+      setScanProgress((currentState) => ({
+        ...currentState,
+        filesFound: payload.total_found,
+        filesProcessed: payload.total_found,
+        isActive: false,
+      }));
+      setScanMessage(`Scan complete! Found ${payload.new_books} new books.`);
       await fetchLibrary(statusFilter);
     } catch (error) {
+      stopScanPolling();
       if (requestRef.current === refreshRequestId) {
         setLoading(false);
       }
+      setScanProgress((currentState) => ({
+        ...currentState,
+        isActive: false,
+      }));
       setErrorMessage(
         error instanceof Error ? error.message : "Unable to scan library.",
       );
@@ -277,11 +374,11 @@ export default function Library() {
             <div className="flex flex-col items-start gap-3 lg:items-end">
               <button
                 className="rounded-full bg-amber-500 px-5 py-2.5 text-sm font-semibold text-slate-950 transition hover:bg-amber-400 disabled:cursor-not-allowed disabled:opacity-60"
-                disabled={loading}
+                disabled={scanProgress.isActive}
                 onClick={handleRefreshLibrary}
                 type="button"
               >
-                {loading ? "Scanning..." : "Scan Library"}
+                {scanProgress.isActive ? "Scanning..." : "Scan Library"}
               </button>
               <div className="flex flex-wrap gap-2">
                 {NAV_ITEMS.map((item) => (
@@ -340,6 +437,42 @@ export default function Library() {
               </div>
             </div>
           )}
+
+          {loading && libraryLoadProgress.startTime ? (
+            <div className="mt-6">
+              <ProgressHeartbeat
+                isActive={loading}
+                progressPercent={libraryLoadProgress.total > 0
+                  ? (libraryLoadProgress.loaded / libraryLoadProgress.total) * 100
+                  : null}
+                showETA={null}
+                size="md"
+                stage={`Loading library... ${libraryLoadProgress.loaded} / ${libraryLoadProgress.total || "?"} books`}
+                startTime={libraryLoadProgress.startTime}
+              />
+            </div>
+          ) : null}
+
+          {scanProgress.isActive ? (
+            <div className="mt-6">
+              <ProgressHeartbeat
+                isActive={scanProgress.isActive}
+                progressPercent={scanProgress.filesFound > 0
+                  ? (scanProgress.filesProcessed / scanProgress.filesFound) * 100
+                  : null}
+                showETA={null}
+                size="md"
+                stage={`Scanning library... ${scanProgress.filesProcessed} / ${scanProgress.filesFound || "?"} files`}
+                startTime={scanProgress.startTime}
+              />
+            </div>
+          ) : null}
+
+          {scanMessage ? (
+            <div className="mt-6 rounded-2xl border border-emerald-300/30 bg-emerald-400/10 px-4 py-3 text-sm text-emerald-100">
+              {scanMessage}
+            </div>
+          ) : null}
 
           <div className="mt-6 grid grid-cols-1 gap-4 md:grid-cols-3">
             <div className="md:col-span-2">

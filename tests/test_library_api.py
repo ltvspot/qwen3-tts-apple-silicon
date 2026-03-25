@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 from docx import Document
@@ -182,6 +183,71 @@ def test_scan_library_and_get_library(
             "exported": 0,
         },
     }
+
+
+def test_scan_progress_endpoint_reports_live_and_completed_state(
+    client: TestClient,
+    monkeypatch: object,
+) -> None:
+    """Scan progress should be visible while a scan is running and after it completes."""
+
+    progress_started = threading.Event()
+    release_scan = threading.Event()
+
+    def fake_scan(self, db_session, *, progress_callback=None):  # noqa: ANN001
+        del self, db_session
+        if progress_callback is not None:
+            progress_callback({
+                "errors": [],
+                "files_found": 10,
+                "files_processed": 3,
+                "new_books": 1,
+            })
+        progress_started.set()
+        assert release_scan.wait(timeout=2)
+        if progress_callback is not None:
+            progress_callback({
+                "errors": [],
+                "files_found": 10,
+                "files_processed": 10,
+                "new_books": 2,
+            })
+        return {
+            "errors": [],
+            "new_books": 2,
+            "total_found": 10,
+            "total_indexed": 10,
+        }
+
+    monkeypatch.setattr(LibraryScanner, "scan", fake_scan)
+
+    response_holder: dict[str, object] = {}
+
+    def run_scan() -> None:
+        response_holder["response"] = client.post("/api/library/scan")
+
+    thread = threading.Thread(target=run_scan)
+    thread.start()
+
+    assert progress_started.wait(timeout=2)
+    in_flight_response = client.get("/api/library/scan/progress")
+    assert in_flight_response.status_code == 200
+    assert in_flight_response.json()["scanning"] is True
+    assert in_flight_response.json()["files_found"] == 10
+    assert in_flight_response.json()["files_processed"] == 3
+
+    release_scan.set()
+    thread.join(timeout=2)
+
+    completed_response = response_holder["response"]
+    assert completed_response.status_code == 200
+
+    final_progress = client.get("/api/library/scan/progress")
+    assert final_progress.status_code == 200
+    assert final_progress.json()["scanning"] is False
+    assert final_progress.json()["files_found"] == 10
+    assert final_progress.json()["files_processed"] == 10
+    assert final_progress.json()["new_books"] == 2
 
 
 def test_parse_book_flow_and_chapter_updates(

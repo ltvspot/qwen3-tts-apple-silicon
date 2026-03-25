@@ -22,6 +22,11 @@ jest.mock("./pages/Library", () => ({
   default: () => <div>Library</div>,
 }));
 
+jest.mock("./pages/ProductionOverseer", () => ({
+  __esModule: true,
+  default: () => <div>Production Overseer</div>,
+}));
+
 jest.mock("./pages/QA", () => ({
   __esModule: true,
   default: () => <div>QA</div>,
@@ -104,6 +109,14 @@ describe("App routes", () => {
 
     await waitFor(() => {
       expect(container.textContent).toContain("Catalog Dashboard");
+    });
+  });
+
+  test("renders_overseer_route", async () => {
+    await renderAppAt("/overseer");
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("Production Overseer");
     });
   });
 

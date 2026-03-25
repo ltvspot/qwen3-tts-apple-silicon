@@ -14,6 +14,8 @@ from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from src import __version__
@@ -21,9 +23,9 @@ from src.api.batch_routes import router as batch_router
 from src.api.error_handlers import register_error_handlers
 from src.api.export_routes import router as export_router
 from src.api.generation import router as generation_router
-from src.api.generation_runtime import shutdown_generation_runtime
 from src.api.middleware import request_context_middleware
 from src.api.monitoring_routes import router as monitoring_router
+from src.api.overseer_routes import router as overseer_router
 from src.api.qa_routes import router as qa_router
 from src.api.queue_routes import router as queue_router
 from src.api.settings_routes import router as settings_router
@@ -34,6 +36,7 @@ from src.config import get_application_settings, reset_settings_manager, setting
 from src.database import init_db, utc_now
 from src.health_checks import run_all_health_checks
 from src.logging_config import configure_logging
+from src.startup import graceful_shutdown, install_signal_handlers, run_startup_recovery
 
 configure_logging(level=settings.LOG_LEVEL)
 logger = logging.getLogger(__name__)
@@ -57,13 +60,15 @@ async def lifespan(app: FastAPI):
     logger.info("Starting Alexandria Audiobook Narrator %s", __version__)
     ensure_runtime_directories()
     init_db()
+    run_startup_recovery()
     reset_settings_manager()
     application_settings = get_application_settings()
     logger.info("Loaded application settings for narrator: %s", application_settings.narrator_name)
+    install_signal_handlers()
     startup_summary = await run_all_health_checks()
     app.state.startup_health = startup_summary
     yield
-    await shutdown_generation_runtime()
+    await graceful_shutdown("application shutdown")
     release_engine()
 
 
@@ -86,6 +91,7 @@ app.include_router(batch_router)
 app.include_router(export_router)
 app.include_router(generation_router)
 app.include_router(monitoring_router)
+app.include_router(overseer_router)
 app.include_router(qa_router)
 app.include_router(queue_router)
 app.include_router(settings_router)
@@ -107,6 +113,33 @@ async def health_check() -> HealthCheckResponse:
     else:
         status = "ok"
     return HealthCheckResponse(status=status, version=__version__, startup=startup_summary)
+
+
+# --- Frontend static file serving ---
+_frontend_build = Path(settings.FRONTEND_BUILD_DIR)
+
+if _frontend_build.exists() and (_frontend_build / "index.html").exists():
+    # Serve /static/js/*, /static/css/*, etc.
+    app.mount("/static", StaticFiles(directory=str(_frontend_build / "static")), name="frontend-static")
+
+    @app.get("/asset-manifest.json")
+    async def asset_manifest():
+        return FileResponse(str(_frontend_build / "asset-manifest.json"))
+
+    @app.get("/{full_path:path}")
+    async def serve_spa(full_path: str):
+        """Catch-all: serve index.html for any non-API route (React Router handles client routing)."""
+
+        file_path = _frontend_build / full_path
+        if full_path and file_path.exists() and file_path.is_file():
+            return FileResponse(str(file_path))
+        return FileResponse(str(_frontend_build / "index.html"))
+else:
+    logger.warning(
+        "Frontend build not found at %s - run 'cd frontend && npm run build' first. "
+        "API endpoints are still available.",
+        _frontend_build,
+    )
 
 
 if __name__ == "__main__":

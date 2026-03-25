@@ -13,11 +13,12 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session, selectinload, sessionmaker
 
 from src.api.cache import invalidate_library_cache
-from src.database import Book, BookExportStatus, Chapter, ChapterStatus, ExportJob, QAStatus, get_db, utc_now
+from src.database import Book, BookExportStatus, Chapter, ChapterQARecord, ChapterStatus, ExportJob, get_db, utc_now
 from src.pipeline.exporter import (
     ExportFormatResult,
     QAReport,
     _empty_format_details,
+    _chapter_is_approved,
     _normalize_export_formats,
     estimate_export_seconds,
     get_export_output_path,
@@ -59,6 +60,11 @@ class ExportStatusResponse(BaseModel):
     formats: dict[str, ExportFormatResult]
     qa_report: QAReport | None = None
     error_message: str | None = None
+    progress_percent: float = 0.0
+    current_stage: str | None = None
+    current_format: str | None = None
+    current_chapter_n: int | None = None
+    total_chapters: int | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
 
@@ -151,6 +157,7 @@ def _serialize_status(book: Book, export_job: ExportJob | None) -> ExportStatusR
             book_id=book.id,
             export_status=book.export_status.value,
             formats={},
+            progress_percent=100.0 if book.export_status == BookExportStatus.COMPLETED else 0.0,
             started_at=None,
             completed_at=book.last_export_date,
         )
@@ -164,6 +171,11 @@ def _serialize_status(book: Book, export_job: ExportJob | None) -> ExportStatusR
         formats=_serialize_format_details(export_job, formats_requested),
         qa_report=qa_report,
         error_message=export_job.error_message,
+        progress_percent=export_job.progress_percent,
+        current_stage=export_job.current_stage,
+        current_format=export_job.current_format,
+        current_chapter_n=export_job.current_chapter_n,
+        total_chapters=export_job.total_chapters,
         started_at=export_job.started_at,
         completed_at=export_job.completed_at,
     )
@@ -182,6 +194,7 @@ def _validate_export_chapters(
     chapters: list[Chapter],
     *,
     include_only_approved: bool,
+    qa_records: dict[int, ChapterQARecord] | None = None,
 ) -> tuple[bool, str]:
     """Return whether the chapter set is export-ready and why when it is not."""
 
@@ -197,7 +210,10 @@ def _validate_export_chapters(
         )
 
     if include_only_approved:
-        approved = sum(chapter.qa_status == QAStatus.APPROVED for chapter in chapters)
+        approved = sum(
+            _chapter_is_approved(chapter, qa_records.get(chapter.number) if qa_records else None)
+            for chapter in chapters
+        )
         if approved < total:
             return (
                 False,
@@ -220,7 +236,15 @@ def _validate_book_export_readiness(
         return False, "Book not found"
 
     chapters = db.query(Chapter).filter(Chapter.book_id == book_id).all()
-    return _validate_export_chapters(chapters, include_only_approved=include_only_approved)
+    qa_records = {
+        record.chapter_n: record
+        for record in db.query(ChapterQARecord).filter(ChapterQARecord.book_id == book_id).all()
+    }
+    return _validate_export_chapters(
+        chapters,
+        include_only_approved=include_only_approved,
+        qa_records=qa_records,
+    )
 
 
 def _queue_export_for_book(
@@ -263,6 +287,11 @@ def _queue_export_for_book(
             export_status=BookExportStatus.PROCESSING,
             formats_requested=json.dumps(formats),
             format_details=pending_details,
+            progress_percent=0.0,
+            current_stage="Queued",
+            current_format=None,
+            current_chapter_n=None,
+            total_chapters=None,
             include_only_approved=request.include_only_approved,
             created_at=started_at,
             started_at=started_at,
@@ -277,6 +306,11 @@ def _queue_export_for_book(
         export_job.export_status = BookExportStatus.PROCESSING
         export_job.formats_requested = json.dumps(formats)
         export_job.format_details = pending_details
+        export_job.progress_percent = 0.0
+        export_job.current_stage = "Queued"
+        export_job.current_format = None
+        export_job.current_chapter_n = None
+        export_job.total_chapters = None
         export_job.include_only_approved = request.include_only_approved
         export_job.created_at = started_at
         export_job.started_at = started_at
@@ -305,10 +339,18 @@ def _launch_export_job(
     task.add_done_callback(_export_tasks.discard)
 
 
-def _book_is_ready_for_batch_export(book: Book, *, include_only_approved: bool) -> bool:
+def _book_is_ready_for_batch_export(db: Session, book: Book, *, include_only_approved: bool) -> bool:
     """Return whether the book is ready for batch export."""
 
-    ready, _ = _validate_export_chapters(list(book.chapters), include_only_approved=include_only_approved)
+    qa_records = {
+        record.chapter_n: record
+        for record in db.query(ChapterQARecord).filter(ChapterQARecord.book_id == book.id).all()
+    }
+    ready, _ = _validate_export_chapters(
+        list(book.chapters),
+        include_only_approved=include_only_approved,
+        qa_records=qa_records,
+    )
     return ready
 
 
@@ -565,7 +607,7 @@ async def batch_export(
             )
             continue
 
-        if not _book_is_ready_for_batch_export(book, include_only_approved=request.include_only_approved):
+        if not _book_is_ready_for_batch_export(db, book, include_only_approved=request.include_only_approved):
             state.not_ready += 1
             _mark_batch_export_book(
                 state=state,

@@ -24,7 +24,8 @@ from src.database import (
     GenerationJobStatus,
     get_db,
 )
-from src.pipeline.queue_manager import JobInfo
+from src.pipeline.manuscript_validator import ManuscriptValidator
+from src.pipeline.queue_manager import DuplicateGenerationJobError, JobInfo, QueueDrainingError
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +78,8 @@ class ChapterGenerationStatusResponse(BaseModel):
     started_at: datetime | None = None
     audio_file_size_bytes: int | None = None
     generation_seconds: float | None = None
+    current_chunk: int | None = None
+    total_chunks: int | None = None
 
 
 class BookGenerationStatusResponse(BaseModel):
@@ -86,6 +89,8 @@ class BookGenerationStatusResponse(BaseModel):
     status: str
     chapters: list[ChapterGenerationStatusResponse]
     current_chapter_n: int | None = None
+    current_chunk: int | None = None
+    total_chunks: int | None = None
     eta_seconds: int | None = None
     started_at: datetime | None = None
 
@@ -128,6 +133,27 @@ def _validate_book_ready_for_generation(
         raise HTTPException(
             status_code=400,
             detail=f"Chapters missing text content: {missing_text}",
+        )
+
+    validation_report = ManuscriptValidator.validate(
+        book_id,
+        [
+            {
+                "book_title": book.title,
+                "number": chapter.number,
+                "text": chapter.text_content or "",
+            }
+            for chapter in chapters
+        ],
+    )
+    if not validation_report.ready_for_generation:
+        error_count = sum(1 for issue in validation_report.issues if issue.severity == "error")
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Manuscript validation failed with {error_count} blocking issue(s). "
+                f"Review /api/book/{book_id}/validate-manuscript before generating."
+            ),
         )
 
     if not force and all(chapter.status == ChapterStatus.GENERATED for chapter in chapters):
@@ -193,6 +219,30 @@ def _get_book_jobs(book_id: int, db: Session) -> list[GenerationJob]:
         .order_by(GenerationJob.created_at.desc(), GenerationJob.id.desc())
         .all()
     )
+
+
+def _latest_resume_checkpoint(book_id: int, db: Session) -> int:
+    """Return the most recent persisted checkpoint for a resumable full-book job."""
+
+    latest_job = (
+        db.query(GenerationJob)
+        .filter(
+            GenerationJob.book_id == book_id,
+            GenerationJob.chapter_id.is_(None),
+            GenerationJob.status.in_(
+                (
+                    GenerationJobStatus.FAILED,
+                    GenerationJobStatus.PAUSED,
+                    GenerationJobStatus.CANCELLED,
+                )
+            ),
+        )
+        .order_by(GenerationJob.created_at.desc(), GenerationJob.id.desc())
+        .first()
+    )
+    if latest_job is None:
+        return 0
+    return latest_job.last_completed_chapter
 
 
 def _expected_total_seconds(chapter: Chapter) -> float | None:
@@ -316,6 +366,8 @@ def _serialize_chapter_generation_status(
         started_at=chapter.started_at,
         audio_file_size_bytes=chapter.audio_file_size_bytes,
         generation_seconds=_generation_seconds(chapter),
+        current_chunk=chapter.current_chunk,
+        total_chunks=chapter.total_chunks,
     )
 
 
@@ -395,10 +447,16 @@ def _build_book_status(book: Book, db: Session) -> BookGenerationStatusResponse:
         status = "idle"
 
     current_chapter_n = None
+    current_chunk = None
+    total_chunks = None
     if generating_chapter is not None:
         current_chapter_n = generating_chapter.number
+        current_chunk = generating_chapter.current_chunk
+        total_chunks = generating_chapter.total_chunks
     elif queued_chapter is not None:
         current_chapter_n = queued_chapter.number
+        current_chunk = queued_chapter.current_chunk
+        total_chunks = queued_chapter.total_chunks
     elif book_job is not None:
         next_incomplete = next(
             (chapter.number for chapter in chapters if chapter.status != ChapterStatus.GENERATED),
@@ -415,6 +473,8 @@ def _build_book_status(book: Book, db: Session) -> BookGenerationStatusResponse:
         status=status,
         chapters=chapter_statuses,
         current_chapter_n=current_chapter_n,
+        current_chunk=current_chunk,
+        total_chunks=total_chunks,
         eta_seconds=_calculate_eta_seconds(chapters, chapter_statuses, is_generating=status == "generating"),
         started_at=started_at,
     )
@@ -428,13 +488,17 @@ async def _enqueue_book_generation(book_id: int, db: Session, *, force: bool) ->
     _validate_book_ready_for_generation(book, chapters, book_id, force=force)
 
     if _has_active_job(book_id, db):
-        raise HTTPException(status_code=400, detail="Generation is already active for this book.")
+        raise HTTPException(status_code=409, detail="Generation is already queued or running for this book.")
 
     try:
         queue = await ensure_queue_started(db)
         job_id = await queue.enqueue_book(book_id, db, force=force)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except DuplicateGenerationJobError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except QueueDrainingError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("Failed to enqueue book %s for generation", book_id)
         raise HTTPException(status_code=500, detail="Failed to queue generation job.") from exc
@@ -482,13 +546,23 @@ async def resume_book_generation(book_id: int, db: Session = Depends(get_db)) ->
     if resume_from is None:
         raise HTTPException(status_code=400, detail="All chapters are already generated.")
     if _has_active_job(book_id, db):
-        raise HTTPException(status_code=400, detail="Generation is already active for this book.")
+        raise HTTPException(status_code=409, detail="Generation is already queued or running for this book.")
+    resume_checkpoint = max(_latest_resume_checkpoint(book_id, db), max(resume_from - 1, 0))
 
     try:
         queue = await ensure_queue_started(db)
-        job_id = await queue.enqueue_book(book_id, db, force=False)
+        job_id = await queue.enqueue_book(
+            book_id,
+            db,
+            force=False,
+            last_completed_chapter=resume_checkpoint,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except DuplicateGenerationJobError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except QueueDrainingError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("Failed to resume generation for book %s", book_id)
         raise HTTPException(status_code=500, detail="Failed to resume generation.") from exc
@@ -528,13 +602,17 @@ async def generate_chapter(
             detail="Chapter audio already exists. Use force=true to re-generate it.",
         )
     if _has_active_job(book_id, db):
-        raise HTTPException(status_code=400, detail="Generation is already active for this book.")
+        raise HTTPException(status_code=409, detail="Generation is already queued or running for this book.")
 
     try:
         queue = await ensure_queue_started(db)
         job_id = await queue.enqueue_chapter(book_id, chapter_number, db, force=force)
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except DuplicateGenerationJobError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except QueueDrainingError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("Failed to enqueue book %s chapter %s", book_id, chapter_number)
         raise HTTPException(status_code=500, detail="Failed to queue chapter generation.") from exc

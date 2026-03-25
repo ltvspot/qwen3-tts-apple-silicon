@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import logging
 import re
 
+import numpy as np
 from pydub.audio_segment import AudioSegment
 
 logger = logging.getLogger(__name__)
+_DFT_MATRIX_CACHE: dict[int, np.ndarray] = {}
 
 
 class TextChunker:
@@ -242,19 +245,122 @@ class AudioStitcher:
     """Join audio chunks together with a light crossfade."""
 
     CROSSFADE_MS = 30
+    SIMILAR_CROSSFADE_MS = 20
+    MODERATE_CROSSFADE_MS = 50
+    DIFFERENT_CROSSFADE_MS = 100
+    VERY_DIFFERENT_CROSSFADE_MS = 150
+
+    @dataclass(slots=True)
+    class StitchResult:
+        """Stitch output plus the chunk start timestamps used for QA."""
+
+        audio: AudioSegment
+        chunk_boundaries: list[float]
+        crossfades_ms: list[int]
+
+    @classmethod
+    def compute_adaptive_crossfade(cls, chunk_a: AudioSegment, chunk_b: AudioSegment) -> int:
+        """Choose a crossfade based on the spectral similarity around a stitch point."""
+
+        tail = chunk_a[-100:].set_channels(1)
+        head = chunk_b[:100].set_channels(1)
+        if len(tail) == 0 or len(head) == 0:
+            return cls.CROSSFADE_MS
+
+        sample_count = min(len(tail.get_array_of_samples()), len(head.get_array_of_samples()))
+        if sample_count <= 0:
+            return cls.CROSSFADE_MS
+
+        tail_samples = cls._normalized_samples(tail)[:sample_count]
+        head_samples = cls._normalized_samples(head)[:sample_count]
+        tail_spectrum = cls._magnitude_spectrum(tail_samples)
+        head_spectrum = cls._magnitude_spectrum(head_samples)
+        similarity = cls._cosine_similarity(tail_spectrum, head_spectrum)
+
+        if similarity > 0.9:
+            return cls.SIMILAR_CROSSFADE_MS
+        if similarity >= 0.7:
+            return cls.MODERATE_CROSSFADE_MS
+        if similarity >= 0.5:
+            return cls.DIFFERENT_CROSSFADE_MS
+
+        logger.warning("Very different chunk boundary detected (similarity %.2f); using 150ms crossfade", similarity)
+        return cls.VERY_DIFFERENT_CROSSFADE_MS
+
+    @classmethod
+    def stitch_with_metadata(cls, audio_chunks: list[AudioSegment]) -> StitchResult:
+        """Return stitched audio plus chunk boundary metadata for downstream QA."""
+
+        if not audio_chunks:
+            raise ValueError("No audio chunks to stitch")
+        if len(audio_chunks) == 1:
+            return cls.StitchResult(audio=audio_chunks[0], chunk_boundaries=[0.0], crossfades_ms=[])
+
+        logger.info("Stitching %s audio chunks", len(audio_chunks))
+        result = audio_chunks[0]
+        chunk_boundaries = [0.0]
+        crossfades_ms: list[int] = []
+
+        for chunk in audio_chunks[1:]:
+            adaptive_crossfade = cls.compute_adaptive_crossfade(result, chunk)
+            crossfade = min(adaptive_crossfade, len(result), len(chunk))
+            chunk_boundaries.append(max(len(result) - crossfade, 0) / 1000.0)
+            crossfades_ms.append(crossfade)
+            result = result.append(chunk, crossfade=crossfade)
+
+        return cls.StitchResult(
+            audio=result,
+            chunk_boundaries=chunk_boundaries,
+            crossfades_ms=crossfades_ms,
+        )
 
     @classmethod
     def stitch(cls, audio_chunks: list[AudioSegment]) -> AudioSegment:
         """Return one continuous segment from one or more generated chunks."""
 
-        if not audio_chunks:
-            raise ValueError("No audio chunks to stitch")
-        if len(audio_chunks) == 1:
-            return audio_chunks[0]
+        return cls.stitch_with_metadata(audio_chunks).audio
 
-        logger.info("Stitching %s audio chunks", len(audio_chunks))
-        result = audio_chunks[0]
-        for chunk in audio_chunks[1:]:
-            crossfade = min(cls.CROSSFADE_MS, len(result), len(chunk))
-            result = result.append(chunk, crossfade=crossfade)
-        return result
+    @staticmethod
+    def _normalized_samples(audio: AudioSegment) -> np.ndarray:
+        """Return mono float samples in the range [-1, 1]."""
+
+        mono_audio = audio.set_channels(1)
+        samples = np.array(mono_audio.get_array_of_samples(), dtype=np.float32)
+        if samples.size == 0:
+            return samples
+
+        max_amplitude = float(1 << ((8 * mono_audio.sample_width) - 1))
+        return samples / max_amplitude
+
+    @staticmethod
+    def _magnitude_spectrum(samples: np.ndarray) -> np.ndarray:
+        """Return a stable real-spectrum magnitude without relying on ``numpy.fft``."""
+
+        frame_length = samples.size
+        if frame_length == 0:
+            return np.zeros(0, dtype=np.float32)
+
+        if frame_length not in _DFT_MATRIX_CACHE:
+            frequencies = np.arange((frame_length // 2) + 1, dtype=np.float32)[:, None]
+            times = np.arange(frame_length, dtype=np.float32)[None, :]
+            exponent = (-2j * np.pi * frequencies * times) / float(frame_length)
+            _DFT_MATRIX_CACHE[frame_length] = np.exp(exponent).astype(np.complex64)
+
+        return np.abs(_DFT_MATRIX_CACHE[frame_length] @ samples.astype(np.float32))
+
+    @staticmethod
+    def _cosine_similarity(left: np.ndarray, right: np.ndarray) -> float:
+        """Return cosine similarity between two spectra."""
+
+        if left.size == 0 or right.size == 0:
+            return 1.0
+
+        sample_count = min(left.size, right.size)
+        left = left[:sample_count]
+        right = right[:sample_count]
+        left_norm = float(np.linalg.norm(left))
+        right_norm = float(np.linalg.norm(right))
+        if left_norm <= 1e-8 or right_norm <= 1e-8:
+            return 1.0
+
+        return float(np.dot(left, right) / (left_norm * right_norm))

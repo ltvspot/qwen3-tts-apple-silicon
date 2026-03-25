@@ -1,0 +1,1 @@
+Read CLAUDE.md and PROJECT-STATE.md first, then read and implement Codex Prompts/PROMPT-18-PRODUCTION-SCALE.md. Follow all conventions in CLAUDE.md. Commit with message: [PROMPT-18] PRODUCTION SCALE. Run tests before committing.

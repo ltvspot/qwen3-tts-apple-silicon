@@ -7,7 +7,7 @@ import logging
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 logger = logging.getLogger(__name__)
@@ -25,6 +25,7 @@ class RuntimeSettings(BaseSettings):
     OUTPUTS_PATH: str = "./outputs/"
     VOICES_PATH: str = "./voices/"
     MODELS_PATH: str = "./models/"
+    FRONTEND_BUILD_DIR: str = "./frontend/build"
     FRONTEND_URL: str = "http://localhost:3000"
     TTS_ENGINE: str = "qwen3_tts"
     TTS_BACKEND: str = "auto"
@@ -51,6 +52,29 @@ class VoiceSettings(BaseModel):
     speed: float = Field(default=1.0, ge=0.5, le=2.0, description="Default narration speed multiplier.")
 
 
+class FailureThresholdSettings(BaseModel):
+    """Configurable failure thresholds for resilient long-running batch jobs."""
+
+    max_failure_rate_percent: float = Field(
+        default=5.0,
+        ge=1.0,
+        le=50.0,
+        description="Stop a long-running generation job if failed chunks exceed this percentage of processed chunks.",
+    )
+    max_consecutive_failures: int = Field(
+        default=10,
+        ge=3,
+        le=50,
+        description="Safety valve that stops a run after this many failures in a row.",
+    )
+    min_chunks_for_rate: int = Field(
+        default=50,
+        ge=10,
+        le=500,
+        description="Minimum processed chunks before rate-based stopping activates.",
+    )
+
+
 class EngineSettings(BaseModel):
     """TTS engine configuration."""
 
@@ -65,11 +89,9 @@ class EngineSettings(BaseModel):
         le=600,
         description="Max seconds allowed for generating a single text chunk.",
     )
-    consecutive_failure_threshold: int = Field(
-        default=5,
-        ge=1,
-        le=20,
-        description="Number of consecutive chapter failures allowed before stopping a job.",
+    failure_thresholds: FailureThresholdSettings = Field(
+        default_factory=FailureThresholdSettings,
+        description="Failure thresholds used to stop unstable long-running generation jobs.",
     )
     cooldown_chapter_threshold: int = Field(
         default=50,
@@ -90,10 +112,86 @@ class EngineSettings(BaseModel):
         description="Reload the TTS engine after this many seconds since the last reload.",
     )
     memory_pressure_threshold_mb: float = Field(
-        default=12000.0,
-        ge=512.0,
-        le=262144.0,
+        default=10000.0,
+        ge=4000.0,
+        le=32000.0,
         description="Force a TTS engine reload when process memory rises above this threshold.",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_failure_threshold(cls, value: Any) -> Any:
+        """Preserve older single-threshold configs when loading persisted settings."""
+
+        if not isinstance(value, dict):
+            return value
+
+        legacy_threshold = value.get("consecutive_failure_threshold")
+        if legacy_threshold is None or "failure_thresholds" in value:
+            return value
+
+        migrated = dict(value)
+        migrated["failure_thresholds"] = {
+            "max_consecutive_failures": legacy_threshold,
+        }
+        return migrated
+
+
+class ChunkValidationSettings(BaseModel):
+    """Per-chunk validation thresholds and optional quality-gate checks."""
+
+    stt_alignment_enabled: bool = Field(
+        default=True,
+        description="Enable speech-to-text alignment validation when Whisper is available.",
+    )
+    stt_model: str = Field(
+        default="tiny.en",
+        min_length=1,
+        description="Whisper model name used for per-chunk STT alignment checks.",
+    )
+    wer_warning_threshold: float = Field(
+        default=0.15,
+        ge=0.0,
+        le=1.0,
+        description="Word error rate above which chunks are flagged for review.",
+    )
+    wer_fail_threshold: float = Field(
+        default=0.30,
+        ge=0.0,
+        le=1.0,
+        description="Word error rate above which chunks are automatically regenerated.",
+    )
+    repeat_detection_enabled: bool = Field(
+        default=True,
+        description="Enable repeated-phrase and loop detection on generated chunks.",
+    )
+    min_repeat_ngram: int = Field(
+        default=3,
+        ge=2,
+        le=8,
+        description="Minimum repeated phrase length that should fail chunk validation.",
+    )
+    repeat_correlation_threshold: float = Field(
+        default=0.85,
+        ge=0.0,
+        le=1.0,
+        description="Minimum audio correlation used for fallback repeat-loop detection.",
+    )
+    clarity_check_enabled: bool = Field(
+        default=True,
+        description="Enable spectral clarity and gibberish detection checks.",
+    )
+    spectral_flatness_warning: float = Field(
+        default=0.20,
+        ge=0.0,
+        le=1.0,
+        description="Average spectral flatness above which chunks are flagged for review.",
+    )
+    spectral_flatness_fail: float = Field(
+        default=0.30,
+        ge=0.0,
+        le=1.0,
+        description="Average spectral flatness above which chunks are automatically regenerated.",
     )
 
 
@@ -150,6 +248,7 @@ class ApplicationSettings(BaseModel):
     )
     default_voice: VoiceSettings = Field(default_factory=VoiceSettings)
     engine_config: EngineSettings = Field(default_factory=EngineSettings)
+    chunk_validation: ChunkValidationSettings = Field(default_factory=ChunkValidationSettings)
     output_preferences: OutputSettings = Field(default_factory=OutputSettings)
 
 

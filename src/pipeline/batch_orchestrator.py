@@ -9,7 +9,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Callable
 
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from src.database import (
     BatchBookStatus,
@@ -34,6 +34,15 @@ class BatchStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
+
+class BatchSchedulingStrategy(str, Enum):
+    """Available ordering strategies for catalog-wide batch generation."""
+
+    FIFO = "fifo"
+    SHORTEST_FIRST = "shortest"
+    LONGEST_FIRST = "longest"
+    PRIORITY = "priority"
 
 
 @dataclass(slots=True)
@@ -73,6 +82,7 @@ class BatchProgress:
     resource_warnings: list[str] = field(default_factory=list)
     model_reloads: int = 0
     pause_reason: str | None = None
+    scheduling_strategy: str = BatchSchedulingStrategy.SHORTEST_FIRST.value
 
 
 class BatchOrchestrator:
@@ -117,6 +127,7 @@ class BatchOrchestrator:
         batch_id: str | None = None,
         priority: str = "normal",
         skip_already_exported: bool = True,
+        strategy: BatchSchedulingStrategy = BatchSchedulingStrategy.SHORTEST_FIRST,
     ) -> BatchProgress:
         """Start a batch generation run for the supplied books."""
 
@@ -129,6 +140,7 @@ class BatchOrchestrator:
             batch_id=batch_identifier,
             total_books=len(book_ids),
             started_at=datetime.now(timezone.utc).isoformat(),
+            scheduling_strategy=strategy.value,
         )
         self._cancel_event.clear()
         self._pause_event.set()
@@ -139,11 +151,56 @@ class BatchOrchestrator:
             self._persist_run()
             return self._progress
 
+        ordered_book_ids = self._order_book_ids(book_ids, strategy)
         self._task = asyncio.create_task(
-            self._run_batch(book_ids, skip_already_exported),
+            self._run_batch(ordered_book_ids, skip_already_exported),
             name=f"batch-orchestrator-{batch_identifier}",
         )
         return self._progress
+
+    def _order_book_ids(
+        self,
+        book_ids: list[int],
+        strategy: BatchSchedulingStrategy,
+    ) -> list[int]:
+        """Return the book ids in the order they should be processed."""
+
+        if not book_ids or strategy == BatchSchedulingStrategy.FIFO:
+            return list(book_ids)
+
+        with self.db_session_factory() as db_session:
+            books = (
+                db_session.query(Book)
+                .options(selectinload(Book.chapters))
+                .filter(Book.id.in_(book_ids))
+                .all()
+            )
+
+        input_order = {book_id: index for index, book_id in enumerate(book_ids)}
+        chapter_counts = {
+            book.id: len(getattr(book, "chapters", []) or [])
+            for book in books
+        }
+        known_ids = [book.id for book in books]
+        missing_ids = [book_id for book_id in book_ids if book_id not in chapter_counts]
+
+        if strategy == BatchSchedulingStrategy.SHORTEST_FIRST:
+            ordered = sorted(
+                known_ids,
+                key=lambda book_id: (chapter_counts.get(book_id, 0), input_order.get(book_id, 0)),
+            )
+        elif strategy == BatchSchedulingStrategy.LONGEST_FIRST:
+            ordered = sorted(
+                known_ids,
+                key=lambda book_id: (-chapter_counts.get(book_id, 0), input_order.get(book_id, 0)),
+            )
+        elif strategy == BatchSchedulingStrategy.PRIORITY:
+            # For batch runs, the submitted book order is the user-defined priority list.
+            ordered = sorted(known_ids, key=lambda book_id: input_order.get(book_id, 0))
+        else:
+            ordered = list(book_ids)
+
+        return [*ordered, *missing_ids]
 
     async def _run_batch(self, book_ids: list[int], skip_exported: bool) -> None:
         """Execute the batch run sequentially across the requested books."""
@@ -170,60 +227,7 @@ class BatchOrchestrator:
                 self._persist_run()
                 return
 
-            with self.db_session_factory() as db_session:
-                book = db_session.query(Book).filter(Book.id == book_id).first()
-                if book is None:
-                    self._record_result(
-                        BatchBookResult(
-                            book_id=book_id,
-                            title=f"Book {book_id}",
-                            status="skipped",
-                            error_message="Book not found.",
-                        )
-                    )
-                    continue
-
-                if skip_exported and book.export_status == BookExportStatus.COMPLETED:
-                    self._record_result(
-                        BatchBookResult(
-                            book_id=book_id,
-                            title=book.title,
-                            status="skipped",
-                        )
-                    )
-                    continue
-
-                self._progress.current_book_id = book.id
-                self._progress.current_book_title = book.title
-                self._progress.books_in_progress = 1
-                self._progress.model_reloads = self.model_manager.stats.reload_count
-                self._persist_run()
-
-                book_started_at = datetime.now(timezone.utc)
-                result = BatchBookResult(
-                    book_id=book.id,
-                    title=book.title,
-                    status="running",
-                    started_at=book_started_at.isoformat(),
-                )
-                self._persist_book_result(result)
-
-                try:
-                    job_id = await self.queue_manager.enqueue_book(
-                        book.id,
-                        db_session,
-                        priority=self._priority_value,
-                        job_type=GenerationJobType.BATCH_ALL,
-                    )
-                except Exception as exc:
-                    logger.exception("Failed to enqueue batch book %s", book.id)
-                    result.status = "failed"
-                    result.error_message = str(exc)
-                    result.completed_at = datetime.now(timezone.utc).isoformat()
-                    self._record_result(result)
-                    continue
-
-            result = await self._wait_for_job(result, job_id)
+            result = await self._process_book(book_id, skip_exported)
             self._record_result(result)
 
             if result.status == "completed":
@@ -237,6 +241,75 @@ class BatchOrchestrator:
         self._progress.books_in_progress = 0
         self._progress.model_reloads = self.model_manager.stats.reload_count
         self._persist_run()
+
+    async def _process_book(self, book_id: int, skip_exported: bool) -> BatchBookResult:
+        """Process one book without letting failures abort the rest of the batch."""
+
+        with self.db_session_factory() as db_session:
+            book = db_session.query(Book).filter(Book.id == book_id).first()
+            if book is None:
+                return BatchBookResult(
+                    book_id=book_id,
+                    title=f"Book {book_id}",
+                    status="skipped",
+                    error_message="Book not found.",
+                )
+
+            if skip_exported and book.export_status == BookExportStatus.COMPLETED:
+                return BatchBookResult(
+                    book_id=book.id,
+                    title=book.title,
+                    status="skipped",
+                )
+
+            self._progress.current_book_id = book.id
+            self._progress.current_book_title = book.title
+            self._progress.books_in_progress = 1
+            self._progress.model_reloads = self.model_manager.stats.reload_count
+            self._persist_run()
+
+            started_at = datetime.now(timezone.utc)
+            result = BatchBookResult(
+                book_id=book.id,
+                title=book.title,
+                status="running",
+                started_at=started_at.isoformat(),
+            )
+            self._persist_book_result(result)
+
+            try:
+                job_id = await self.queue_manager.enqueue_book(
+                    book.id,
+                    db_session,
+                    priority=self._priority_value,
+                    job_type=GenerationJobType.BATCH_ALL,
+                )
+            except Exception as exc:
+                logger.exception("Failed to enqueue batch book %s", book.id)
+                return BatchBookResult(
+                    book_id=book.id,
+                    title=book.title,
+                    status="failed",
+                    error_message=f"Unhandled error: {str(exc)[:500]}",
+                    started_at=result.started_at,
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                )
+
+        try:
+            result = await self._wait_for_job(result, job_id)
+            if result.status == "failed" and not result.error_message:
+                result.error_message = "Book generation failed: unknown"
+            return result
+        except Exception as exc:
+            logger.error("Book %s failed with exception: %s", book_id, exc, exc_info=True)
+            return BatchBookResult(
+                book_id=result.book_id,
+                title=result.title,
+                status="failed",
+                error_message=f"Unhandled error: {str(exc)[:500]}",
+                started_at=result.started_at,
+                completed_at=datetime.now(timezone.utc).isoformat(),
+            )
 
     async def _wait_for_resources(self) -> None:
         """Block until monitored resources are healthy enough to continue."""
@@ -276,6 +349,7 @@ class BatchOrchestrator:
                 result.completed_at = datetime.now(timezone.utc).isoformat()
                 return result
 
+            terminal_result: BatchBookResult | None = None
             with self.db_session_factory() as db_session:
                 db_job = db_session.query(GenerationJob).filter(GenerationJob.id == job_id).first()
                 if db_job is None:
@@ -291,18 +365,22 @@ class BatchOrchestrator:
                 elif db_job.status == GenerationJobStatus.CANCELLED:
                     result.status = "cancelled"
                 else:
-                    await asyncio.sleep(2.0)
-                    continue
+                    db_job = None
 
-                result.chapters_total = db_job.chapters_total
-                result.chapters_completed = db_job.chapters_completed
-                result.chapters_failed = db_job.chapters_failed
-                result.error_message = db_job.error_message
-                completed_at = db_job.completed_at or utc_now()
-                result.completed_at = completed_at.isoformat()
-                started_at = db_job.started_at or utc_now()
-                result.duration_seconds = max((completed_at - started_at).total_seconds(), 0.0)
-                return result
+                if db_job is not None:
+                    result.chapters_total = db_job.chapters_total
+                    result.chapters_completed = db_job.chapters_completed
+                    result.chapters_failed = db_job.chapters_failed
+                    result.error_message = db_job.error_message
+                    completed_at = db_job.completed_at or utc_now()
+                    result.completed_at = completed_at.isoformat()
+                    started_at = db_job.started_at or utc_now()
+                    result.duration_seconds = max((completed_at - started_at).total_seconds(), 0.0)
+                    terminal_result = result
+
+            if terminal_result is not None:
+                return terminal_result
+            await asyncio.sleep(2.0)
 
     def _update_eta(
         self,
@@ -490,6 +568,14 @@ class BatchOrchestrator:
             return None
 
         progress = self._progress
+        books_remaining = max(
+            progress.total_books
+            - progress.books_completed
+            - progress.books_failed
+            - progress.books_skipped
+            - progress.books_in_progress,
+            0,
+        )
         return {
             "batch_id": progress.batch_id,
             "status": progress.status.value,
@@ -498,6 +584,7 @@ class BatchOrchestrator:
             "books_failed": progress.books_failed,
             "books_skipped": progress.books_skipped,
             "books_in_progress": progress.books_in_progress,
+            "books_remaining": books_remaining,
             "current_book_id": progress.current_book_id,
             "current_book_title": progress.current_book_title,
             "started_at": progress.started_at,
@@ -507,6 +594,13 @@ class BatchOrchestrator:
             "resource_warnings": progress.resource_warnings,
             "model_reloads": progress.model_reloads,
             "pause_reason": progress.pause_reason,
+            "scheduling_strategy": progress.scheduling_strategy,
+            "summary": (
+                f"Completed: {progress.books_completed} | "
+                f"Failed: {progress.books_failed} | "
+                f"Skipped: {progress.books_skipped} | "
+                f"Remaining: {books_remaining}"
+            ),
             "percent_complete": round(
                 (progress.books_completed + progress.books_failed + progress.books_skipped)
                 / max(progress.total_books, 1)

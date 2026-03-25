@@ -94,6 +94,8 @@ def test_get_chapter_qa_returns_expected_shape(client, test_db: Session) -> None
     assert payload["overall_status"] == "warning"
     assert payload["manual_status"] is None
     assert payload["automatic_checks"][1]["name"] == "silence_gaps"
+    assert payload["qa_grade"] == "B"
+    assert payload["ready_for_export"] is True
 
 
 def test_post_chapter_qa_saves_manual_review(client, test_db: Session) -> None:
@@ -151,7 +153,9 @@ def test_get_qa_dashboard_returns_books_with_grouped_chapter_statuses(client, te
     assert warning_book["chapters_warning"] == 1
     assert warning_book["chapters_pending_manual"] == 1
     assert warning_book["chapters"][1]["overall_status"] == "warning"
+    assert warning_book["chapters"][1]["qa_grade"] == "B"
 
     failure_book = next(book for book in payload["books_needing_review"] if book["book_id"] == book_two.id)
     assert failure_book["chapters_fail"] == 1
     assert failure_book["chapters"][0]["manual_status"] == "flagged"
+    assert failure_book["chapters"][0]["qa_grade"] == "F"

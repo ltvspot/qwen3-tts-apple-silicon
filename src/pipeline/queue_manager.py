@@ -15,7 +15,7 @@ from typing import Any
 from sqlalchemy.orm import Session, selectinload
 
 from src.api.cache import invalidate_library_cache
-from src.config import get_application_settings
+from src.config import FailureThresholdSettings, get_application_settings
 from src.database import (
     Book,
     BookGenerationStatus,
@@ -26,9 +26,12 @@ from src.database import (
     GenerationJobStatus,
     GenerationJobType,
     JobHistory,
+    retry_on_locked,
     utc_now,
 )
+from src.engines.chunker import TextChunker
 from src.pipeline.generator import AudiobookGenerator, GenerationCancelled
+from src.utils.caffeinate import allow_sleep, prevent_sleep
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +92,37 @@ class JobInfo:
         )
 
 
+class DuplicateGenerationJobError(RuntimeError):
+    """Raised when a queued or running generation job already exists for a book."""
+
+
+class QueueDrainingError(RuntimeError):
+    """Raised when new work is submitted while the queue is draining for shutdown."""
+
+
+@dataclass(slots=True)
+class FailureTrackingStats:
+    """Chunk-weighted failure tracking for long-running full-book jobs."""
+
+    total_chunks_processed: int = 0
+    failed_chunks: int = 0
+    consecutive_failures: int = 0
+
+    def record_success(self, chunk_count: int) -> None:
+        """Record a successful chapter attempt."""
+
+        self.total_chunks_processed += max(chunk_count, 1)
+        self.consecutive_failures = 0
+
+    def record_failure(self, chunk_count: int) -> None:
+        """Record a failed chapter attempt."""
+
+        resolved_count = max(chunk_count, 1)
+        self.total_chunks_processed += resolved_count
+        self.failed_chunks += resolved_count
+        self.consecutive_failures += 1
+
+
 class GenerationQueue:
     """Priority-driven generation queue backed by persistent DB rows."""
 
@@ -96,7 +130,7 @@ class GenerationQueue:
         self,
         max_workers: int = 1,
         *,
-        consecutive_failure_threshold: int | None = None,
+        failure_thresholds: FailureThresholdSettings | None = None,
     ) -> None:
         """Initialize queue state."""
 
@@ -113,11 +147,12 @@ class GenerationQueue:
         self._jobs_available = asyncio.Event()
         self._stop_event = asyncio.Event()
         self._started = False
+        self._draining = False
         self.resource_poll_interval_seconds = 30.0
-        self.consecutive_failure_threshold = (
-            get_application_settings().engine_config.consecutive_failure_threshold
-            if consecutive_failure_threshold is None
-            else consecutive_failure_threshold
+        self.failure_thresholds = (
+            get_application_settings().engine_config.failure_thresholds.model_copy(deep=True)
+            if failure_thresholds is None
+            else failure_thresholds.model_copy(deep=True)
         )
 
     @property
@@ -144,6 +179,7 @@ class GenerationQueue:
             self._resource_monitor = resource_monitor
             self._jobs_available.clear()
             self._stop_event.clear()
+            self._draining = False
             self._workers = [
                 asyncio.create_task(self._worker(index), name=f"generation-worker-{index}")
                 for index in range(self.max_workers)
@@ -169,7 +205,9 @@ class GenerationQueue:
             self._generator = None
             self._resource_monitor = None
             self._resource_pause_reason = None
+            self._draining = False
             self._started = False
+            allow_sleep()
             logger.info("Stopped generation queue")
 
     async def enqueue_book(
@@ -183,10 +221,12 @@ class GenerationQueue:
         emotion: str | None = None,
         speed: float | None = None,
         job_type: GenerationJobType = GenerationJobType.FULL_BOOK,
+        last_completed_chapter: int | None = None,
     ) -> int:
         """Create and enqueue a full-book generation job."""
 
         self._ensure_started()
+        self._ensure_not_draining()
         resolved_voice_name, resolved_emotion, resolved_speed = _resolve_voice_defaults(
             voice_name=voice_name,
             emotion=emotion,
@@ -205,43 +245,53 @@ class GenerationQueue:
         chapters = list(book.chapters)
         completed_count, failed_count, avg_seconds = self._chapter_metrics(chapters, force=force)
         current_chapter_n = self._next_chapter_number(chapters, force=force)
-        job = GenerationJob(
-            book_id=book_id,
-            chapter_id=None,
-            job_type=job_type,
-            status=GenerationJobStatus.QUEUED,
-            progress=self._overall_progress(completed_count, len(chapters), 0.0),
-            current_chapter_progress=0.0,
-            chapters_total=len(chapters),
-            chapters_completed=completed_count,
-            chapters_failed=failed_count,
-            current_chapter_n=current_chapter_n,
-            priority=self._clamp_priority(priority),
-            eta_seconds=self._estimate_full_book_eta_from_values(
-                chapters,
-                completed_count=completed_count,
-                failed_count=failed_count,
-                avg_seconds_per_chapter=avg_seconds,
-                current_progress_fraction=0.0,
+        initial_last_completed_chapter = self._last_completed_chapter_number(chapters, force=force)
+        if last_completed_chapter is not None:
+            initial_last_completed_chapter = max(initial_last_completed_chapter, last_completed_chapter)
+        with self._jobs_lock:
+            if self._has_active_job_for_book(book_id, db_session):
+                raise DuplicateGenerationJobError(
+                    f"Book {book_id} already has a queued or running generation job."
+                )
+
+            job = GenerationJob(
+                book_id=book_id,
+                chapter_id=None,
+                job_type=job_type,
+                status=GenerationJobStatus.QUEUED,
+                progress=self._overall_progress(completed_count, len(chapters), 0.0),
+                current_chapter_progress=0.0,
+                chapters_total=len(chapters),
+                chapters_completed=completed_count,
+                chapters_failed=failed_count,
                 current_chapter_n=current_chapter_n,
+                last_completed_chapter=initial_last_completed_chapter,
+                priority=self._clamp_priority(priority),
+                eta_seconds=self._estimate_full_book_eta_from_values(
+                    chapters,
+                    completed_count=completed_count,
+                    failed_count=failed_count,
+                    avg_seconds_per_chapter=avg_seconds,
+                    current_progress_fraction=0.0,
+                    current_chapter_n=current_chapter_n,
+                    force=force,
+                ),
+                avg_seconds_per_chapter=avg_seconds,
                 force=force,
-            ),
-            avg_seconds_per_chapter=avg_seconds,
-            force=force,
-            voice_name=resolved_voice_name,
-            emotion=resolved_emotion,
-            speed=resolved_speed,
-        )
-        db_session.add(job)
-        db_session.flush()
+                voice_name=resolved_voice_name,
+                emotion=resolved_emotion,
+                speed=resolved_speed,
+            )
+            db_session.add(job)
+            db_session.flush()
 
-        book.current_job_id = job.id
-        book.generation_status = BookGenerationStatus.GENERATING
-        book.generation_eta_seconds = job.eta_seconds
-        db_session.commit()
-        db_session.refresh(job)
+            book.current_job_id = job.id
+            book.generation_status = BookGenerationStatus.GENERATING
+            book.generation_eta_seconds = job.eta_seconds
+            db_session.commit()
+            db_session.refresh(job)
 
-        self._store_job_snapshot(job)
+            self._store_job_snapshot(job)
         self._notify_workers()
         logger.info("Enqueued book %s as generation job %s", book_id, job.id)
         return job.id
@@ -261,6 +311,7 @@ class GenerationQueue:
         """Create and enqueue a single-chapter generation job."""
 
         self._ensure_started()
+        self._ensure_not_draining()
         resolved_voice_name, resolved_emotion, resolved_speed = _resolve_voice_defaults(
             voice_name=voice_name,
             emotion=emotion,
@@ -282,42 +333,49 @@ class GenerationQueue:
         if completed_count == 1:
             avg_seconds = self._observed_generation_seconds(chapter)
 
-        job = GenerationJob(
-            book_id=book_id,
-            chapter_id=chapter.id,
-            job_type=GenerationJobType.SINGLE_CHAPTER,
-            status=GenerationJobStatus.QUEUED,
-            progress=self._overall_progress(completed_count, 1, 0.0),
-            current_chapter_progress=0.0,
-            chapters_total=1,
-            chapters_completed=completed_count,
-            chapters_failed=failed_count,
-            current_chapter_n=chapter.number,
-            priority=self._clamp_priority(priority),
-            eta_seconds=self._estimate_single_chapter_eta(
-                chapter,
+        with self._jobs_lock:
+            if self._has_active_job_for_book(book_id, db_session):
+                raise DuplicateGenerationJobError(
+                    f"Book {book_id} already has a queued or running generation job."
+                )
+
+            job = GenerationJob(
+                book_id=book_id,
+                chapter_id=chapter.id,
+                job_type=GenerationJobType.SINGLE_CHAPTER,
+                status=GenerationJobStatus.QUEUED,
+                progress=self._overall_progress(completed_count, 1, 0.0),
+                current_chapter_progress=0.0,
+                chapters_total=1,
+                chapters_completed=completed_count,
+                chapters_failed=failed_count,
+                current_chapter_n=chapter.number,
+                last_completed_chapter=chapter.number if completed_count else 0,
+                priority=self._clamp_priority(priority),
+                eta_seconds=self._estimate_single_chapter_eta(
+                    chapter,
+                    avg_seconds_per_chapter=avg_seconds,
+                    progress_fraction=0.0,
+                ),
                 avg_seconds_per_chapter=avg_seconds,
-                progress_fraction=0.0,
-            ),
-            avg_seconds_per_chapter=avg_seconds,
-            force=force,
-            voice_name=resolved_voice_name,
-            emotion=resolved_emotion,
-            speed=resolved_speed,
-        )
-        db_session.add(job)
-        db_session.flush()
+                force=force,
+                voice_name=resolved_voice_name,
+                emotion=resolved_emotion,
+                speed=resolved_speed,
+            )
+            db_session.add(job)
+            db_session.flush()
 
-        book = db_session.query(Book).filter(Book.id == book_id).first()
-        if book is not None:
-            book.current_job_id = job.id
-            book.generation_status = BookGenerationStatus.GENERATING
-            book.generation_eta_seconds = job.eta_seconds
+            book = db_session.query(Book).filter(Book.id == book_id).first()
+            if book is not None:
+                book.current_job_id = job.id
+                book.generation_status = BookGenerationStatus.GENERATING
+                book.generation_eta_seconds = job.eta_seconds
 
-        db_session.commit()
-        db_session.refresh(job)
+            db_session.commit()
+            db_session.refresh(job)
 
-        self._store_job_snapshot(job)
+            self._store_job_snapshot(job)
         self._notify_workers()
         logger.info("Enqueued book %s chapter %s as generation job %s", book_id, chapter_number, job.id)
         return job.id
@@ -495,6 +553,78 @@ class GenerationQueue:
 
             await asyncio.sleep(0.02)
 
+    def request_drain(self) -> None:
+        """Stop claiming new work and reject new submissions during shutdown."""
+
+        self._draining = True
+        self._jobs_available.set()
+
+    def has_active_work(self) -> bool:
+        """Return True when a job is actively being processed by a worker."""
+
+        with self._jobs_lock:
+            if self.active_jobs:
+                return True
+            return any(job.status == JobStatus.RUNNING for job in self.jobs.values())
+
+    async def save_and_pause_active_jobs(self) -> None:
+        """Checkpoint in-flight jobs so they can resume cleanly after restart."""
+
+        if self._db_session_maker is None:
+            return
+
+        @retry_on_locked()
+        def _pause_jobs() -> list[int]:
+            paused_job_ids: list[int] = []
+            db_session: Session = self._db_session_maker()
+            try:
+                running_jobs = (
+                    db_session.query(GenerationJob)
+                    .filter(GenerationJob.status == GenerationJobStatus.RUNNING)
+                    .all()
+                )
+                if not running_jobs:
+                    return paused_job_ids
+
+                paused_at = utc_now()
+                for db_job in running_jobs:
+                    db_job.status = GenerationJobStatus.PAUSED
+                    db_job.pause_requested = True
+                    db_job.cancel_requested = False
+                    db_job.current_chapter_progress = 0.0
+                    db_job.paused_at = paused_at
+                    db_job.eta_seconds = None
+                    db_job.error_message = "Server shutdown — job paused. Will resume on restart."
+                    self._record_history(
+                        db_session,
+                        db_job,
+                        "paused",
+                        "Server shutdown — job paused. Will resume on restart.",
+                    )
+                    self._reset_generating_chapters_for_job(db_session, db_job)
+                    book = db_session.query(Book).filter(Book.id == db_job.book_id).first()
+                    if book is not None:
+                        book.generation_status = BookGenerationStatus.IDLE
+                        book.generation_eta_seconds = None
+                        book.current_job_id = db_job.id
+                    paused_job_ids.append(db_job.id)
+
+                db_session.commit()
+                for job_id in paused_job_ids:
+                    refreshed = db_session.query(GenerationJob).filter(GenerationJob.id == job_id).first()
+                    if refreshed is not None:
+                        self._store_job_snapshot(refreshed)
+                return paused_job_ids
+            finally:
+                db_session.close()
+
+        paused_job_ids = await asyncio.to_thread(_pause_jobs)
+        if paused_job_ids:
+            with self._jobs_lock:
+                for job_id in paused_job_ids:
+                    self.active_jobs.discard(job_id)
+            invalidate_library_cache()
+
     def list_active_jobs(self, db_session: Session) -> list[GenerationJob]:
         """Return non-terminal jobs ordered by runtime precedence."""
 
@@ -534,6 +664,12 @@ class GenerationQueue:
         if not self._started or self._db_session_maker is None or self._generator is None:
             raise RuntimeError("Generation queue is not started.")
 
+    def _ensure_not_draining(self) -> None:
+        """Raise when the queue is intentionally draining for shutdown."""
+
+        if self._draining:
+            raise QueueDrainingError("Generation queue is draining for shutdown.")
+
     def _notify_workers(self) -> None:
         """Wake the worker loop after a scheduling change."""
 
@@ -567,6 +703,8 @@ class GenerationQueue:
         """Return the next queued job id according to the DB ordering."""
 
         self._ensure_started()
+        if self._draining:
+            return None
         db_session: Session = self._db_session_maker()
         try:
             next_job = (
@@ -584,22 +722,26 @@ class GenerationQueue:
 
         if self._db_session_maker is None:
             return False
+        if self._draining:
+            return False
 
-        db_session: Session = self._db_session_maker()
-        try:
-            return (
-                db_session.query(GenerationJob.id)
-                .filter(GenerationJob.status == GenerationJobStatus.QUEUED)
-                .first()
-                is not None
-            )
-        finally:
-            db_session.close()
+        with self._jobs_lock:
+            db_session: Session = self._db_session_maker()
+            try:
+                return (
+                    db_session.query(GenerationJob.id)
+                    .filter(GenerationJob.status == GenerationJobStatus.QUEUED)
+                    .first()
+                    is not None
+                )
+            finally:
+                db_session.close()
 
     async def _process_job(self, job_id: int) -> None:
         """Execute a single queued generation job."""
 
         self._ensure_started()
+        prevent_sleep()
         await self._wait_for_resources()
         if self._stop_event.is_set():
             return
@@ -645,6 +787,8 @@ class GenerationQueue:
             with self._jobs_lock:
                 self.active_jobs.discard(job_id)
             db_session.close()
+            if not self.has_active_work() and not self._has_pending_jobs():
+                allow_sleep()
             if self._has_pending_jobs():
                 self._notify_workers()
 
@@ -678,7 +822,7 @@ class GenerationQueue:
         self._sync_full_book_metrics(db_job, chapters, force=db_job.force)
         db_session.commit()
         self._store_job_snapshot(db_job)
-        consecutive_failures = 0
+        failure_stats = self._build_failure_tracking_stats(chapters, force=db_job.force)
 
         for chapter in chapters:
             if not db_job.force and chapter.status == ChapterStatus.GENERATED:
@@ -741,24 +885,26 @@ class GenerationQueue:
                 )
             except Exception as exc:
                 logger.error("Job %s chapter %s failed: %s", db_job.id, chapter.number, exc)
-                consecutive_failures += 1
+                failure_stats.record_failure(self._estimated_chunk_count(chapter))
                 self._sync_full_book_metrics(db_job, chapters, force=db_job.force)
                 db_job.error_message = str(exc)
                 db_job.current_chapter_progress = 0.0
                 db_job.progress = self._overall_progress(db_job.chapters_completed, db_job.chapters_total, 0.0)
                 db_session.commit()
                 self._store_job_snapshot(db_job)
-                if consecutive_failures >= self.consecutive_failure_threshold:
+                should_stop, failure_message = self._should_stop_batch(failure_stats)
+                if should_stop:
                     self._mark_failed(
                         db_job,
                         job_info,
                         db_session,
-                        f"Generation stopped after {self.consecutive_failure_threshold} consecutive chapter failures.",
+                        failure_message,
                     )
                     return
             else:
-                consecutive_failures = 0
+                failure_stats.record_success(self._estimated_chunk_count(chapter))
                 self._sync_full_book_metrics(db_job, chapters, force=db_job.force)
+                db_job.last_completed_chapter = chapter.number
                 observed_seconds = self._observed_generation_seconds(chapter)
                 db_job.avg_seconds_per_chapter = self._updated_average(
                     db_job.avg_seconds_per_chapter,
@@ -863,6 +1009,7 @@ class GenerationQueue:
 
         db_job.chapters_completed = 1
         db_job.chapters_failed = 0
+        db_job.last_completed_chapter = chapter.number
         db_job.current_chapter_progress = 0.0
         db_job.current_chapter_n = None
         observed_seconds = self._observed_generation_seconds(chapter)
@@ -1058,6 +1205,19 @@ class GenerationQueue:
             self.jobs[db_job.id] = snapshot
         return snapshot
 
+    def _has_active_job_for_book(self, book_id: int, db_session: Session) -> bool:
+        """Check whether a book already has a queued or running generation job."""
+
+        return (
+            db_session.query(GenerationJob.id)
+            .filter(
+                GenerationJob.book_id == book_id,
+                GenerationJob.status.in_((GenerationJobStatus.QUEUED, GenerationJobStatus.RUNNING)),
+            )
+            .first()
+            is not None
+        )
+
     async def _wait_for_resources(self) -> None:
         """Pause queue processing while monitored resources are unhealthy."""
 
@@ -1105,6 +1265,29 @@ class GenerationQueue:
         chapter.completed_at = None
         chapter.error_message = None
         chapter.audio_file_size_bytes = None
+        chapter.current_chunk = None
+        chapter.total_chunks = None
+        chapter.chunk_boundaries = None
+
+    def _reset_generating_chapters_for_job(self, db_session: Session, db_job: GenerationJob) -> None:
+        """Reset any in-progress chapter rows owned by the provided job's book."""
+
+        generating_chapters = (
+            db_session.query(Chapter)
+            .filter(
+                Chapter.book_id == db_job.book_id,
+                Chapter.status == ChapterStatus.GENERATING,
+            )
+            .all()
+        )
+        for chapter in generating_chapters:
+            chapter.status = ChapterStatus.PENDING
+            chapter.started_at = None
+            chapter.completed_at = None
+            chapter.error_message = None
+            chapter.current_chunk = None
+            chapter.total_chunks = None
+            chapter.chunk_boundaries = None
 
     def _sync_full_book_metrics(self, db_job: GenerationJob, chapters: list[Chapter], *, force: bool) -> None:
         """Refresh persisted counters from the current chapter rows."""
@@ -1113,9 +1296,43 @@ class GenerationQueue:
         db_job.chapters_total = len(chapters)
         db_job.chapters_completed = completed_count
         db_job.chapters_failed = failed_count
+        db_job.last_completed_chapter = self._last_completed_chapter_number(chapters, force=force)
         if avg_seconds is not None:
             db_job.avg_seconds_per_chapter = avg_seconds
         db_job.current_chapter_n = self._next_chapter_number(chapters, force=force)
+
+    def _build_failure_tracking_stats(self, chapters: list[Chapter], *, force: bool) -> FailureTrackingStats:
+        """Seed failure tracking from any already-processed chapters in the job."""
+
+        if force:
+            return FailureTrackingStats()
+
+        stats = FailureTrackingStats()
+        for chapter in chapters:
+            if chapter.status == ChapterStatus.GENERATED:
+                stats.record_success(self._estimated_chunk_count(chapter))
+            elif chapter.status == ChapterStatus.FAILED:
+                stats.record_failure(self._estimated_chunk_count(chapter))
+        stats.consecutive_failures = 0
+        return stats
+
+    def _should_stop_batch(self, stats: FailureTrackingStats) -> tuple[bool, str]:
+        """Return whether a long-running book job should stop for instability."""
+
+        if stats.consecutive_failures >= self.failure_thresholds.max_consecutive_failures:
+            return (True, f"Stopped: {stats.consecutive_failures} consecutive failures")
+
+        if stats.total_chunks_processed >= self.failure_thresholds.min_chunks_for_rate:
+            failure_rate = (stats.failed_chunks / max(stats.total_chunks_processed, 1)) * 100
+            if failure_rate > self.failure_thresholds.max_failure_rate_percent:
+                return (
+                    True,
+                    "Stopped: "
+                    f"{failure_rate:.1f}% failure rate "
+                    f"({stats.failed_chunks}/{stats.total_chunks_processed})",
+                )
+
+        return (False, "")
 
     def _chapter_metrics(self, chapters: list[Chapter], *, force: bool) -> tuple[int, int, float | None]:
         """Return completed count, failed count, and observed average generation time."""
@@ -1140,6 +1357,15 @@ class GenerationQueue:
             if force or chapter.status != ChapterStatus.GENERATED:
                 return chapter.number
         return None
+
+    def _last_completed_chapter_number(self, chapters: list[Chapter], *, force: bool) -> int:
+        """Return the highest chapter number that already has generated audio."""
+
+        if force:
+            return 0
+
+        completed_numbers = [chapter.number for chapter in chapters if chapter.status == ChapterStatus.GENERATED]
+        return max(completed_numbers, default=0)
 
     def _overall_progress(self, completed_count: int, total_count: int, current_progress_fraction: float) -> float:
         """Return the overall job progress as a percentage."""
@@ -1251,6 +1477,19 @@ class GenerationQueue:
         if elapsed < 0:
             return None
         return round(elapsed, 2)
+
+    def _estimated_chunk_count(self, chapter: Chapter) -> int:
+        """Estimate how many synthesis chunks the chapter represents for failure-rate tracking."""
+
+        if chapter.total_chunks is not None and chapter.total_chunks > 0:
+            return chapter.total_chunks
+
+        text_content = (chapter.text_content or "").strip()
+        if not text_content:
+            return 1
+
+        chunks = TextChunker.chunk_text(text_content, 500)
+        return max(len(chunks), 1)
 
     def _clamp_priority(self, priority: int) -> int:
         """Clamp priority into the accepted UI range."""

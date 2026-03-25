@@ -19,14 +19,14 @@ async def get_resources() -> dict[str, float | None]:
 
 
 @router.get("/model")
-async def get_model_stats() -> dict[str, float | int]:
+async def get_model_stats() -> dict[str, float | int | str | bool | None]:
     """Return shared model lifecycle statistics."""
 
     return get_model_manager().to_dict()
 
 
 @router.post("/model/reload")
-async def force_model_reload() -> dict[str, float | int | str]:
+async def force_model_reload() -> dict[str, float | int | str | bool | None]:
     """Force an immediate reload of the shared TTS engine."""
 
     manager = get_model_manager()

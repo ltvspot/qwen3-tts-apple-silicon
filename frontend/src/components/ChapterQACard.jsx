@@ -36,9 +36,26 @@ function getManualSummary(chapter) {
   return "Automatic QA passed";
 }
 
+function getGradeBadge(grade) {
+  if (grade === "A" || grade === "B") {
+    return { status: "pass", text: `Grade ${grade}` };
+  }
+
+  if (grade === "C") {
+    return { status: "warning", text: "Grade C" };
+  }
+
+  if (grade === "F") {
+    return { status: "fail", text: "Grade F" };
+  }
+
+  return null;
+}
+
 export default function ChapterQACard({ actionPending = false, chapter, onApprove, onFlag }) {
   const [expanded, setExpanded] = useState(false);
   const reviewBadge = getReviewBadge(chapter);
+  const gradeBadge = getGradeBadge(chapter.qa_grade);
   const needsManualActions =
     chapter.manual_status === null &&
     (chapter.overall_status === "warning" || chapter.overall_status === "fail");
@@ -59,6 +76,9 @@ export default function ChapterQACard({ actionPending = false, chapter, onApprov
                 {chapter.chapter_title ?? `Chapter ${chapter.chapter_n}`}
               </h4>
             </div>
+            {gradeBadge ? (
+              <QAStatusBadge label={gradeBadge.text} status={gradeBadge.status} />
+            ) : null}
             <QAStatusBadge label={reviewBadge.text} status={reviewBadge.status} />
             <QAStatusBadge
               label={`Auto ${chapter.overall_status}`}
@@ -135,6 +155,7 @@ ChapterQACard.propTypes = {
     manual_reviewed_by: PropTypes.string,
     manual_status: PropTypes.oneOf(["approved", "flagged", null]),
     overall_status: PropTypes.oneOf(["pass", "warning", "fail"]).isRequired,
+    qa_grade: PropTypes.oneOf(["A", "B", "C", "F"]),
   }).isRequired,
   onApprove: PropTypes.func.isRequired,
   onFlag: PropTypes.func.isRequired,

@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
+import functools
 import logging
+import time
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Generator
+from typing import Any, Callable, Generator, TypeVar
 
 from sqlalchemy import (
     Boolean,
     DateTime,
+    event,
     Float,
     ForeignKey,
     Integer,
@@ -22,11 +25,13 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy import Enum as SqlEnum
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
 from src.config import DEFAULT_NARRATOR_NAME, settings
 
 logger = logging.getLogger(__name__)
+_CallableT = TypeVar("_CallableT", bound=Callable[..., Any])
 
 
 def utc_now() -> datetime:
@@ -43,6 +48,27 @@ def ensure_aware(dt: datetime | None) -> datetime | None:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt
+
+
+def retry_on_locked(max_retries: int = 3, backoff_ms: int = 500) -> Callable[[_CallableT], _CallableT]:
+    """Retry SQLite operations that fail due to a transient database lock."""
+
+    def decorator(func: _CallableT) -> _CallableT:
+        @functools.wraps(func)
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except OperationalError as exc:
+                    if "database is locked" not in str(exc).lower() or attempt >= max_retries - 1:
+                        raise
+                    time.sleep((backoff_ms * (attempt + 1)) / 1000.0)
+
+            raise RuntimeError("retry_on_locked exhausted without returning or re-raising.")
+
+        return wrapper  # type: ignore[return-value]
+
+    return decorator
 
 
 class Base(DeclarativeBase):
@@ -231,6 +257,11 @@ class Chapter(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     audio_file_size_bytes: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    current_chunk: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_chunks: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    chunk_boundaries: Mapped[str | None] = mapped_column(Text, nullable=True)
+    generation_metadata: Mapped[str | None] = mapped_column(Text, nullable=True)
+    mastered: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
@@ -271,6 +302,26 @@ class ChapterQARecord(Base):
     book: Mapped["Book"] = relationship()
 
 
+class QualitySnapshot(Base):
+    """Historical per-book quality metrics used by the production overseer."""
+
+    __tablename__ = "quality_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    book_id: Mapped[int] = mapped_column(ForeignKey("books.id"), nullable=False, index=True)
+    completed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, index=True)
+    gate1_pass_rate: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    gate2_avg_grade: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    gate3_overall_grade: Mapped[str] = mapped_column(String(1), nullable=False, default="F")
+    chunks_regenerated: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    avg_wer: Mapped[float | None] = mapped_column(Float, nullable=True)
+    avg_lufs: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    generation_rtf: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    issues_found: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    book: Mapped["Book"] = relationship()
+
+
 class ExportJob(Base):
     """Persistent export status for the most recent book export."""
 
@@ -286,6 +337,11 @@ class ExportJob(Base):
     )
     formats_requested: Mapped[str] = mapped_column(Text, nullable=False)
     format_details: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    progress_percent: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    current_stage: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    current_format: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    current_chapter_n: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_chapters: Mapped[int | None] = mapped_column(Integer, nullable=True)
     include_only_approved: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -373,14 +429,21 @@ class GenerationJob(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     eta_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     avg_seconds_per_chapter: Mapped[float | None] = mapped_column(Float, nullable=True)
+    last_completed_chapter: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     force: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     voice_name: Mapped[str] = mapped_column(String(255), nullable=False, default="Ethan")
-    emotion: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    emotion: Mapped[str] = mapped_column(String(100), nullable=False, default="neutral")
     speed: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
     pause_requested: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     cancel_requested: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utc_now,
+        onupdate=utc_now,
+    )
 
     book: Mapped["Book"] = relationship(back_populates="generation_jobs", foreign_keys=[book_id])
     chapter: Mapped[Chapter | None] = relationship(back_populates="generation_jobs")
@@ -468,7 +531,26 @@ def _sqlite_connect_args(database_url: str) -> dict[str, bool]:
     return {}
 
 
-engine = create_engine(settings.DATABASE_URL, connect_args=_sqlite_connect_args(settings.DATABASE_URL))
+def create_database_engine(database_url: str):
+    """Create the shared application engine with SQLite reliability settings."""
+
+    db_engine = create_engine(database_url, connect_args=_sqlite_connect_args(database_url))
+
+    if database_url.startswith("sqlite"):
+        @event.listens_for(db_engine, "connect")
+        def set_sqlite_pragma(dbapi_conn, _connection_record) -> None:
+            cursor = dbapi_conn.cursor()
+            try:
+                cursor.execute("PRAGMA journal_mode=WAL")
+                cursor.execute("PRAGMA busy_timeout=5000")
+                cursor.execute("PRAGMA synchronous=NORMAL")
+            finally:
+                cursor.close()
+
+    return db_engine
+
+
+engine = create_database_engine(settings.DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
 
 
@@ -500,6 +582,11 @@ def _migrate_sqlite_schema() -> None:
             "completed_at": "DATETIME",
             "error_message": "TEXT",
             "audio_file_size_bytes": "INTEGER",
+            "current_chunk": "INTEGER",
+            "total_chunks": "INTEGER",
+            "chunk_boundaries": "TEXT",
+            "generation_metadata": "TEXT",
+            "mastered": "BOOLEAN NOT NULL DEFAULT 0",
         },
         "generation_jobs": {
             "job_type": "VARCHAR(32) NOT NULL DEFAULT 'full_book'",
@@ -512,12 +599,21 @@ def _migrate_sqlite_schema() -> None:
             "paused_at": "DATETIME",
             "eta_seconds": "INTEGER",
             "avg_seconds_per_chapter": "FLOAT",
+            "last_completed_chapter": "INTEGER NOT NULL DEFAULT 0",
             "force": "BOOLEAN NOT NULL DEFAULT 0",
             "voice_name": "VARCHAR(255) NOT NULL DEFAULT 'Ethan'",
             "emotion": "VARCHAR(100)",
             "speed": "FLOAT NOT NULL DEFAULT 1.0",
             "pause_requested": "BOOLEAN NOT NULL DEFAULT 0",
             "cancel_requested": "BOOLEAN NOT NULL DEFAULT 0",
+            "updated_at": "DATETIME",
+        },
+        "export_jobs": {
+            "progress_percent": "FLOAT NOT NULL DEFAULT 0.0",
+            "current_stage": "VARCHAR(255)",
+            "current_format": "VARCHAR(32)",
+            "current_chapter_n": "INTEGER",
+            "total_chapters": "INTEGER",
         },
     }
 
@@ -530,6 +626,14 @@ def _migrate_sqlite_schema() -> None:
                     continue
                 logger.info("Applying SQLite schema migration: %s.%s", table_name, column_name)
                 connection.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl}"))
+
+        connection.execute(
+            text(
+                "UPDATE generation_jobs "
+                "SET updated_at = COALESCE(updated_at, created_at, CURRENT_TIMESTAMP) "
+                "WHERE updated_at IS NULL"
+            )
+        )
 
         for ddl in (
             "CREATE INDEX IF NOT EXISTS ix_chapters_status ON chapters (status)",

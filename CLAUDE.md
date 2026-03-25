@@ -1,5 +1,13 @@
 # Alexandria Audiobook Narrator — Codex Conventions
 
+## HARDCODED RULES FOR ALL AI AGENTS (Claude Cowork / Desktop Chat)
+
+1. **ALWAYS use computer use / Chrome browser / osascript to perform tasks on Tim's computer.** NEVER tell Tim to do something himself that you can do via computer control. This includes: creating GitHub repos, running git commands, opening apps, clicking buttons, navigating websites, running terminal commands (via osascript `do shell script`), and any other action achievable through computer use tools.
+2. **If sandbox commands fail** (e.g., no git credentials, no `gh` CLI), switch to `osascript do shell script` which runs on the real Mac with full credentials.
+3. **Tim's Mac details:** Username `timzengerink`, home `/Users/timzengerink`, Coding Folder at `/Users/timzengerink/Documents/Coding Folder`. `gh` CLI at `/opt/homebrew/bin/gh` (authenticated to `ltvspot` GitHub org).
+4. **Only as an absolute last resort** — after exhausting ALL computer-use options — should you ask Tim to do something manually.
+5. **ALWAYS test like a human before telling Tim something works.** Before saying any feature, fix, or app is "ready to test," you MUST actually verify it yourself: start the server (via osascript), open the URL in Chrome, click through the UI, check API endpoints, and confirm things actually work. NEVER just read code and assume it works. NEVER rely only on automated test results. If you can't run it yourself, say so honestly — don't claim it's ready.
+
 ## Project Overview
 
 This is the **Alexandria Audiobook Narrator** — a local web application that transforms formatted manuscripts (DOCX/EPUB/PDF) into production-ready audiobooks using local TTS models. It serves 873 titles from the Library of Alexandria publishing catalog.
@@ -101,6 +109,38 @@ outputs/{book_id}-{slug}/
 - Prefix commits with the prompt number: `[PROMPT-01] Initial project scaffolding`
 - Always run tests before committing
 - Never commit broken code
+
+## MANDATORY QA FEEDBACK LOOP (NON-NEGOTIABLE)
+
+**After EVERY Codex prompt completes, Claude (Cowork) MUST perform ALL of the following QA steps before sending the next prompt. NO EXCEPTIONS.**
+
+### Step 1: Programmatic Testing
+- Start the FastAPI server and hit every NEW and EXISTING API endpoint
+- Run the full pytest suite — ALL tests must pass (sandbox-only failures like missing mlx_audio are acceptable)
+- Verify all import chains resolve correctly
+- Check for regressions in previously-working features
+
+### Step 2: Code Audit
+- Read through every new/modified file Codex committed
+- Verify business rules are followed (skip rules, credit format, narrator name)
+- Check for hardcoded values, missing error handling, type issues
+- Confirm new code follows project coding standards
+
+### Step 3: Visual/UX Testing (when Chrome access is available)
+- Load the frontend in a browser
+- Navigate every page/route
+- Interact with new UI features: click buttons, fill forms, test error states
+- Verify responsive layout, loading states, empty states
+- Test the full user flow: scan → parse → generate → QA → export
+
+### Step 4: Report to Tim
+- Summarize what was built, what passed, what failed
+- List any bugs found and whether they were fixed
+- Only proceed to the next prompt after QA is clean
+
+**Tim's explicit directive: "It does not even seem like you're actually testing the code, output, functionality both programmatically and visually + the UX/UI, etc. like a human? I thought we agreed you always did this feedback loop? Please hardcode this in your systems everywhere so this never happens again!"**
+
+**This QA loop is the SINGLE MOST IMPORTANT part of the workflow. Skipping it is a FAILURE.**
 
 ## Reference Documents
 

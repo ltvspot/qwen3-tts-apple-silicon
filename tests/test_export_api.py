@@ -13,9 +13,11 @@ from src.database import (
     BookExportStatus,
     BookStatus,
     Chapter,
+    ChapterQARecord,
     ChapterStatus,
     ChapterType,
     ExportJob,
+    QAAutomaticStatus,
     QAStatus,
     utc_now,
 )
@@ -124,6 +126,8 @@ def test_export_accepts_fully_generated_book(
     assert launched_jobs == [export_job.id]
     assert export_job.export_status == BookExportStatus.PROCESSING
     assert json.loads(export_job.formats_requested) == ["mp3", "m4b"]
+    assert export_job.progress_percent == 0.0
+    assert export_job.current_stage == "Queued"
     assert book.export_status == BookExportStatus.PROCESSING
 
 
@@ -175,6 +179,52 @@ def test_export_rejects_unapproved_book(client, test_db: Session) -> None:
 
     assert response.status_code == 400
     assert response.json()["detail"] == "Only 1/2 chapters approved. Approve all chapters before exporting."
+
+
+def test_export_accepts_warning_chapter_when_ready_for_export(client, test_db: Session, monkeypatch) -> None:
+    """Approval-only export should accept Gate 2 warnings that are still marked export-ready."""
+
+    book = _create_book(test_db, title="Warning Ready Export Book")
+    chapter = _create_generated_chapter(test_db, book_id=book.id, number=1, qa_status=QAStatus.NEEDS_REVIEW)
+    test_db.add(
+        ChapterQARecord(
+            book_id=book.id,
+            chapter_n=chapter.number,
+            overall_status=QAAutomaticStatus.WARNING,
+            qa_details=json.dumps(
+                {
+                    "chapter_n": chapter.number,
+                    "book_id": book.id,
+                    "overall_status": QAAutomaticStatus.WARNING.value,
+                    "checks": [],
+                    "chapter_report": {
+                        "overall_grade": "B",
+                        "ready_for_export": True,
+                    },
+                }
+            ),
+        )
+    )
+    test_db.commit()
+
+    launched_jobs: list[int] = []
+    monkeypatch.setattr(export_routes, "estimate_export_seconds", lambda *args, **kwargs: 120)
+    monkeypatch.setattr(
+        export_routes,
+        "_launch_export_job",
+        lambda export_job_id, session_factory=None: launched_jobs.append(export_job_id),
+    )
+
+    response = client.post(
+        f"/api/book/{book.id}/export",
+        json={
+            "formats": ["mp3"],
+            "include_only_approved": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert launched_jobs
 
 
 def test_get_export_status_returns_completed_formats_and_qa_report(client, test_db: Session) -> None:
@@ -250,6 +300,42 @@ def test_get_export_status_returns_completed_formats_and_qa_report(client, test_
     assert payload["formats"]["m4b"]["download_url"] == f"/api/book/{book.id}/export/download/m4b"
     assert payload["qa_report"]["chapters_flagged"] == 1
     assert payload["qa_report"]["chapter_summary"][0]["chapter_title"] == "Chapter One"
+
+
+def test_get_export_status_returns_live_progress_fields(client, test_db: Session) -> None:
+    """Processing exports should expose real progress and stage metadata."""
+
+    book = _create_book(test_db, title="In Flight Export")
+    started_at = utc_now()
+
+    test_db.add(
+        ExportJob(
+            book_id=book.id,
+            job_token=f"export_{book.id}_20260324_150000",
+            export_status=BookExportStatus.PROCESSING,
+            formats_requested=json.dumps(["mp3"]),
+            format_details=json.dumps({"mp3": {"status": "pending"}}),
+            progress_percent=45.0,
+            current_stage="Encoding MP3 (chapter 3/10)",
+            current_format="mp3",
+            current_chapter_n=3,
+            total_chapters=10,
+            include_only_approved=True,
+            started_at=started_at,
+        )
+    )
+    book.export_status = BookExportStatus.PROCESSING
+    test_db.commit()
+
+    response = client.get(f"/api/book/{book.id}/export/status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["progress_percent"] == 45.0
+    assert payload["current_stage"] == "Encoding MP3 (chapter 3/10)"
+    assert payload["current_format"] == "mp3"
+    assert payload["current_chapter_n"] == 3
+    assert payload["total_chapters"] == 10
 
 
 def test_batch_export_queues_ready_books_and_exposes_progress(client, test_db: Session, monkeypatch) -> None:

@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import shutil
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from src.api.generation_runtime import ensure_batch_orchestrator
+from src.pipeline.batch_orchestrator import BatchSchedulingStrategy
+from src.config import settings
 from src.database import Book, BookStatus, GenerationJob, GenerationJobStatus, get_db
 
 router = APIRouter(prefix="/api/batch", tags=["batch"])
@@ -20,6 +24,28 @@ class BatchStartRequest(BaseModel):
     book_ids: list[int] | None = None
     priority: str = Field(default="normal")
     skip_already_exported: bool = True
+    scheduling_strategy: BatchSchedulingStrategy = Field(default=BatchSchedulingStrategy.SHORTEST_FIRST)
+
+
+class BatchEstimateRequest(BaseModel):
+    """Request payload for estimating a batch before queueing it."""
+
+    book_ids: list[int] | None = None
+    skip_already_exported: bool = True
+
+
+class BatchEstimatePayload(BaseModel):
+    """Serialized resource estimate for a catalog batch run."""
+
+    books: int
+    total_chapters: int
+    total_words: int
+    estimated_audio_hours: float
+    estimated_disk_gb: float
+    estimated_generation_hours: float
+    disk_free_gb: float
+    can_proceed: bool
+    warnings: list[str]
 
 
 class BatchActionRequest(BaseModel):
@@ -53,6 +79,7 @@ class BatchProgressPayload(BaseModel):
     books_failed: int
     books_skipped: int
     books_in_progress: int
+    books_remaining: int = 0
     current_book_id: int | None = None
     current_book_title: str | None = None
     started_at: str | None = None
@@ -62,6 +89,8 @@ class BatchProgressPayload(BaseModel):
     resource_warnings: list[str]
     model_reloads: int
     pause_reason: str | None = None
+    scheduling_strategy: str | None = None
+    summary: str = ""
     percent_complete: float
     book_results: list[BatchBookResultPayload]
 
@@ -99,6 +128,141 @@ def _default_batch_book_ids(db: Session) -> list[int]:
     ]
 
 
+def _resolve_batch_books(
+    db: Session,
+    *,
+    book_ids: list[int] | None,
+    skip_already_exported: bool,
+) -> tuple[list[Book], list[str]]:
+    """Return the batch candidate books plus any preflight warnings."""
+
+    resolved_ids = book_ids if book_ids is not None else _default_batch_book_ids(db)
+    if not resolved_ids:
+        return ([], ["No parsed books are currently available for batch generation."])
+
+    requested_order = {book_id: index for index, book_id in enumerate(resolved_ids)}
+    books = (
+        db.query(Book)
+        .options(selectinload(Book.chapters))
+        .filter(Book.id.in_(resolved_ids))
+        .all()
+    )
+    books.sort(key=lambda book: requested_order.get(book.id, len(requested_order)))
+
+    warnings: list[str] = []
+    found_ids = {book.id for book in books}
+    missing_ids = [str(book_id) for book_id in resolved_ids if book_id not in found_ids]
+    if missing_ids:
+        warnings.append(f"Skipped missing books: {', '.join(missing_ids)}.")
+
+    unparsed_books = [book.title for book in books if book.status != BookStatus.PARSED]
+    if unparsed_books:
+        warnings.append(
+            f"{len(unparsed_books)} selected books are not parsed and may fail if queued: "
+            + ", ".join(unparsed_books[:3])
+            + ("." if len(unparsed_books) <= 3 else ", …")
+        )
+
+    def is_exported(book: Book) -> bool:
+        return getattr(book.export_status, "value", book.export_status) == "completed"
+
+    if skip_already_exported:
+        exported_books = [book for book in books if is_exported(book)]
+        if exported_books:
+            warnings.append(f"Skipping {len(exported_books)} books that are already exported.")
+        books = [book for book in books if not is_exported(book)]
+
+    return (books, warnings)
+
+
+def _generate_warnings(
+    books: list[Book],
+    *,
+    disk_free_gb: float,
+    total_disk_needed_gb: float,
+    existing_warnings: list[str] | None = None,
+) -> list[str]:
+    """Return preflight warnings that help the user decide whether to proceed."""
+
+    warnings = list(existing_warnings or [])
+    if not books:
+        warnings.append("No books remain after applying the current batch filters.")
+        return warnings
+
+    if disk_free_gb <= total_disk_needed_gb * 1.2:
+        warnings.append(
+            "Low disk headroom for this run. "
+            f"Need ~{total_disk_needed_gb:.1f} GB, free {disk_free_gb:.1f} GB, recommended buffer 20%."
+        )
+
+    missing_words = [book.title for book in books if sum(chapter.word_count or 0 for chapter in book.chapters) == 0]
+    if missing_words:
+        warnings.append(
+            f"{len(missing_words)} books are missing chapter word counts, so the estimate may be conservative."
+        )
+
+    large_books = [
+        book.title
+        for book in books
+        if len(book.chapters) >= 40
+    ]
+    if large_books:
+        warnings.append(
+            f"{len(large_books)} large books (40+ chapters) are included and may dominate overnight runtime."
+        )
+
+    return warnings
+
+
+@router.post("/estimate", response_model=BatchEstimatePayload)
+async def estimate_batch_resources(
+    request: BatchEstimateRequest,
+    db: Session = Depends(get_db),
+) -> BatchEstimatePayload:
+    """Estimate disk and runtime needs for a catalog batch before queueing it."""
+
+    books, warnings = _resolve_batch_books(
+        db,
+        book_ids=request.book_ids,
+        skip_already_exported=request.skip_already_exported,
+    )
+    total_chapters = sum(len(book.chapters) for book in books)
+    total_words = sum(sum(chapter.word_count or 0 for chapter in book.chapters) for book in books)
+
+    estimated_audio_seconds = total_words / 2.5 if total_words > 0 else 0.0
+    estimated_wav_bytes = estimated_audio_seconds * 48_000
+    estimated_export_bytes = estimated_wav_bytes * 0.1
+    total_disk_needed_gb = (estimated_wav_bytes + estimated_export_bytes) / (1024**3)
+
+    rtf = 1.5
+    estimated_generation_hours = (estimated_audio_seconds * rtf) / 3600 if estimated_audio_seconds else 0.0
+    estimated_export_hours = (estimated_audio_seconds * 0.3) / 3600 if estimated_audio_seconds else 0.0
+    total_hours = estimated_generation_hours + estimated_export_hours
+
+    disk_target_path = Path(settings.OUTPUTS_PATH)
+    disk_usage_target = disk_target_path if disk_target_path.exists() else disk_target_path.resolve().parent
+    disk_target = shutil.disk_usage(disk_usage_target)
+    disk_free_gb = disk_target.free / (1024**3)
+    warnings = _generate_warnings(
+        books,
+        disk_free_gb=disk_free_gb,
+        total_disk_needed_gb=total_disk_needed_gb,
+        existing_warnings=warnings,
+    )
+
+    return BatchEstimatePayload(
+        books=len(books),
+        total_chapters=total_chapters,
+        total_words=total_words,
+        estimated_audio_hours=round(estimated_audio_seconds / 3600, 1) if estimated_audio_seconds else 0.0,
+        estimated_disk_gb=round(total_disk_needed_gb, 1),
+        estimated_generation_hours=round(total_hours, 1),
+        disk_free_gb=round(disk_free_gb, 1),
+        can_proceed=disk_free_gb > total_disk_needed_gb * 1.2,
+        warnings=warnings,
+    )
+
+
 @router.post("/start", response_model=BatchProgressPayload)
 async def start_batch(request: BatchStartRequest, db: Session = Depends(get_db)) -> BatchProgressPayload:
     """Start a new batch generation run."""
@@ -110,6 +274,7 @@ async def start_batch(request: BatchStartRequest, db: Session = Depends(get_db))
             book_ids,
             priority=request.priority,
             skip_already_exported=request.skip_already_exported,
+            strategy=request.scheduling_strategy,
         )
     except RuntimeError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc

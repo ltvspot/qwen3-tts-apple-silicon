@@ -1,7 +1,8 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import AppShell from "../components/AppShell";
 import AudioPlayer from "../components/AudioPlayer";
 import ClonedVoicesList from "../components/ClonedVoicesList";
+import ProgressHeartbeat from "../components/ProgressHeartbeat";
 import VoiceCloneForm from "../components/VoiceCloneForm";
 import VoicePresetManager from "../components/VoicePresetManager";
 import VoiceSelector from "../components/VoiceSelector";
@@ -9,6 +10,7 @@ import VoiceSelector from "../components/VoiceSelector";
 const DEFAULT_TEST_TEXT = "This is the Alexandria Audiobook Narrator. Test your voice settings here with any text you like.";
 const EMOTION_PRESETS = ["neutral", "warm", "dramatic", "energetic", "contemplative", "authoritative"];
 const PRESET_STORAGE_KEY = "voicePresets";
+const VOICE_LOAD_MAX_RETRIES = 20;
 
 function readStoredPresets() {
   try {
@@ -54,9 +56,12 @@ function VoiceControls({
   generating,
   label,
   loadingVoices,
+  loadingMessage = "",
   onEmotionChange,
   onGenerate,
   onQuickEmotionSelect,
+  onRetryPreview,
+  previewState = null,
   onSpeedChange,
   onVoiceChange,
   speed,
@@ -94,6 +99,9 @@ function VoiceControls({
             value={voice}
             voices={voices}
           />
+          {loadingVoices && loadingMessage ? (
+            <p className="mt-3 text-sm text-slate-500">{loadingMessage}</p>
+          ) : null}
         </div>
 
         <div>
@@ -160,6 +168,30 @@ function VoiceControls({
         >
           {generating ? "Generating preview..." : generateLabel}
         </button>
+
+        {previewState?.errorMessage ? (
+          <div className="rounded-[1.5rem] border border-rose-200 bg-rose-50 px-4 py-4 text-sm text-rose-700">
+            <div>{previewState.errorMessage}</div>
+            <button
+              className="mt-3 inline-flex items-center rounded-full border border-rose-300 px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-rose-700 transition hover:bg-rose-100"
+              onClick={onRetryPreview}
+              type="button"
+            >
+              Retry
+            </button>
+          </div>
+        ) : null}
+
+        {previewState?.isActive ? (
+          <ProgressHeartbeat
+            isActive={previewState.isActive}
+            progressPercent={null}
+            showETA={null}
+            size="sm"
+            stage={previewState.stage}
+            startTime={previewState.startTime}
+          />
+        ) : null}
       </div>
 
       {showPreview ? (
@@ -178,6 +210,10 @@ function VoiceControls({
 }
 
 export default function VoiceLab() {
+  const previewStageTimeoutsRef = useRef({});
+  const voiceLoadRequestRef = useRef(0);
+  const voiceRetryTimeoutRef = useRef(null);
+
   const [activeTab, setActiveTab] = useState("audition");
   const [audioUrl, setAudioUrl] = useState("");
   const [clonedVoices, setClonedVoices] = useState([]);
@@ -196,14 +232,62 @@ export default function VoiceLab() {
   const [loadingVoices, setLoadingVoices] = useState(true);
   const [mode, setMode] = useState("single");
   const [presets, setPresets] = useState([]);
+  const [previewStateByTarget, setPreviewStateByTarget] = useState({
+    compare: null,
+    primary: null,
+  });
   const [testText, setTestText] = useState(DEFAULT_TEST_TEXT);
   const [voice, setVoice] = useState("Ethan");
+  const [voiceLoadAttempt, setVoiceLoadAttempt] = useState(0);
+  const [voiceLoadingMessage, setVoiceLoadingMessage] = useState("");
   const [voices, setVoices] = useState([]);
   const [emotion, setEmotion] = useState("neutral");
   const [speed, setSpeed] = useState(1.0);
 
-  async function loadVoices() {
+  function setPreviewState(target, nextState) {
+    setPreviewStateByTarget((currentState) => ({
+      ...currentState,
+      [target]: nextState,
+    }));
+  }
+
+  function clearPreviewStageTimeout(target) {
+    const timeoutId = previewStageTimeoutsRef.current[target];
+    if (timeoutId) {
+      window.clearTimeout(timeoutId);
+      delete previewStageTimeoutsRef.current[target];
+    }
+  }
+
+  function schedulePreviewStage(target) {
+    clearPreviewStageTimeout(target);
+    previewStageTimeoutsRef.current[target] = window.setTimeout(() => {
+      setPreviewStateByTarget((currentState) => {
+        const currentPreviewState = currentState[target];
+        if (!currentPreviewState?.isActive) {
+          return currentState;
+        }
+
+        return {
+          ...currentState,
+          [target]: {
+            ...currentPreviewState,
+            stage: "Processing...",
+          },
+        };
+      });
+    }, 1500);
+  }
+
+  async function loadVoices(attempt = 1) {
+    const requestId = voiceLoadRequestRef.current + 1;
+    voiceLoadRequestRef.current = requestId;
     setLoadingVoices(true);
+    if (voiceRetryTimeoutRef.current) {
+      window.clearTimeout(voiceRetryTimeoutRef.current);
+      voiceRetryTimeoutRef.current = null;
+    }
+    let keepLoading = false;
 
     try {
       const response = await fetch("/api/voice-lab/voices");
@@ -212,17 +296,45 @@ export default function VoiceLab() {
       }
 
       const payload = await response.json();
+      if (payload.loading) {
+        const nextAttempt = Math.min(attempt, VOICE_LOAD_MAX_RETRIES);
+        setVoiceLoadAttempt(nextAttempt);
+        setVoiceLoadingMessage(`TTS engine is loading... retrying in 3s (attempt ${nextAttempt}/${VOICE_LOAD_MAX_RETRIES})`);
+        keepLoading = true;
+
+        if (nextAttempt >= VOICE_LOAD_MAX_RETRIES) {
+          setLoadingVoices(false);
+          setErrorMessage(payload.message ?? "TTS engine is still loading.");
+          return;
+        }
+
+        voiceRetryTimeoutRef.current = window.setTimeout(() => {
+          void loadVoices(nextAttempt + 1);
+        }, 3000);
+        return;
+      }
+
+      if (voiceLoadRequestRef.current !== requestId) {
+        return;
+      }
+
       const availableVoices = payload.voices ?? [];
       setEngineName(payload.engine ?? "");
       setVoices(availableVoices);
       setVoice((currentVoice) => selectVoiceValue(availableVoices, currentVoice, 0));
       setCompareVoice((currentVoice) => selectVoiceValue(availableVoices, currentVoice, 1));
+      setVoiceLoadAttempt(0);
+      setVoiceLoadingMessage("");
       setErrorMessage("");
     } catch (error) {
+      setVoiceLoadAttempt(0);
+      setVoiceLoadingMessage("");
       setErrorMessage(error instanceof Error ? error.message : "Failed to load voices.");
       console.error("Error fetching voices:", error);
     } finally {
-      setLoadingVoices(false);
+      if (voiceLoadRequestRef.current === requestId && !keepLoading) {
+        setLoadingVoices(false);
+      }
     }
   }
 
@@ -253,6 +365,14 @@ export default function VoiceLab() {
     setPresets(readStoredPresets());
     void loadVoices();
     void loadClonedVoices();
+    return () => {
+      if (voiceRetryTimeoutRef.current) {
+        window.clearTimeout(voiceRetryTimeoutRef.current);
+      }
+      Object.values(previewStageTimeoutsRef.current).forEach((timeoutId) => {
+        window.clearTimeout(timeoutId);
+      });
+    };
   }, []);
 
   const handleGenerateAudio = async (isCompare = false) => {
@@ -260,6 +380,7 @@ export default function VoiceLab() {
     const selectedEmotion = isCompare ? compareEmotion : emotion;
     const selectedSpeed = isCompare ? compareSpeed : speed;
     const selectedTarget = isCompare ? "compare" : "primary";
+    const startedAt = Date.now();
 
     if (!testText.trim()) {
       setErrorMessage("Please enter text to generate audio.");
@@ -273,6 +394,22 @@ export default function VoiceLab() {
 
     setErrorMessage("");
     setGenerationTarget(selectedTarget);
+    clearPreviewStageTimeout(selectedTarget);
+    setPreviewState(selectedTarget, {
+      errorMessage: "",
+      isActive: true,
+      stage: "Synthesizing audio...",
+      startTime: startedAt,
+    });
+    schedulePreviewStage(selectedTarget);
+
+    if (isCompare) {
+      setCompareAudioUrl("");
+      setCompareDuration(0);
+    } else {
+      setAudioUrl("");
+      setDuration(0);
+    }
 
     try {
       const response = await fetch("/api/voice-lab/test", {
@@ -304,6 +441,13 @@ export default function VoiceLab() {
       }
 
       const payload = await response.json();
+      clearPreviewStageTimeout(selectedTarget);
+      setPreviewState(selectedTarget, {
+        errorMessage: "",
+        isActive: false,
+        stage: "Ready",
+        startTime: startedAt,
+      });
       if (isCompare) {
         setCompareAudioUrl(payload.audio_url);
         setCompareDuration(payload.duration_seconds ?? 0);
@@ -312,12 +456,22 @@ export default function VoiceLab() {
         setDuration(payload.duration_seconds ?? 0);
       }
     } catch (error) {
-      setErrorMessage(error instanceof Error ? error.message : "Audio generation failed.");
+      clearPreviewStageTimeout(selectedTarget);
+      setPreviewState(selectedTarget, {
+        errorMessage: error instanceof Error ? error.message : "Audio generation failed.",
+        isActive: false,
+        stage: "Processing...",
+        startTime: startedAt,
+      });
       console.error("Generation error:", error);
     } finally {
       setGenerationTarget("");
     }
   };
+
+  function handleRetryPreview(target) {
+    void handleGenerateAudio(target === "compare");
+  }
 
   const handleSavePreset = () => {
     const presetName = window.prompt("Preset name:");
@@ -556,13 +710,18 @@ export default function VoiceLab() {
                     generating={generationTarget === "primary"}
                     label="Voice A"
                     loadingVoices={loadingVoices}
+                    loadingMessage={voiceLoadingMessage}
                     onEmotionChange={setEmotion}
                     onGenerate={() => {
                       void handleGenerateAudio(false);
                     }}
                     onQuickEmotionSelect={setEmotion}
+                    onRetryPreview={() => {
+                      handleRetryPreview("primary");
+                    }}
                     onSpeedChange={setSpeed}
                     onVoiceChange={setVoice}
+                    previewState={previewStateByTarget.primary}
                     speed={speed}
                     showPreview={false}
                     subtitle="Primary voice settings"
@@ -613,13 +772,18 @@ export default function VoiceLab() {
                   generating={generationTarget === "primary"}
                   label="Voice A"
                   loadingVoices={loadingVoices}
+                  loadingMessage={voiceLoadingMessage}
                   onEmotionChange={setEmotion}
                   onGenerate={() => {
                     void handleGenerateAudio(false);
                   }}
                   onQuickEmotionSelect={setEmotion}
+                  onRetryPreview={() => {
+                    handleRetryPreview("primary");
+                  }}
                   onSpeedChange={setSpeed}
                   onVoiceChange={setVoice}
+                  previewState={previewStateByTarget.primary}
                   speed={speed}
                   subtitle="Left-side comparison"
                   voice={voice}
@@ -633,13 +797,18 @@ export default function VoiceLab() {
                   generating={generationTarget === "compare"}
                   label="Voice B"
                   loadingVoices={loadingVoices}
+                  loadingMessage={voiceLoadingMessage}
                   onEmotionChange={setCompareEmotion}
                   onGenerate={() => {
                     void handleGenerateAudio(true);
                   }}
                   onQuickEmotionSelect={setCompareEmotion}
+                  onRetryPreview={() => {
+                    handleRetryPreview("compare");
+                  }}
                   onSpeedChange={setCompareSpeed}
                   onVoiceChange={setCompareVoice}
+                  previewState={previewStateByTarget.compare}
                   speed={compareSpeed}
                   subtitle="Right-side comparison"
                   voice={compareVoice}

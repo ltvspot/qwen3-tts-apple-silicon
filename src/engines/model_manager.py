@@ -12,6 +12,7 @@ from typing import Any, Callable
 from src.config import get_application_settings
 
 logger = logging.getLogger(__name__)
+CANARY_TEXT = "The old lighthouse keeper closed his journal and set it on the windowsill."
 
 
 @dataclass(slots=True)
@@ -20,10 +21,14 @@ class ModelStats:
 
     chunks_generated: int = 0
     chapters_generated: int = 0
+    manager_started_at: float = field(default_factory=time.time)
     last_reload_time: float = field(default_factory=time.time)
     total_generation_seconds: float = 0.0
     peak_memory_mb: float = 0.0
     reload_count: int = 0
+    last_canary_status: str = "not_run"
+    last_canary_checked_at: float | None = None
+    last_canary_deviation_percent: float | None = None
 
 
 class ModelManager:
@@ -65,6 +70,7 @@ class ModelManager:
             if memory_pressure_threshold_mb is None
             else memory_pressure_threshold_mb
         )
+        self._baseline_spectral_centroid: float | None = None
 
     @property
     def engine(self) -> Any | None:
@@ -123,9 +129,13 @@ class ModelManager:
             await asyncio.to_thread(engine.load)
         self._engine = engine
         self._stats = ModelStats(
+            manager_started_at=self._stats.manager_started_at,
             last_reload_time=time.time(),
             peak_memory_mb=self._get_process_memory_mb(),
             reload_count=reload_count,
+            last_canary_status=self._stats.last_canary_status,
+            last_canary_checked_at=self._stats.last_canary_checked_at,
+            last_canary_deviation_percent=self._stats.last_canary_deviation_percent,
         )
         logger.info("Shared TTS engine ready")
 
@@ -133,6 +143,12 @@ class ModelManager:
         """Unload the current engine and replace it with a fresh instance."""
 
         reload_count = self._stats.reload_count + 1
+        await self._replace_engine_locked(reload_count=reload_count)
+        await self._run_quality_canary()
+
+    async def _replace_engine_locked(self, *, reload_count: int) -> None:
+        """Unload the current engine, wait for memory release, and load a fresh instance."""
+
         old_engine = self._engine
         self._engine = None
 
@@ -141,8 +157,96 @@ class ModelManager:
 
         del old_engine
         gc.collect()
-        await asyncio.sleep(1.0)
+        await asyncio.sleep(3.0)
+        gc.collect()
         await self._load_engine_locked(reload_count=reload_count)
+
+    async def _run_quality_canary(self, *, allow_rereload: bool = True) -> None:
+        """Generate a canary phrase after reload and compare quality to the baseline."""
+
+        engine = self._engine
+        if engine is None or not hasattr(engine, "generate"):
+            return
+
+        try:
+            audio = await asyncio.to_thread(engine.generate, CANARY_TEXT, "Ethan", "neutral", 1.0)
+            if audio is None or len(audio) < 1000:
+                self._stats.last_canary_status = "failed"
+                self._stats.last_canary_checked_at = time.time()
+                self._stats.last_canary_deviation_percent = None
+                logger.warning("Quality canary: generation failed, triggering another reload")
+                if allow_rereload:
+                    await self._replace_engine_locked(reload_count=self._stats.reload_count + 1)
+                    await self._run_quality_canary(allow_rereload=False)
+                return
+
+            centroid = self._compute_spectral_centroid(audio)
+            if centroid is None:
+                self._stats.last_canary_status = "unavailable"
+                self._stats.last_canary_checked_at = time.time()
+                self._stats.last_canary_deviation_percent = None
+                logger.warning("Quality canary: could not compute spectral centroid")
+                return
+
+            if self._baseline_spectral_centroid is None:
+                self._baseline_spectral_centroid = centroid
+                self._stats.last_canary_status = "baseline"
+                self._stats.last_canary_checked_at = time.time()
+                self._stats.last_canary_deviation_percent = 0.0
+                logger.info("Quality canary: baseline spectral centroid = %.1f Hz", centroid)
+                return
+
+            deviation = abs(centroid - self._baseline_spectral_centroid) / self._baseline_spectral_centroid
+            self._stats.last_canary_checked_at = time.time()
+            self._stats.last_canary_deviation_percent = round(deviation * 100.0, 3)
+            if deviation > 0.15:
+                self._stats.last_canary_status = "degraded"
+                logger.warning(
+                    "Quality canary: spectral centroid %.1f Hz deviates %.1f%% from baseline %.1f Hz — triggering re-reload",
+                    centroid,
+                    deviation * 100,
+                    self._baseline_spectral_centroid,
+                )
+                if allow_rereload:
+                    await self._replace_engine_locked(reload_count=self._stats.reload_count + 1)
+                    await self._run_quality_canary(allow_rereload=False)
+                return
+
+            self._stats.last_canary_status = "ok"
+            logger.info("Quality canary: OK (deviation %.1f%%)", deviation * 100)
+        except Exception as exc:
+            self._stats.last_canary_status = "error"
+            self._stats.last_canary_checked_at = time.time()
+            logger.error("Quality canary failed: %s", exc)
+
+    def _compute_spectral_centroid(self, audio: Any) -> float | None:
+        """Compute a simple spectral centroid for canary comparison."""
+
+        try:
+            import numpy as np
+        except Exception:
+            return None
+
+        samples = np.array(audio.get_array_of_samples(), dtype=np.float64)
+        if samples.size == 0:
+            return None
+
+        frame_size = min(max(256, samples.size), 1024)
+        frame = samples[:frame_size]
+        if frame.size < frame_size:
+            frame = np.pad(frame, (0, frame_size - frame.size))
+
+        window = np.hanning(frame_size)
+        frequencies = np.arange((frame_size // 2) + 1, dtype=np.float64)[:, None]
+        times = np.arange(frame_size, dtype=np.float64)[None, :]
+        exponent = (-2j * np.pi * frequencies * times) / float(frame_size)
+        basis = np.exp(exponent)
+        magnitude = np.abs(basis @ (frame * window))
+        freqs = (frequencies[:, 0] * audio.frame_rate) / frame_size
+        denominator = float(np.sum(magnitude))
+        if denominator <= 0:
+            return None
+        return float(np.sum(freqs * magnitude) / denominator)
 
     def record_chunk(self, generation_seconds: float = 0.0) -> None:
         """Record one generated chunk for cooldown tracking."""
@@ -189,21 +293,38 @@ class ModelManager:
         if self._engine is not None and getattr(self._engine, "loaded", False):
             self._engine.unload()
         self._engine = None
-        self._stats = ModelStats(reload_count=self._stats.reload_count)
+        self._stats = ModelStats(
+            manager_started_at=self._stats.manager_started_at,
+            reload_count=self._stats.reload_count,
+            last_canary_status=self._stats.last_canary_status,
+            last_canary_checked_at=self._stats.last_canary_checked_at,
+            last_canary_deviation_percent=self._stats.last_canary_deviation_percent,
+        )
 
-    def to_dict(self) -> dict[str, float | int]:
+    def to_dict(self) -> dict[str, float | int | str | bool | None]:
         """Return a serializable snapshot of the current model state."""
 
         seconds_since_reload = time.time() - self._stats.last_reload_time
+        uptime_seconds = time.time() - self._stats.manager_started_at
         current_memory = self._get_process_memory_mb()
         return {
+            "loaded": self._engine is not None,
             "chunks_generated": self._stats.chunks_generated,
             "chapters_generated": self._stats.chapters_generated,
             "seconds_since_reload": round(seconds_since_reload, 1),
+            "uptime_seconds": round(uptime_seconds, 1),
+            "last_reload_at": round(self._stats.last_reload_time, 3),
             "total_generation_seconds": round(self._stats.total_generation_seconds, 1),
             "process_memory_mb": round(current_memory, 1),
             "peak_memory_mb": round(max(self._stats.peak_memory_mb, current_memory), 1),
             "reload_count": self._stats.reload_count,
+            "last_canary_status": self._stats.last_canary_status,
+            "last_canary_checked_at": (
+                round(self._stats.last_canary_checked_at, 3)
+                if self._stats.last_canary_checked_at is not None
+                else None
+            ),
+            "last_canary_deviation_percent": self._stats.last_canary_deviation_percent,
             "cooldown_threshold_chapters": self.cooldown_chapter_threshold,
             "cooldown_threshold_chunks": self.cooldown_chunk_threshold,
             "cooldown_threshold_seconds": self.cooldown_time_threshold_seconds,

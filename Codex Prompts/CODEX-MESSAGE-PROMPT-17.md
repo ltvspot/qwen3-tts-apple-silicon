@@ -1,0 +1,1 @@
+Read CLAUDE.md and PROJECT-STATE.md first, then read and implement Codex Prompts/PROMPT-17-PRODUCTION-HARDENING.md. Follow all conventions in CLAUDE.md. Commit with message: [PROMPT-17] PRODUCTION HARDENING. Run tests before committing.

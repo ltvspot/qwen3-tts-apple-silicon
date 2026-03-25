@@ -17,7 +17,7 @@ function createChapter(overrides = {}) {
     audio_url: "/api/book/15/chapter/1/audio",
     automatic_checks: [
       createCheck("file_exists", "pass", "File exists (1024 bytes).", 1024),
-      createCheck("silence_gaps", "warning", "Synthetic warning.", 4.2),
+      createCheck("contextual_silence", "warning", "Synthetic warning.", 4.2),
     ],
     book_id: 15,
     chapter_n: 1,
@@ -29,6 +29,7 @@ function createChapter(overrides = {}) {
     manual_reviewed_by: null,
     manual_status: null,
     overall_status: "warning",
+    qa_grade: "B",
     ...overrides,
   };
 }
@@ -187,6 +188,7 @@ describe("QA dashboard page", () => {
     await waitFor(() => {
       expect(container.textContent).toContain("Chapter One");
       expect(container.textContent).toContain("Awaiting manual QA");
+      expect(container.textContent).toContain("Grade B");
     });
 
     await act(async () => {
@@ -196,7 +198,7 @@ describe("QA dashboard page", () => {
     });
 
     await waitFor(() => {
-      expect(container.textContent).toContain("silence gaps");
+      expect(container.textContent).toContain("contextual silence");
       expect(container.textContent).toContain("Synthetic warning.");
     });
 
@@ -257,7 +259,7 @@ describe("QA dashboard page", () => {
 
     await act(async () => {
       Array.from(container.querySelectorAll("button"))
-        .find((button) => button.textContent.includes("Approve"))
+        .find((button) => button.textContent.trim() === "Approve")
         .dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
 
@@ -265,6 +267,68 @@ describe("QA dashboard page", () => {
       expect(fetchMock.mock.calls[1][0]).toBe("/api/book/15/chapter/1/qa");
       expect(fetchMock.mock.calls[1][1].method).toBe("POST");
       expect(container.textContent).toContain("Approved by Tim");
+    });
+  });
+
+  test("approves all passing chapters for a book", async () => {
+    const passChapter = createChapter({
+      book_id: 15,
+      chapter_n: 1,
+      manual_status: null,
+      overall_status: "pass",
+    });
+    const warningChapter = createChapter({
+      book_id: 15,
+      chapter_n: 2,
+      overall_status: "warning",
+    });
+    const refreshedPassChapter = createChapter({
+      book_id: 15,
+      chapter_n: 1,
+      manual_reviewed_at: "2026-03-24T12:20:00Z",
+      manual_reviewed_by: "auto-approved",
+      manual_status: "approved",
+      overall_status: "pass",
+    });
+
+    fetchMock
+      .mockResolvedValueOnce(createJsonResponse(createDashboardPayload({
+        books_needing_review: [createBook({
+          chapters: [passChapter, warningChapter],
+          chapters_pass: 1,
+          chapters_pending_manual: 1,
+          chapters_warning: 1,
+          overall_book_status: "warning",
+        })],
+      })))
+      .mockResolvedValueOnce(createJsonResponse({ approved: 1 }))
+      .mockResolvedValueOnce(createJsonResponse(createDashboardPayload({
+        books_needing_review: [createBook({
+          chapters: [refreshedPassChapter, warningChapter],
+          chapters_pass: 1,
+          chapters_pending_manual: 1,
+          chapters_warning: 1,
+          overall_book_status: "warning",
+        })],
+      })));
+
+    await renderQA();
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("Warning Book");
+      expect(container.textContent).toContain("Approve All Passing");
+    });
+
+    await act(async () => {
+      Array.from(container.querySelectorAll("button"))
+        .find((button) => button.textContent.includes("Approve All Passing"))
+        .dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    await waitFor(() => {
+      expect(fetchMock.mock.calls[1][0]).toBe("/api/book/15/approve-all-passing");
+      expect(fetchMock.mock.calls[1][1].method).toBe("POST");
+      expect(container.textContent).toContain("Approved 1 passing chapter for Warning Book.");
     });
   });
 

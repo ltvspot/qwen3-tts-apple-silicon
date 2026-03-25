@@ -6,19 +6,7 @@ import {
   formatEta,
   getChapterLabel,
 } from "./generationStatus";
-
-function formatElapsed(startedAt, nowMs) {
-  if (!startedAt) {
-    return "0s elapsed";
-  }
-
-  const startedAtMs = new Date(startedAt).getTime();
-  if (Number.isNaN(startedAtMs)) {
-    return "0s elapsed";
-  }
-
-  return `${formatDetailedDuration(Math.max((nowMs - startedAtMs) / 1000, 0))} elapsed`;
-}
+import ProgressHeartbeat from "./ProgressHeartbeat";
 
 export default function GenerationProgress({
   active = false,
@@ -28,7 +16,7 @@ export default function GenerationProgress({
   onStatusUpdate = () => {},
 }) {
   const [pollingError, setPollingError] = useState("");
-  const [renderNow, setRenderNow] = useState(() => Date.now());
+  const [pollRetryNonce, setPollRetryNonce] = useState(0);
   const [snapshot, setSnapshot] = useState(null);
 
   const callbackRef = useRef({
@@ -54,7 +42,16 @@ export default function GenerationProgress({
 
     let cancelled = false;
     let failureCount = 0;
-    let intervalId = null;
+    let timeoutId = null;
+
+    function scheduleNextPoll(delayMs) {
+      if (cancelled) {
+        return;
+      }
+      timeoutId = window.setTimeout(() => {
+        void pollStatus();
+      }, delayMs);
+    }
 
     async function pollStatus() {
       try {
@@ -91,9 +88,8 @@ export default function GenerationProgress({
         }
 
         completedSetRef.current = nextCompletedSet;
-        if (payload.status !== "generating" && intervalId !== null) {
-          window.clearInterval(intervalId);
-          intervalId = null;
+        if (payload.status === "generating") {
+          scheduleNextPoll(2000);
         }
       } catch (error) {
         if (cancelled) {
@@ -101,52 +97,37 @@ export default function GenerationProgress({
         }
 
         failureCount += 1;
-        if (failureCount >= 3) {
-          setPollingError("Generation progress lost connection after 3 retries.");
-          if (intervalId !== null) {
-            window.clearInterval(intervalId);
-            intervalId = null;
-          }
+        if (failureCount >= 10) {
+          setPollingError("Connection lost — click to retry");
           return;
         }
 
-        setPollingError(`Retrying generation status (${failureCount}/3)...`);
+        const retryDelayMs = Math.min(2000 * (2 ** (failureCount - 1)), 8000);
+        setPollingError(
+          `Retrying generation status in ${Math.round(retryDelayMs / 1000)}s (${failureCount}/10)...`,
+        );
+        scheduleNextPoll(retryDelayMs);
       }
     }
 
     void pollStatus();
-    intervalId = window.setInterval(() => {
-      void pollStatus();
-    }, 2000);
 
     return () => {
       cancelled = true;
-      if (intervalId !== null) {
-        window.clearInterval(intervalId);
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
       }
     };
-  }, [active, bookId]);
-
-  useEffect(() => {
-    if (!active) {
-      return undefined;
-    }
-
-    const intervalId = window.setInterval(() => {
-      setRenderNow(Date.now());
-    }, 1000);
-
-    return () => {
-      window.clearInterval(intervalId);
-    };
-  }, [active]);
+  }, [active, bookId, pollRetryNonce]);
 
   const chapterMap = useMemo(() => new Map(chapters.map((chapter) => [chapter.number, chapter])), [chapters]);
   const resolvedSnapshot = snapshot ?? {
     chapters: [],
+    current_chunk: null,
     current_chapter_n: null,
     eta_seconds: null,
     status: "generating",
+    total_chunks: null,
   };
   const completedCount = resolvedSnapshot.chapters.filter((chapter) => chapter.status === "completed").length;
   const totalCount = Math.max(chapters.length, resolvedSnapshot.chapters.length, 1);
@@ -157,6 +138,27 @@ export default function GenerationProgress({
     ? chapterMap.get(currentChapterStatus.chapter_n) ?? { number: currentChapterStatus.chapter_n, type: "chapter" }
     : null;
   const progressPercent = Math.min((completedCount / totalCount) * 100, 100);
+  const currentChapterIndex = Math.min(
+    Math.max(completedCount + (currentChapterStatus ? 1 : 0), 1),
+    totalCount,
+  );
+  const currentChunk = resolvedSnapshot.current_chunk ?? currentChapterStatus?.current_chunk ?? null;
+  const totalChunks = resolvedSnapshot.total_chunks ?? currentChapterStatus?.total_chunks ?? null;
+  const hasChunkProgress = currentChunk !== null && totalChunks !== null;
+  const chunkProgressPercent = hasChunkProgress
+    ? Math.min((currentChunk / totalChunks) * 100, 100)
+    : (
+      currentChapterStatus?.progress_seconds != null
+      && currentChapterStatus?.expected_total_seconds
+        ? Math.min(
+          (currentChapterStatus.progress_seconds / currentChapterStatus.expected_total_seconds) * 100,
+          100,
+        )
+        : null
+    );
+  const chapterHeading = hasChunkProgress
+    ? `Chapter ${currentChapterIndex} of ${totalCount} — Chunk ${currentChunk}/${totalChunks} (${Math.round(chunkProgressPercent ?? 0)}%)`
+    : `Chapter ${currentChapterIndex} of ${totalCount}`;
 
   if (!active) {
     return null;
@@ -169,9 +171,7 @@ export default function GenerationProgress({
           <div className="text-xs font-semibold uppercase tracking-[0.28em] text-sky-200/80">
             Generation Progress
           </div>
-          <h2 className="mt-2 text-2xl font-semibold text-white">
-            Chapter {Math.min(Math.max(completedCount + (currentChapterStatus ? 1 : 0), 1), totalCount)} of {totalCount}
-          </h2>
+          <h2 className="mt-2 text-2xl font-semibold text-white">{chapterHeading}</h2>
           <p className="mt-2 text-sm text-slate-300">
             {currentChapter
               ? `${getChapterLabel(currentChapter)} is processing now.`
@@ -211,23 +211,43 @@ export default function GenerationProgress({
             {currentChapter ? getChapterLabel(currentChapter) : `Chapter ${currentChapterStatus.chapter_n}`}
           </div>
           <div className="mt-2 text-sm text-slate-300">
-            Generating... {formatDetailedDuration(currentChapterStatus.progress_seconds ?? 0)} of{" "}
-            {formatDetailedDuration(currentChapterStatus.expected_total_seconds ?? 0)} complete
+            {hasChunkProgress
+              ? `Chunk ${currentChunk} of ${totalChunks} is rendering now.`
+              : `Generating... ${formatDetailedDuration(currentChapterStatus.progress_seconds ?? 0)} of ${formatDetailedDuration(currentChapterStatus.expected_total_seconds ?? 0)} complete`}
           </div>
-          <div className="mt-3 flex flex-wrap gap-2 text-xs text-slate-400">
-            <span className="rounded-full border border-white/10 bg-slate-950/45 px-2 py-1">
-              {formatElapsed(currentChapterStatus.started_at, renderNow)}
-            </span>
-            <span className="rounded-full border border-white/10 bg-slate-950/45 px-2 py-1">
-              {formatEta(resolvedSnapshot.eta_seconds)}
-            </span>
+          <div className="mt-4">
+            <ProgressHeartbeat
+              isActive={resolvedSnapshot.status === "generating"}
+              progressPercent={chunkProgressPercent}
+              showETA={formatEta(resolvedSnapshot.eta_seconds)}
+              size="sm"
+              stage={
+                hasChunkProgress
+                  ? `Generating chunk ${currentChunk}/${totalChunks}`
+                  : "Generating chapter audio..."
+              }
+              startTime={currentChapterStatus.started_at}
+            />
           </div>
         </div>
       ) : null}
 
       {pollingError ? (
         <div className="mt-5 rounded-[1.25rem] border border-amber-300/25 bg-amber-400/10 px-4 py-3 text-sm text-amber-100">
-          {pollingError}
+          {pollingError === "Connection lost — click to retry" ? (
+            <button
+              className="font-semibold underline underline-offset-4"
+              onClick={() => {
+                setPollingError("");
+                setPollRetryNonce((currentValue) => currentValue + 1);
+              }}
+              type="button"
+            >
+              {pollingError}
+            </button>
+          ) : (
+            pollingError
+          )}
         </div>
       ) : null}
 

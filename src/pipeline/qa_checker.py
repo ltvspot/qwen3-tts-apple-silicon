@@ -5,6 +5,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
+import shutil
+import subprocess
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -16,6 +20,7 @@ from sqlalchemy.orm import Session
 
 from src.config import settings
 from src.database import Chapter, ChapterQARecord, QAAutomaticStatus, QAManualStatus, QAStatus, SessionLocal, utc_now
+from src.engines.chunker import TextChunker
 
 logger = logging.getLogger(__name__)
 
@@ -42,9 +47,23 @@ CHECK_NAMES = (
     "file_exists",
     "duration_check",
     "clipping_detection",
-    "silence_gaps",
+    "contextual_silence",
     "volume_consistency",
+    "voice_consistency",
+    "stitch_quality",
+    "pacing_detailed",
+    "spectral_quality",
+    "lufs_compliance",
 )
+_DFT_MATRIX_CACHE: dict[int, np.ndarray] = {}
+CONTEXT_SILENCE_RULES = {
+    "mid_sentence": {"min_ms": 0, "max_ms": 800, "expected_ms": 200},
+    "sentence_boundary": {"min_ms": 300, "max_ms": 1500, "expected_ms": 600},
+    "paragraph_boundary": {"min_ms": 600, "max_ms": 2500, "expected_ms": 1200},
+    "dialogue_transition": {"min_ms": 400, "max_ms": 1200, "expected_ms": 700},
+    "chapter_start": {"min_ms": 500, "max_ms": 2000, "expected_ms": 1000},
+    "chapter_end": {"min_ms": 500, "max_ms": 3000, "expected_ms": 1500},
+}
 
 
 class QACheckResult(BaseModel):
@@ -54,6 +73,7 @@ class QACheckResult(BaseModel):
     status: str
     message: str
     value: float | None = None
+    details: dict[str, Any] | None = None
 
 
 class QAResult(BaseModel):
@@ -65,6 +85,7 @@ class QAResult(BaseModel):
     checks: list[QACheckResult]
     overall_status: str
     notes: str = ""
+    chapter_report: dict[str, Any] | None = None
 
     @property
     def has_warnings(self) -> bool:
@@ -83,12 +104,67 @@ class _AudioAnalysis(BaseModel):
     """Decoded audio ready for QA analysis."""
 
     audio: Any
+    normalized_samples: Any
     actual_duration: float
     peak_amplitude: float
     chunk_rms_dbfs: list[float]
     mid_chapter_silences_ms: list[int]
 
     model_config = {"arbitrary_types_allowed": True}
+
+
+@dataclass(slots=True)
+class ChapterQAReport:
+    """Structured chapter-level QA summary."""
+
+    chapter_number: int
+    chapter_title: str
+    duration_seconds: float
+    total_checks: int
+    passed: int
+    warnings: int
+    failures: int
+    results: list[QACheckResult]
+    pacing_stats: dict[str, Any]
+    silence_stats: dict[str, Any]
+    stitch_quality: dict[str, Any]
+
+    @property
+    def overall_grade(self) -> str:
+        """Return the audiobook-grade summary for the chapter."""
+
+        if self.failures > 0:
+            return "F"
+        if self.warnings > 3:
+            return "C"
+        if self.warnings > 0:
+            return "B"
+        return "A"
+
+    @property
+    def ready_for_export(self) -> bool:
+        """Return whether the chapter is export-ready without manual intervention."""
+
+        return self.overall_grade in ("A", "B")
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serializable representation."""
+
+        return {
+            "chapter_number": self.chapter_number,
+            "chapter_title": self.chapter_title,
+            "duration_seconds": round(self.duration_seconds, 4),
+            "total_checks": self.total_checks,
+            "passed": self.passed,
+            "warnings": self.warnings,
+            "failures": self.failures,
+            "results": [result.model_dump(mode="json") for result in self.results],
+            "pacing_stats": self.pacing_stats,
+            "silence_stats": self.silence_stats,
+            "stitch_quality": self.stitch_quality,
+            "overall_grade": self.overall_grade,
+            "ready_for_export": self.ready_for_export,
+        }
 
 
 def _resolve_audio_path(audio_path: str | None) -> Path | None:
@@ -179,6 +255,14 @@ def _chunk_rms_dbfs(normalized_samples: np.ndarray, frame_rate: int, chunk_secon
     return chunk_levels
 
 
+def _dbfs_from_amplitude(value: float) -> float:
+    """Convert a normalized amplitude into dBFS with a floor for silence."""
+
+    if value <= 1e-9:
+        return -100.0
+    return float(20 * np.log10(value))
+
+
 def _mid_chapter_silences(audio: AudioSegment) -> list[int]:
     """Return silent gap durations inside the chapter body in milliseconds."""
 
@@ -201,6 +285,17 @@ def _mid_chapter_silences(audio: AudioSegment) -> list[int]:
     return durations
 
 
+def _active_speech_ms(audio: AudioSegment) -> int:
+    """Return the approximate amount of active speech in milliseconds."""
+
+    active_segments = silence.detect_nonsilent(
+        audio,
+        min_silence_len=250,
+        silence_thresh=QA_THRESHOLDS["silence_threshold_dbfs"],
+    )
+    return sum(end - start for start, end in active_segments)
+
+
 def _load_audio_analysis(audio_path: str | Path) -> _AudioAnalysis:
     """Decode WAV audio and pre-compute reusable QA metrics."""
 
@@ -213,6 +308,7 @@ def _load_audio_analysis(audio_path: str | Path) -> _AudioAnalysis:
 
     return _AudioAnalysis(
         audio=audio,
+        normalized_samples=normalized_samples,
         actual_duration=len(audio) / 1000.0,
         peak_amplitude=peak_amplitude,
         chunk_rms_dbfs=_chunk_rms_dbfs(
@@ -222,6 +318,230 @@ def _load_audio_analysis(audio_path: str | Path) -> _AudioAnalysis:
         ),
         mid_chapter_silences_ms=_mid_chapter_silences(audio),
     )
+
+
+def _magnitude_spectrum(samples: np.ndarray) -> np.ndarray:
+    """Return a real-spectrum magnitude without relying on ``numpy.fft``."""
+
+    frame_length = samples.size
+    if frame_length == 0:
+        return np.zeros(0, dtype=np.float32)
+
+    if frame_length not in _DFT_MATRIX_CACHE:
+        frequencies = np.arange((frame_length // 2) + 1, dtype=np.float32)[:, None]
+        times = np.arange(frame_length, dtype=np.float32)[None, :]
+        exponent = (-2j * np.pi * frequencies * times) / float(frame_length)
+        _DFT_MATRIX_CACHE[frame_length] = np.exp(exponent).astype(np.complex64)
+
+    return np.abs(_DFT_MATRIX_CACHE[frame_length] @ samples.astype(np.float32))
+
+
+def _average_frame_spectrum(
+    samples: np.ndarray,
+    sample_rate: int,
+    *,
+    frame_size: int = 1024,
+    hop_size: int = 512,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return average magnitude spectrum across non-silent frames."""
+
+    if samples.size == 0:
+        return (np.zeros(0, dtype=np.float32), np.zeros(0, dtype=np.float32))
+
+    if samples.size < frame_size:
+        samples = np.pad(samples, (0, frame_size - samples.size))
+
+    window = np.hanning(frame_size).astype(np.float32)
+    spectra: list[np.ndarray] = []
+
+    for start in range(0, samples.size - frame_size + 1, hop_size):
+        frame = samples[start:start + frame_size]
+        if np.sqrt(np.mean(np.square(frame))) <= 1e-4:
+            continue
+        spectra.append(_magnitude_spectrum(frame * window))
+
+    if not spectra:
+        spectra = [_magnitude_spectrum(samples[:frame_size] * window)]
+
+    mean_spectrum = np.mean(np.stack(spectra), axis=0)
+    frequencies = (np.arange(mean_spectrum.size, dtype=np.float32) * sample_rate) / float(frame_size)
+    return (frequencies, mean_spectrum.astype(np.float32))
+
+
+def _spectral_centroid(samples: np.ndarray, sample_rate: int) -> float | None:
+    """Return the spectral centroid for the provided samples."""
+
+    frequencies, spectrum = _average_frame_spectrum(samples, sample_rate)
+    if spectrum.size == 0:
+        return None
+
+    energy = float(np.sum(spectrum))
+    if energy <= 1e-8:
+        return None
+    return float(np.sum(frequencies * spectrum) / energy)
+
+
+def _linear_rms(samples: np.ndarray) -> float:
+    """Return linear RMS amplitude for normalized samples."""
+
+    if samples.size == 0:
+        return 0.0
+    return float(np.sqrt(np.mean(np.square(samples))))
+
+
+def _median(values: list[float] | np.ndarray) -> float | None:
+    """Return a stable median without relying on numpy's median implementation."""
+
+    sequence = [float(value) for value in values]
+    if not sequence:
+        return None
+
+    ordered = sorted(sequence)
+    midpoint = len(ordered) // 2
+    if len(ordered) % 2 == 1:
+        return ordered[midpoint]
+    return (ordered[midpoint - 1] + ordered[midpoint]) / 2.0
+
+
+def _estimate_pitch(audio_segment: AudioSegment, sample_rate: int) -> float | None:
+    """Estimate a median F0 using frame-wise zero-crossing intervals."""
+
+    samples = _mono_samples(audio_segment)
+    if samples.size == 0:
+        return None
+
+    frame_size = max(int(sample_rate * 0.1), 1)
+    hop_size = max(int(sample_rate * 0.05), 1)
+    pitches: list[float] = []
+
+    for start in range(0, samples.size - frame_size + 1, hop_size):
+        frame = samples[start:start + frame_size]
+        if _linear_rms(frame) <= 0.01:
+            continue
+
+        centered = frame - float(np.mean(frame))
+        crossings = np.where((centered[:-1] <= 0) & (centered[1:] > 0))[0]
+        if crossings.size < 2:
+            continue
+
+        intervals = np.diff(crossings)
+        if intervals.size == 0:
+            continue
+
+        period = _median(intervals)
+        if period is None:
+            continue
+        if period <= 0:
+            continue
+
+        pitch = sample_rate / period
+        if 48.0 <= pitch <= 480.0:
+            pitches.append(pitch)
+
+    if not pitches:
+        return None
+    return _median(pitches)
+
+
+def _parse_chunk_boundaries(boundary_payload: str | None) -> list[float]:
+    """Parse persisted chunk boundaries from JSON."""
+
+    if boundary_payload is None or not boundary_payload.strip():
+        return []
+
+    try:
+        parsed = json.loads(boundary_payload)
+    except json.JSONDecodeError:
+        logger.warning("Unable to parse chunk boundaries JSON: %s", boundary_payload)
+        return []
+
+    if not isinstance(parsed, list):
+        return []
+
+    boundaries = [max(float(value), 0.0) for value in parsed if isinstance(value, (int, float))]
+    if not boundaries:
+        return []
+    if boundaries[0] > 0:
+        boundaries.insert(0, 0.0)
+    return sorted(set(boundaries))
+
+
+def _chunk_regions(audio: AudioSegment, chunk_boundaries: list[float]) -> list[tuple[int, int]]:
+    """Return `(start_ms, end_ms)` regions for each chunk."""
+
+    if not chunk_boundaries:
+        return [(0, len(audio))]
+
+    boundaries_ms = [max(int(boundary * 1000), 0) for boundary in chunk_boundaries]
+    if boundaries_ms[0] != 0:
+        boundaries_ms.insert(0, 0)
+
+    regions: list[tuple[int, int]] = []
+    for index, start_ms in enumerate(boundaries_ms):
+        end_ms = boundaries_ms[index + 1] if index + 1 < len(boundaries_ms) else len(audio)
+        if end_ms > start_ms:
+            regions.append((start_ms, end_ms))
+
+    return regions or [(0, len(audio))]
+
+
+def _status_from_severity(worst_status: str) -> int:
+    """Return sortable severity for QA statuses."""
+
+    return STATUS_SEVERITY.get(worst_status, 0)
+
+
+def _synthesize_chapter_report(
+    qa_result: QAResult,
+    *,
+    chapter_number: int,
+    chapter_title: str,
+    duration_seconds: float,
+) -> dict[str, Any]:
+    """Backfill a chapter report for older stored QA payloads."""
+
+    passed = sum(check.status == QAAutomaticStatus.PASS.value for check in qa_result.checks)
+    warnings = sum(check.status == QAAutomaticStatus.WARNING.value for check in qa_result.checks)
+    failures = sum(check.status == QAAutomaticStatus.FAIL.value for check in qa_result.checks)
+    pacing_stats: dict[str, Any] = {}
+    silence_stats: dict[str, Any] = {}
+    stitch_quality: dict[str, Any] = {}
+
+    for check in qa_result.checks:
+        if not check.details:
+            continue
+        if check.name == "pacing_detailed":
+            pacing_stats = dict(check.details.get("pacing_stats") or {})
+        elif check.name == "contextual_silence":
+            silence_stats = dict(check.details.get("silence_stats") or {})
+        elif check.name == "stitch_quality":
+            stitch_quality = dict(check.details.get("stitch_quality") or {})
+
+    report = ChapterQAReport(
+        chapter_number=chapter_number,
+        chapter_title=chapter_title,
+        duration_seconds=duration_seconds,
+        total_checks=len(qa_result.checks),
+        passed=passed,
+        warnings=warnings,
+        failures=failures,
+        results=qa_result.checks,
+        pacing_stats=pacing_stats,
+        silence_stats=silence_stats,
+        stitch_quality=stitch_quality,
+    )
+    return report.to_dict()
+
+
+def _write_chapter_report_sidecar(audio_path: Path | None, qa_result: QAResult) -> None:
+    """Write the structured QA result next to the chapter WAV when possible."""
+
+    if audio_path is None:
+        return
+
+    report_path = audio_path.with_suffix(".qa.json")
+    payload = qa_result.chapter_report or qa_result.model_dump(mode="json")
+    report_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
 
 
 def check_duration(audio_path: str | Path, word_count: int | None) -> QACheckResult:
@@ -346,14 +666,867 @@ def check_volume_consistency(audio_path: str | Path) -> QACheckResult:
     )
 
 
+def _timeline_regions(total_duration_ms: int, chunk_boundaries: list[float]) -> list[tuple[int, int]]:
+    """Return stitched chunk regions from chunk boundary timestamps."""
+
+    if total_duration_ms <= 0:
+        return [(0, 0)]
+    if not chunk_boundaries:
+        return [(0, total_duration_ms)]
+
+    boundaries_ms = [max(int(boundary * 1000), 0) for boundary in chunk_boundaries]
+    if not boundaries_ms or boundaries_ms[0] != 0:
+        boundaries_ms.insert(0, 0)
+
+    regions: list[tuple[int, int]] = []
+    for index, start_ms in enumerate(boundaries_ms):
+        end_ms = boundaries_ms[index + 1] if index + 1 < len(boundaries_ms) else total_duration_ms
+        if end_ms > start_ms:
+            regions.append((start_ms, min(end_ms, total_duration_ms)))
+
+    return regions or [(0, total_duration_ms)]
+
+
+def _chunk_text_ranges(text_content: str, chunk_boundaries: list[float], total_duration_ms: int) -> list[tuple[int, int]]:
+    """Allocate approximate text ranges to chunk regions using stitched durations."""
+
+    if not text_content:
+        return [(0, 0)]
+
+    regions = _timeline_regions(total_duration_ms, chunk_boundaries)
+    total_chars = len(text_content)
+    total_region_ms = sum(max(end - start, 1) for start, end in regions)
+    allocated: list[tuple[int, int]] = []
+    cursor = 0
+    elapsed_ms = 0
+
+    for index, (start_ms, end_ms) in enumerate(regions):
+        region_ms = max(end_ms - start_ms, 1)
+        elapsed_ms += region_ms
+        if index == len(regions) - 1:
+            next_cursor = total_chars
+        else:
+            next_cursor = min(total_chars, round((elapsed_ms / max(total_region_ms, 1)) * total_chars))
+        allocated.append((cursor, next_cursor))
+        cursor = next_cursor
+
+    if allocated and allocated[-1][1] < total_chars:
+        allocated[-1] = (allocated[-1][0], total_chars)
+    return allocated or [(0, total_chars)]
+
+
+def _timestamp_to_text_index(
+    text_content: str,
+    chunk_boundaries: list[float],
+    timestamp_ms: float,
+    total_duration_ms: int,
+) -> int:
+    """Map an audio timestamp onto an approximate character index in the source text."""
+
+    if not text_content:
+        return 0
+    if total_duration_ms <= 0:
+        return 0
+
+    regions = _timeline_regions(total_duration_ms, chunk_boundaries)
+    text_ranges = _chunk_text_ranges(text_content, chunk_boundaries, total_duration_ms)
+    clamped_timestamp = min(max(int(timestamp_ms), 0), total_duration_ms)
+
+    for (start_ms, end_ms), (char_start, char_end) in zip(regions, text_ranges, strict=False):
+        if clamped_timestamp > end_ms and end_ms != total_duration_ms:
+            continue
+
+        region_duration = max(end_ms - start_ms, 1)
+        ratio = min(max((clamped_timestamp - start_ms) / region_duration, 0.0), 1.0)
+        char_span = max(char_end - char_start, 0)
+        return min(char_start + int(round(char_span * ratio)), len(text_content))
+
+    return len(text_content)
+
+
+def _nearest_paragraph_boundary_distance(text_content: str, index: int) -> int | None:
+    """Return the distance to the nearest paragraph break around a text index."""
+
+    if not text_content or "\n\n" not in text_content:
+        return None
+
+    boundaries: list[int] = []
+    search_from = 0
+    while True:
+        position = text_content.find("\n\n", search_from)
+        if position < 0:
+            break
+        boundaries.append(position)
+        search_from = position + 2
+
+    if not boundaries:
+        return None
+    return min(abs(boundary - index) for boundary in boundaries)
+
+
+def _classify_silence_context(
+    text_content: str,
+    chunk_boundaries: list[float],
+    *,
+    silence_start_ms: int,
+    silence_end_ms: int,
+    total_duration_ms: int,
+) -> str:
+    """Classify a silence region based on its approximate text location."""
+
+    if silence_start_ms <= 500:
+        return "chapter_start"
+    if silence_end_ms >= max(total_duration_ms - 500, 0):
+        return "chapter_end"
+
+    midpoint = silence_start_ms + ((silence_end_ms - silence_start_ms) / 2)
+    text_index = _timestamp_to_text_index(text_content, chunk_boundaries, midpoint, total_duration_ms)
+    local_before = text_content[:text_index].rstrip()
+    local_after = text_content[text_index:].lstrip()
+
+    paragraph_distance = _nearest_paragraph_boundary_distance(text_content, text_index)
+    if paragraph_distance is not None and paragraph_distance <= 20:
+        return "paragraph_boundary"
+
+    if local_before:
+        trimmed_before = local_before.rstrip("\"')]}")
+        if trimmed_before.endswith((".", "!", "?")):
+            quote_transition = local_after.startswith(("\"", "'", "-", "\u2014"))
+            if quote_transition:
+                return "dialogue_transition"
+            return "sentence_boundary"
+
+    if local_after.startswith(("\"", "'", "-", "\u2014")):
+        return "dialogue_transition"
+
+    return "mid_sentence"
+
+
+def _frequency_projection_energy(samples: np.ndarray, sample_rate: int, frequency_hz: float) -> float:
+    """Return the magnitude of a target frequency using a direct sinusoid projection."""
+
+    if samples.size == 0:
+        return 0.0
+
+    times = np.arange(samples.size, dtype=np.float32) / float(sample_rate)
+    angle = 2 * np.pi * frequency_hz * times
+    cosine = np.cos(angle).astype(np.float32)
+    sine = np.sin(angle).astype(np.float32)
+    real = float(np.dot(samples.astype(np.float32), cosine))
+    imaginary = float(np.dot(samples.astype(np.float32), sine))
+    return float(np.sqrt(real**2 + imaginary**2) / max(samples.size, 1))
+
+
+def _analysis_windows(samples: np.ndarray, sample_rate: int, *, window_ms: int = 1500, max_windows: int = 4) -> list[np.ndarray]:
+    """Sample representative windows from a chapter without analyzing the full file at once."""
+
+    if samples.size == 0:
+        return [samples]
+
+    window_size = max(int(sample_rate * (window_ms / 1000.0)), 1)
+    if samples.size <= window_size:
+        return [samples]
+
+    last_start = max(samples.size - window_size, 0)
+    if max_windows <= 1 or last_start == 0:
+        return [samples[:window_size]]
+
+    starts = np.linspace(0, last_start, num=max_windows, dtype=int)
+    return [samples[start:start + window_size] for start in starts]
+
+
+def _detect_hum(samples: np.ndarray, sample_rate: int) -> tuple[bool, float | None, float]:
+    """Detect narrowband hum at common mains frequencies and harmonics."""
+
+    hum_frequencies = (50.0, 60.0, 100.0, 120.0, 150.0, 180.0)
+    windows = _analysis_windows(samples, sample_rate)
+    strongest_target: float | None = None
+    strongest_ratio = 0.0
+
+    for target in hum_frequencies:
+        target_energies: list[float] = []
+        surround_energies: list[float] = []
+        for window in windows:
+            target_energies.append(_frequency_projection_energy(window, sample_rate, target))
+            for surround in (target - 10, target - 6, target + 6, target + 10):
+                if surround > 0:
+                    surround_energies.append(_frequency_projection_energy(window, sample_rate, surround))
+
+        target_energy = float(np.mean(target_energies)) if target_energies else 0.0
+        surround_energy = float(np.mean(surround_energies)) if surround_energies else 0.0
+        ratio = target_energy / max(surround_energy, 1e-6)
+        if ratio > strongest_ratio:
+            strongest_ratio = ratio
+            strongest_target = target
+
+    return (strongest_ratio >= 5.0, strongest_target if strongest_ratio >= 5.0 else None, strongest_ratio)
+
+
+def check_voice_consistency(audio_path: str | Path, chunk_boundaries: list[float]) -> QACheckResult:
+    """Compare per-chunk pitch, spectral centroid, and energy against chapter medians."""
+
+    analysis = _load_audio_analysis(audio_path)
+    regions = _chunk_regions(analysis.audio, chunk_boundaries)
+    if len(regions) <= 1:
+        return QACheckResult(
+            name="voice_consistency",
+            status=QAAutomaticStatus.PASS.value,
+            message="Single chunk chapter; no cross-chunk voice drift detected.",
+            value=0,
+            details={"chunk_count": len(regions)},
+        )
+
+    metrics: list[dict[str, float | None]] = []
+    for start_ms, end_ms in regions:
+        segment = analysis.audio[start_ms:end_ms]
+        samples = _mono_samples(segment)
+        metrics.append(
+            {
+                "pitch_hz": _estimate_pitch(segment, segment.frame_rate),
+                "spectral_centroid_hz": _spectral_centroid(samples, segment.frame_rate),
+                "rms": _linear_rms(samples),
+            }
+        )
+
+    def _metric_median(metric_name: str) -> float | None:
+        values = [float(metric[metric_name]) for metric in metrics if metric.get(metric_name) is not None]
+        return _median(values)
+
+    medians = {
+        "pitch_hz": _metric_median("pitch_hz"),
+        "spectral_centroid_hz": _metric_median("spectral_centroid_hz"),
+        "rms": _metric_median("rms"),
+    }
+
+    deviating_chunks: list[dict[str, Any]] = []
+    worst_deviation = 0.0
+    overall_status = QAAutomaticStatus.PASS.value
+
+    for chunk_index, metric in enumerate(metrics):
+        chunk_deviations: dict[str, float] = {}
+        chunk_status = QAAutomaticStatus.PASS.value
+
+        for metric_name, warning_threshold in (
+            ("pitch_hz", 0.15),
+            ("spectral_centroid_hz", 0.20),
+            ("rms", 0.15),
+        ):
+            value = metric.get(metric_name)
+            median = medians.get(metric_name)
+            if value is None or median is None or median <= 1e-6:
+                continue
+
+            deviation = abs(float(value) - median) / median
+            if deviation > worst_deviation:
+                worst_deviation = deviation
+            if deviation > 0.25:
+                chunk_status = QAAutomaticStatus.FAIL.value
+            elif deviation > warning_threshold and chunk_status != QAAutomaticStatus.FAIL.value:
+                chunk_status = QAAutomaticStatus.WARNING.value
+            if deviation > warning_threshold:
+                chunk_deviations[metric_name] = round(deviation, 3)
+
+        if chunk_deviations:
+            deviating_chunks.append(
+                {
+                    "chunk_index": chunk_index,
+                    "status": chunk_status,
+                    "deviations": chunk_deviations,
+                }
+            )
+            if _status_from_severity(chunk_status) > _status_from_severity(overall_status):
+                overall_status = chunk_status
+
+    if not deviating_chunks:
+        return QACheckResult(
+            name="voice_consistency",
+            status=QAAutomaticStatus.PASS.value,
+            message="Voice characteristics remain stable across stitched chunks.",
+            value=0,
+            details={"chunk_metrics": metrics, "medians": medians, "deviating_chunks": []},
+        )
+
+    if overall_status == QAAutomaticStatus.FAIL.value:
+        message = f"Voice drift exceeds fail thresholds in {len(deviating_chunks)} chunk(s)."
+    else:
+        message = f"Voice drift detected in {len(deviating_chunks)} chunk(s)."
+
+    return QACheckResult(
+        name="voice_consistency",
+        status=overall_status,
+        message=message,
+        value=round(worst_deviation, 3),
+        details={"chunk_metrics": metrics, "medians": medians, "deviating_chunks": deviating_chunks},
+    )
+
+
+def check_contextual_silence(
+    audio_path: str | Path,
+    text_content: str,
+    chunk_boundaries: list[float],
+) -> QACheckResult:
+    """Validate detected silences against the surrounding narration context."""
+
+    analysis = _load_audio_analysis(audio_path)
+    silences = silence.detect_silence(
+        analysis.audio,
+        min_silence_len=200,
+        silence_thresh=QA_THRESHOLDS["silence_threshold_dbfs"],
+    )
+    if not silences:
+        return QACheckResult(
+            name="contextual_silence",
+            status=QAAutomaticStatus.PASS.value,
+            message="No material silence gaps detected.",
+            value=0,
+            details={"silence_stats": {"count": 0, "min_ms": 0, "max_ms": 0, "avg_ms": 0}, "violations": []},
+        )
+
+    durations = [end - start for start, end in silences]
+    violations: list[dict[str, Any]] = []
+    overall_status = QAAutomaticStatus.PASS.value
+
+    for start_ms, end_ms in silences:
+        duration_ms = end_ms - start_ms
+        context = _classify_silence_context(
+            text_content,
+            chunk_boundaries,
+            silence_start_ms=start_ms,
+            silence_end_ms=end_ms,
+            total_duration_ms=len(analysis.audio),
+        )
+        rules = CONTEXT_SILENCE_RULES.get(context, CONTEXT_SILENCE_RULES["mid_sentence"])
+        if duration_ms > 5000:
+            status = QAAutomaticStatus.FAIL.value
+        elif duration_ms < rules["min_ms"] or duration_ms > rules["max_ms"]:
+            status = QAAutomaticStatus.WARNING.value
+        else:
+            status = QAAutomaticStatus.PASS.value
+
+        if status != QAAutomaticStatus.PASS.value:
+            violations.append(
+                {
+                    "timestamp_ms": start_ms,
+                    "duration_ms": duration_ms,
+                    "context": context,
+                    "expected_range_ms": [rules["min_ms"], rules["max_ms"]],
+                    "status": status,
+                }
+            )
+            if _status_from_severity(status) > _status_from_severity(overall_status):
+                overall_status = status
+
+    silence_stats = {
+        "count": len(durations),
+        "min_ms": min(durations),
+        "max_ms": max(durations),
+        "avg_ms": round(sum(durations) / len(durations), 2),
+    }
+    if not violations:
+        message = "Detected silences match their surrounding text context."
+        value = 0
+    else:
+        message = f"{len(violations)} contextual silence issue(s) detected."
+        value = round(max(violation["duration_ms"] for violation in violations) / 1000.0, 3)
+
+    return QACheckResult(
+        name="contextual_silence",
+        status=overall_status,
+        message=message,
+        value=value,
+        details={"silence_stats": silence_stats, "violations": violations},
+    )
+
+
+def check_stitch_quality(audio_path: str | Path, chunk_boundaries: list[float]) -> QACheckResult:
+    """Combine click detection with tonal and energy discontinuity checks."""
+
+    if len(chunk_boundaries) <= 1:
+        return QACheckResult(
+            name="stitch_quality",
+            status=QAAutomaticStatus.PASS.value,
+            message="Single chunk chapter; no stitch boundaries to evaluate.",
+            value=0,
+            details={
+                "issues": [],
+                "stitch_quality": {
+                    "total_stitches": 0,
+                    "clean": 0,
+                    "warnings": 0,
+                    "failures": 0,
+                },
+            },
+        )
+
+    analysis = _load_audio_analysis(audio_path)
+    click_result = check_stitch_clicks(analysis.audio)
+    issues: list[dict[str, Any]] = []
+    warning_count = 0
+    failure_count = 0
+
+    if click_result.status != QAAutomaticStatus.PASS.value:
+        issues.append({"type": "clicks", "status": click_result.status, "message": click_result.message})
+        if click_result.status == QAAutomaticStatus.FAIL.value:
+            failure_count += 1
+        else:
+            warning_count += 1
+
+    for stitch_index, boundary_seconds in enumerate(chunk_boundaries[1:], start=1):
+        boundary_ms = int(boundary_seconds * 1000)
+        before_tonal = analysis.audio[max(boundary_ms - 50, 0):boundary_ms]
+        after_tonal = analysis.audio[boundary_ms:min(boundary_ms + 50, len(analysis.audio))]
+        before_energy = analysis.audio[max(boundary_ms - 100, 0):boundary_ms]
+        after_energy = analysis.audio[boundary_ms:min(boundary_ms + 100, len(analysis.audio))]
+
+        tonal_before = _spectral_centroid(_mono_samples(before_tonal), analysis.audio.frame_rate)
+        tonal_after = _spectral_centroid(_mono_samples(after_tonal), analysis.audio.frame_rate)
+        if tonal_before is not None and tonal_after is not None and tonal_before > 1e-6:
+            tonal_shift = abs(tonal_after - tonal_before) / tonal_before
+            if tonal_shift > 0.30:
+                warning_count += 1
+                issues.append(
+                    {
+                        "type": "tonal_discontinuity",
+                        "stitch_index": stitch_index,
+                        "boundary_ms": boundary_ms,
+                        "shift": round(tonal_shift, 3),
+                    }
+                )
+
+        rms_before = _linear_rms(_mono_samples(before_energy))
+        rms_after = _linear_rms(_mono_samples(after_energy))
+        rms_before_db = _dbfs_from_amplitude(rms_before)
+        rms_after_db = _dbfs_from_amplitude(rms_after)
+        jump_db = abs(rms_after_db - rms_before_db)
+        if jump_db > 6.0:
+            warning_count += 1
+            issues.append(
+                {
+                    "type": "energy_jump",
+                    "stitch_index": stitch_index,
+                    "boundary_ms": boundary_ms,
+                    "jump_db": round(jump_db, 3),
+                }
+            )
+
+    if failure_count > 0:
+        status = QAAutomaticStatus.FAIL.value
+    elif warning_count > 0:
+        status = QAAutomaticStatus.WARNING.value
+    else:
+        status = QAAutomaticStatus.PASS.value
+
+    stitch_quality = {
+        "total_stitches": max(len(chunk_boundaries) - 1, 0),
+        "clean": max(max(len(chunk_boundaries) - 1, 0) - warning_count - failure_count, 0),
+        "warnings": warning_count,
+        "failures": failure_count,
+    }
+
+    if status == QAAutomaticStatus.PASS.value:
+        message = "No stitch quality issues detected."
+        value = 0
+    else:
+        message = f"{len(issues)} stitch issue(s) detected."
+        value = float(len(issues))
+
+    return QACheckResult(
+        name="stitch_quality",
+        status=status,
+        message=message,
+        value=value,
+        details={"issues": issues, "stitch_quality": stitch_quality},
+    )
+
+
+def check_pacing_detailed(audio_path: str | Path, text_content: str) -> QACheckResult:
+    """Measure pacing consistency in 10-second windows using active speech time."""
+
+    analysis = _load_audio_analysis(audio_path)
+    total_words = len((text_content or "").split())
+    if total_words < 20 or len(analysis.audio) < 20_000:
+        return QACheckResult(
+            name="pacing_detailed",
+            status=QAAutomaticStatus.PASS.value,
+            message="Not enough chapter material to analyze pacing consistency reliably.",
+            value=0,
+            details={"pacing_stats": {}, "outlier_windows": []},
+        )
+
+    window_ms = 10_000
+    windows: list[dict[str, Any]] = []
+    total_duration_ms = max(len(analysis.audio), 1)
+    for start_ms in range(0, len(analysis.audio), window_ms):
+        window = analysis.audio[start_ms:start_ms + window_ms]
+        if len(window) == 0:
+            continue
+        active_ms = _active_speech_ms(window)
+        proportional_words = total_words * (len(window) / total_duration_ms)
+        if active_ms <= 0:
+            wpm = 0.0
+        else:
+            wpm = proportional_words / (active_ms / 60_000)
+        windows.append({"start_ms": start_ms, "duration_ms": len(window), "active_ms": active_ms, "wpm": wpm})
+
+    if not windows:
+        return QACheckResult(
+            name="pacing_detailed",
+            status=QAAutomaticStatus.WARNING.value,
+            message="Unable to estimate pacing because no speech windows were detected.",
+            value=None,
+            details={"pacing_stats": {}, "outlier_windows": []},
+        )
+
+    wpm_values = np.array([window["wpm"] for window in windows], dtype=np.float32)
+    mean_wpm = float(np.mean(wpm_values))
+    std_wpm = float(np.std(wpm_values))
+    max_deviation = 0.0
+    outlier_windows: list[dict[str, Any]] = []
+    status = QAAutomaticStatus.PASS.value
+
+    for window in windows:
+        deviation = abs(window["wpm"] - mean_wpm) / max(mean_wpm, 1e-6)
+        window["deviation"] = round(deviation, 3)
+        if deviation > max_deviation:
+            max_deviation = deviation
+        if deviation > 0.40:
+            outlier_windows.append({"start_ms": window["start_ms"], "wpm": round(window["wpm"], 2), "deviation": round(deviation, 3), "status": QAAutomaticStatus.FAIL.value})
+            status = QAAutomaticStatus.FAIL.value
+        elif deviation > 0.25:
+            outlier_windows.append({"start_ms": window["start_ms"], "wpm": round(window["wpm"], 2), "deviation": round(deviation, 3), "status": QAAutomaticStatus.WARNING.value})
+            if status != QAAutomaticStatus.FAIL.value:
+                status = QAAutomaticStatus.WARNING.value
+
+    std_ratio = std_wpm / max(mean_wpm, 1e-6)
+    if std_ratio > 0.20 and status != QAAutomaticStatus.FAIL.value:
+        status = QAAutomaticStatus.WARNING.value
+
+    pacing_stats = {
+        "mean_wpm": round(mean_wpm, 2),
+        "std_wpm": round(std_wpm, 2),
+        "min_wpm": round(float(np.min(wpm_values)), 2),
+        "max_wpm": round(float(np.max(wpm_values)), 2),
+    }
+
+    if status == QAAutomaticStatus.PASS.value:
+        message = "Pacing is consistent across 10-second chapter windows."
+        value = 0
+    elif status == QAAutomaticStatus.FAIL.value:
+        message = f"Major pacing inconsistency detected in {len(outlier_windows)} window(s)."
+        value = round(max_deviation, 3)
+    else:
+        message = f"Pacing drift detected in {len(outlier_windows)} window(s)."
+        value = round(max(max_deviation, std_ratio), 3)
+
+    return QACheckResult(
+        name="pacing_detailed",
+        status=status,
+        message=message,
+        value=value,
+        details={"pacing_stats": pacing_stats, "outlier_windows": outlier_windows, "windows": windows},
+    )
+
+
+def check_spectral_quality(audio_path: str | Path) -> QACheckResult:
+    """Detect hum, high-frequency ringing, and elevated silence noise floors."""
+
+    analysis = _load_audio_analysis(audio_path)
+    issues: list[dict[str, Any]] = []
+
+    hum_detected, hum_frequency, hum_ratio = _detect_hum(analysis.normalized_samples, analysis.audio.frame_rate)
+    if hum_detected:
+        issues.append(
+            {
+                "type": "hum",
+                "frequency_hz": hum_frequency,
+                "concentration_ratio": round(hum_ratio, 3),
+            }
+        )
+
+    frequencies, spectrum = _average_frame_spectrum(
+        analysis.normalized_samples,
+        analysis.audio.frame_rate,
+        frame_size=2048,
+        hop_size=1024,
+    )
+    total_energy = float(np.sum(spectrum))
+    high_freq_ratio = 0.0
+    if total_energy > 1e-8 and spectrum.size > 0:
+        high_freq_ratio = float(np.sum(spectrum[frequencies >= 8000]) / total_energy)
+        if high_freq_ratio > 0.15:
+            issues.append(
+                {
+                    "type": "high_frequency_artifacts",
+                    "energy_ratio": round(high_freq_ratio, 3),
+                }
+            )
+
+    silence_regions = silence.detect_silence(
+        analysis.audio,
+        min_silence_len=200,
+        silence_thresh=QA_THRESHOLDS["silence_threshold_dbfs"],
+    )
+    noise_floors: list[float] = []
+    for start_ms, end_ms in silence_regions:
+        segment_samples = _mono_samples(analysis.audio[start_ms:end_ms])
+        noise_floor = _dbfs_from_amplitude(_linear_rms(segment_samples))
+        noise_floors.append(noise_floor)
+    worst_noise_floor = max(noise_floors) if noise_floors else -100.0
+    if worst_noise_floor > -45.0:
+        issues.append(
+            {
+                "type": "noise_floor",
+                "dbfs": round(worst_noise_floor, 3),
+            }
+        )
+
+    if not issues:
+        return QACheckResult(
+            name="spectral_quality",
+            status=QAAutomaticStatus.PASS.value,
+            message="No hum, ringing, or elevated silence noise floor detected.",
+            value=0,
+            details={"hum_frequency_hz": None, "high_freq_energy_ratio": round(high_freq_ratio, 3), "max_noise_floor_dbfs": round(worst_noise_floor, 3), "issues": []},
+        )
+
+    return QACheckResult(
+        name="spectral_quality",
+        status=QAAutomaticStatus.WARNING.value,
+        message=f"{len(issues)} spectral quality issue(s) detected.",
+        value=float(len(issues)),
+        details={"hum_frequency_hz": hum_frequency, "high_freq_energy_ratio": round(high_freq_ratio, 3), "max_noise_floor_dbfs": round(worst_noise_floor, 3), "issues": issues},
+    )
+
+
+def check_stitch_clicks(audio: AudioSegment, crossfade_ms: int = 30) -> QACheckResult:
+    """Detect likely click or pop artifacts introduced near stitch boundaries."""
+
+    del crossfade_ms
+
+    if len(audio) < 250:
+        return QACheckResult(
+            name="stitch_clicks",
+            status=QAAutomaticStatus.PASS.value,
+            message="Audio too short to analyze stitch boundaries reliably.",
+            value=0,
+        )
+
+    samples = _mono_samples(audio)
+    window_ms = 5
+    surrounding_ms = 100
+    window_size = max(int(audio.frame_rate * (window_ms / 1000.0)), 1)
+    surrounding_windows = max(int(surrounding_ms / window_ms), 1)
+
+    peaks_dbfs: list[float] = []
+    for start in range(0, samples.size, window_size):
+        window = samples[start:start + window_size]
+        if window.size == 0:
+            continue
+        peaks_dbfs.append(_dbfs_from_amplitude(float(np.max(np.abs(window)))))
+
+    if len(peaks_dbfs) <= (surrounding_windows * 2):
+        return QACheckResult(
+            name="stitch_clicks",
+            status=QAAutomaticStatus.PASS.value,
+            message="Audio too short to analyze stitch boundaries reliably.",
+            value=0,
+        )
+
+    click_indices: list[int] = []
+    for index in range(surrounding_windows, len(peaks_dbfs) - surrounding_windows):
+        surrounding = [
+            *peaks_dbfs[index - surrounding_windows:index],
+            *peaks_dbfs[index + 1:index + 1 + surrounding_windows],
+        ]
+        surrounding_average = float(np.mean(surrounding))
+        if peaks_dbfs[index] - surrounding_average >= 12.0:
+            click_indices.append(index)
+
+    collapsed_indices: list[int] = []
+    for index in click_indices:
+        if not collapsed_indices or index - collapsed_indices[-1] > 1:
+            collapsed_indices.append(index)
+
+    click_count = len(collapsed_indices)
+    if click_count == 0:
+        return QACheckResult(
+            name="stitch_clicks",
+            status=QAAutomaticStatus.PASS.value,
+            message="No likely stitch clicks detected.",
+            value=0,
+        )
+    if click_count <= 2:
+        return QACheckResult(
+            name="stitch_clicks",
+            status=QAAutomaticStatus.WARNING.value,
+            message=f"Possible click artifacts detected at {click_count} boundary region(s).",
+            value=float(click_count),
+        )
+    return QACheckResult(
+        name="stitch_clicks",
+        status=QAAutomaticStatus.FAIL.value,
+        message=f"Repeated click artifacts detected at {click_count} boundary region(s).",
+        value=float(click_count),
+    )
+
+
+def check_pacing_consistency(audio: AudioSegment, text: str) -> QACheckResult:
+    """Check for large within-chapter pacing swings using speech-density windows."""
+
+    total_words = len((text or "").split())
+    if total_words < 20 or len(audio) < 20_000:
+        return QACheckResult(
+            name="pacing_consistency",
+            status=QAAutomaticStatus.PASS.value,
+            message="Not enough chapter material to analyze pacing consistency reliably.",
+            value=0,
+        )
+
+    total_active_ms = _active_speech_ms(audio)
+    if total_active_ms <= 0:
+        return QACheckResult(
+            name="pacing_consistency",
+            status=QAAutomaticStatus.WARNING.value,
+            message="Unable to estimate pacing because no active speech was detected.",
+            value=None,
+        )
+
+    chapter_average_wpm = total_words / (total_active_ms / 60_000)
+    window_ms = 10_000
+    inconsistent_windows: list[float] = []
+
+    for start in range(0, len(audio), window_ms):
+        window = audio[start:start + window_ms]
+        if len(window) == 0:
+            continue
+
+        active_ms = _active_speech_ms(window)
+        if active_ms <= 0:
+            inconsistent_windows.append(1.0)
+            continue
+
+        proportional_words = total_words * (len(window) / max(len(audio), 1))
+        window_wpm = proportional_words / (active_ms / 60_000)
+        deviation = abs(window_wpm - chapter_average_wpm) / max(chapter_average_wpm, 1e-6)
+        if deviation > 0.4:
+            inconsistent_windows.append(deviation)
+
+    if not inconsistent_windows:
+        return QACheckResult(
+            name="pacing_consistency",
+            status=QAAutomaticStatus.PASS.value,
+            message="Pacing is consistent across the chapter.",
+            value=0,
+        )
+
+    max_deviation = max(inconsistent_windows)
+    if len(inconsistent_windows) <= 2:
+        return QACheckResult(
+            name="pacing_consistency",
+            status=QAAutomaticStatus.WARNING.value,
+            message=(
+                f"Pacing drift detected in {len(inconsistent_windows)} window(s); "
+                f"max deviation {max_deviation * 100:.0f}% from chapter average."
+            ),
+            value=round(max_deviation, 3),
+        )
+
+    return QACheckResult(
+        name="pacing_consistency",
+        status=QAAutomaticStatus.FAIL.value,
+        message=(
+            f"Major pacing inconsistency detected in {len(inconsistent_windows)} window(s); "
+            f"max deviation {max_deviation * 100:.0f}% from chapter average."
+        ),
+        value=round(max_deviation, 3),
+    )
+
+
+def check_lufs_compliance(audio_path: str | Path) -> QACheckResult:
+    """Measure integrated LUFS and compare it against audiobook loudness targets."""
+
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path is None:
+        return QACheckResult(
+            name="lufs_compliance",
+            status=QAAutomaticStatus.WARNING.value,
+            message="ffmpeg is unavailable, so LUFS compliance could not be measured.",
+            value=None,
+        )
+
+    command = [
+        ffmpeg_path,
+        "-hide_banner",
+        "-i",
+        str(audio_path),
+        "-af",
+        "loudnorm=I=-19:TP=-1.5:LRA=11:print_format=json",
+        "-f",
+        "null",
+        "-",
+    ]
+    try:
+        completed = subprocess.run(command, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        return QACheckResult(
+            name="lufs_compliance",
+            status=QAAutomaticStatus.WARNING.value,
+            message=f"Unable to measure LUFS compliance: {exc.stderr.strip() or exc.stdout.strip() or exc}",
+            value=None,
+        )
+
+    output = "\n".join(part for part in (completed.stdout, completed.stderr) if part)
+    match = re.search(r"(\{\s*\"input_i\".*?\})", output, re.DOTALL)
+    if match is None:
+        return QACheckResult(
+            name="lufs_compliance",
+            status=QAAutomaticStatus.WARNING.value,
+            message="ffmpeg did not return loudnorm JSON output.",
+            value=None,
+        )
+
+    try:
+        metrics = json.loads(match.group(1))
+        lufs = float(metrics["input_i"])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        return QACheckResult(
+            name="lufs_compliance",
+            status=QAAutomaticStatus.WARNING.value,
+            message=f"Unable to parse LUFS measurement: {exc}",
+            value=None,
+        )
+
+    if -23.0 <= lufs <= -18.0:
+        status = QAAutomaticStatus.PASS.value
+        message = f"Integrated loudness {lufs:.1f} LUFS is within ACX range."
+    elif (-25.0 <= lufs < -23.0) or (-18.0 < lufs <= -16.0):
+        status = QAAutomaticStatus.WARNING.value
+        message = f"Integrated loudness {lufs:.1f} LUFS is near but outside ACX range."
+    else:
+        status = QAAutomaticStatus.FAIL.value
+        message = f"Integrated loudness {lufs:.1f} LUFS is outside ACX range."
+
+    return QACheckResult(
+        name="lufs_compliance",
+        status=status,
+        message=message,
+        value=round(lufs, 3),
+    )
+
+
 def _analysis_error_results(message: str) -> list[QACheckResult]:
     """Return a full set of failed analysis checks when audio cannot be decoded."""
 
     return [
         QACheckResult(name="duration_check", status=QAAutomaticStatus.FAIL.value, message=message, value=None),
         QACheckResult(name="clipping_detection", status=QAAutomaticStatus.FAIL.value, message=message, value=None),
-        QACheckResult(name="silence_gaps", status=QAAutomaticStatus.FAIL.value, message=message, value=None),
+        QACheckResult(name="contextual_silence", status=QAAutomaticStatus.FAIL.value, message=message, value=None),
         QACheckResult(name="volume_consistency", status=QAAutomaticStatus.FAIL.value, message=message, value=None),
+        QACheckResult(name="voice_consistency", status=QAAutomaticStatus.FAIL.value, message=message, value=None),
+        QACheckResult(name="stitch_quality", status=QAAutomaticStatus.FAIL.value, message=message, value=None),
+        QACheckResult(name="pacing_detailed", status=QAAutomaticStatus.FAIL.value, message=message, value=None),
+        QACheckResult(name="spectral_quality", status=QAAutomaticStatus.FAIL.value, message=message, value=None),
+        QACheckResult(name="lufs_compliance", status=QAAutomaticStatus.FAIL.value, message=message, value=None),
     ]
 
 
@@ -370,31 +1543,55 @@ def _run_qa_checks_sync(
     chapter_n: int,
     audio_path: Path | None,
     word_count: int | None,
+    text_content: str,
+    chapter_title: str,
+    chunk_boundaries: str | None,
 ) -> QAResult:
     """Synchronously execute the full QA sequence for one chapter."""
 
     file_result = _file_exists_result(audio_path)
     checks = [file_result]
+    chapter_duration = 0.0
 
     if file_result.status == QAAutomaticStatus.FAIL.value or audio_path is None:
         checks.extend(_analysis_error_results("Audio file could not be analyzed because it is missing or empty."))
         overall_status = _overall_status(checks)
-        return QAResult(
+        qa_result = QAResult(
             chapter_n=chapter_n,
             book_id=book_id,
             timestamp=utc_now(),
             checks=checks,
             overall_status=overall_status,
+            chapter_report=_synthesize_chapter_report(
+                QAResult(
+                    chapter_n=chapter_n,
+                    book_id=book_id,
+                    timestamp=utc_now(),
+                    checks=checks,
+                    overall_status=overall_status,
+                ),
+                chapter_number=chapter_n,
+                chapter_title=chapter_title,
+                duration_seconds=chapter_duration,
+            ),
         )
+        return qa_result
 
     try:
-        _load_audio_analysis(audio_path)
+        analysis = _load_audio_analysis(audio_path)
+        chapter_duration = analysis.actual_duration
+        parsed_chunk_boundaries = _parse_chunk_boundaries(chunk_boundaries)
         checks.extend(
             [
                 check_duration(audio_path, word_count),
                 check_clipping(audio_path),
-                check_silence_gaps(audio_path),
+                check_contextual_silence(audio_path, text_content, parsed_chunk_boundaries),
                 check_volume_consistency(audio_path),
+                check_voice_consistency(audio_path, parsed_chunk_boundaries),
+                check_stitch_quality(audio_path, parsed_chunk_boundaries),
+                check_pacing_detailed(audio_path, text_content),
+                check_spectral_quality(audio_path),
+                check_lufs_compliance(audio_path),
             ]
         )
     except Exception as exc:
@@ -412,13 +1609,27 @@ def _run_qa_checks_sync(
             check.message,
         )
 
-    return QAResult(
+    qa_result = QAResult(
         chapter_n=chapter_n,
         book_id=book_id,
         timestamp=utc_now(),
         checks=checks,
         overall_status=overall_status,
+        chapter_report=_synthesize_chapter_report(
+            QAResult(
+                chapter_n=chapter_n,
+                book_id=book_id,
+                timestamp=utc_now(),
+                checks=checks,
+                overall_status=overall_status,
+            ),
+            chapter_number=chapter_n,
+            chapter_title=chapter_title,
+            duration_seconds=chapter_duration,
+        ),
     )
+    _write_chapter_report_sidecar(audio_path, qa_result)
+    return qa_result
 
 
 async def run_qa_checks(
@@ -451,6 +1662,9 @@ async def run_qa_checks(
             chapter_n=chapter_n,
             audio_path=audio_path,
             word_count=chapter.word_count,
+            text_content=chapter.text_content or "",
+            chapter_title=chapter.title or f"Chapter {chapter_n}",
+            chunk_boundaries=chapter.chunk_boundaries,
         )
     finally:
         if owns_session:
@@ -466,23 +1680,35 @@ async def run_qa_checks_for_chapter(chapter: Chapter) -> QAResult:
         chapter_n=chapter.number,
         audio_path=_resolve_audio_path(chapter.audio_path),
         word_count=chapter.word_count,
+        text_content=chapter.text_content or "",
+        chapter_title=chapter.title or f"Chapter {chapter.number}",
+        chunk_boundaries=chapter.chunk_boundaries,
     )
 
 
-def build_qa_record_response(record: ChapterQARecord) -> dict[str, Any]:
+def build_qa_record_response(record: ChapterQARecord, chapter: Chapter | None = None) -> dict[str, Any]:
     """Return a JSON-serializable QA payload for API responses."""
 
     qa_result = QAResult.model_validate(json.loads(record.qa_details))
+    chapter_report = qa_result.chapter_report or _synthesize_chapter_report(
+        qa_result,
+        chapter_number=record.chapter_n,
+        chapter_title=(chapter.title if chapter is not None and chapter.title else f"Chapter {record.chapter_n}"),
+        duration_seconds=float(chapter.duration_seconds or 0.0) if chapter is not None and chapter.duration_seconds is not None else 0.0,
+    )
     return {
         "chapter_n": record.chapter_n,
         "book_id": record.book_id,
         "overall_status": record.overall_status.value,
-        "automatic_checks": [check.model_dump() for check in qa_result.checks],
+        "automatic_checks": [check.model_dump(mode="json") for check in qa_result.checks],
         "checked_at": record.checked_at,
         "manual_status": record.manual_status.value if record.manual_status is not None else None,
         "manual_notes": record.manual_notes,
         "manual_reviewed_by": record.manual_reviewed_by,
         "manual_reviewed_at": record.manual_reviewed_at,
+        "chapter_report": chapter_report,
+        "qa_grade": chapter_report.get("overall_grade"),
+        "ready_for_export": chapter_report.get("ready_for_export"),
     }
 
 

@@ -5,6 +5,7 @@ import BookDetail from "./pages/BookDetail";
 import CatalogDashboard from "./pages/CatalogDashboard";
 import Library from "./pages/Library";
 import NotFound from "./pages/NotFound";
+import ProductionOverseer from "./pages/ProductionOverseer";
 import QA from "./pages/QA";
 import Queue from "./pages/Queue";
 import Settings from "./pages/Settings";
@@ -16,6 +17,7 @@ function App() {
       <ErrorBoundary>
         <Routes>
           <Route path="/catalog" element={<CatalogDashboard />} />
+          <Route path="/overseer" element={<ProductionOverseer />} />
           <Route path="/" element={<Library />} />
           <Route path="/book/:id" element={<BookDetail />} />
           <Route path="/voice-lab" element={<VoiceLab />} />

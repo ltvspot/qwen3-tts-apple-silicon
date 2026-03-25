@@ -12,7 +12,7 @@ import { mapChapterGenerationState } from "../components/generationStatus";
 
 const DEFAULT_NARRATION_SETTINGS = {
   voice: "Ethan",
-  emotion: "warm",
+  emotion: "neutral",
   speed: 1.0,
   engine: "qwen3_tts",
 };
@@ -22,6 +22,7 @@ const DEFAULT_VOICE_OPTIONS = [
   { name: "Nova", display_name: "Nova", is_cloned: false },
   { name: "Aria", display_name: "Aria", is_cloned: false },
 ];
+const VOICE_LOAD_MAX_RETRIES = 20;
 
 function chapterHasUnsavedChanges(selectedChapter, draftText, editMode) {
   if (!editMode || !selectedChapter) {
@@ -57,12 +58,17 @@ function createIdleExportSnapshot(bookId) {
   return {
     book_id: Number(bookId),
     completed_at: null,
+    current_chapter_n: null,
+    current_format: null,
+    current_stage: null,
     error_message: null,
     export_status: "idle",
     formats: {},
     job_id: null,
+    progress_percent: 0,
     qa_report: null,
     started_at: null,
+    total_chapters: null,
   };
 }
 
@@ -72,6 +78,34 @@ function getExportFormatLabel(format) {
   }
 
   return "MP3";
+}
+
+function getQualityBadgeTone(grade) {
+  if (grade === "A") {
+    return "border-emerald-300/30 bg-emerald-400/10 text-emerald-100";
+  }
+
+  if (grade === "B") {
+    return "border-amber-300/30 bg-amber-400/10 text-amber-100";
+  }
+
+  if (grade === "C") {
+    return "border-orange-300/30 bg-orange-400/10 text-orange-100";
+  }
+
+  return "border-rose-300/30 bg-rose-500/10 text-rose-100";
+}
+
+function getStatusTone(status) {
+  if (status === "pass") {
+    return "text-emerald-200";
+  }
+
+  if (status === "warning") {
+    return "text-amber-200";
+  }
+
+  return "text-rose-200";
 }
 
 function formatTimestamp(value) {
@@ -90,9 +124,14 @@ function formatTimestamp(value) {
 export default function BookDetail() {
   const navigate = useNavigate();
   const requestRef = useRef(0);
+  const voiceRetryTimeoutRef = useRef(null);
   const { id } = useParams();
 
   const [book, setBook] = useState(null);
+  const [bookQualityAction, setBookQualityAction] = useState(null);
+  const [bookQualityErrorMessage, setBookQualityErrorMessage] = useState("");
+  const [bookQualityLoading, setBookQualityLoading] = useState(false);
+  const [bookQualityReport, setBookQualityReport] = useState(null);
   const [chapters, setChapters] = useState([]);
   const [draftText, setDraftText] = useState("");
   const [editMode, setEditMode] = useState(false);
@@ -113,7 +152,9 @@ export default function BookDetail() {
   const [saveErrorMessage, setSaveErrorMessage] = useState("");
   const [saving, setSaving] = useState(false);
   const [selectedChapterId, setSelectedChapterId] = useState(null);
+  const [voiceLoadingMessage, setVoiceLoadingMessage] = useState("");
   const [voiceOptions, setVoiceOptions] = useState(DEFAULT_VOICE_OPTIONS);
+  const [voiceConsistencyChart, setVoiceConsistencyChart] = useState(null);
 
   const mergedChapters = useMemo(
     () => mergeChaptersWithGeneration(chapters, generationSnapshot),
@@ -132,6 +173,8 @@ export default function BookDetail() {
     ([, format]) => format?.status === "error",
   );
   const exportInProgress = exportSubmitting || exportSnapshot?.export_status === "processing";
+  const bookQualityEligible = chapters.length > 0 && chapters.every((chapter) => chapter.status === "generated");
+  const bookQualityBusy = bookQualityLoading || bookQualityAction !== null;
 
   useEffect(() => {
     if (!editMode) {
@@ -142,6 +185,12 @@ export default function BookDetail() {
   useEffect(() => {
     void fetchBookData();
   }, [id]);
+
+  useEffect(() => () => {
+    if (voiceRetryTimeoutRef.current) {
+      window.clearTimeout(voiceRetryTimeoutRef.current);
+    }
+  }, []);
 
   useEffect(() => {
     if (!generationSnapshot || generationSnapshot.status === "generating") {
@@ -217,7 +266,13 @@ export default function BookDetail() {
     }
   }
 
-  async function fetchVoiceOptions(currentRequestId) {
+  async function fetchVoiceOptions(currentRequestId, attempt = 1) {
+    if (voiceRetryTimeoutRef.current) {
+      window.clearTimeout(voiceRetryTimeoutRef.current);
+      voiceRetryTimeoutRef.current = null;
+    }
+    let keepLoading = false;
+
     try {
       const response = await fetch("/api/voice-lab/voices");
       if (!response.ok) {
@@ -229,8 +284,25 @@ export default function BookDetail() {
         return;
       }
 
+      if (payload.loading) {
+        const nextAttempt = Math.min(attempt, VOICE_LOAD_MAX_RETRIES);
+        setVoiceLoadingMessage(`TTS engine is loading... retrying in 3s (attempt ${nextAttempt}/${VOICE_LOAD_MAX_RETRIES})`);
+        keepLoading = true;
+
+        if (nextAttempt >= VOICE_LOAD_MAX_RETRIES) {
+          setLoadingVoiceOptions(false);
+          return;
+        }
+
+        voiceRetryTimeoutRef.current = window.setTimeout(() => {
+          void fetchVoiceOptions(currentRequestId, nextAttempt + 1);
+        }, 3000);
+        return;
+      }
+
       const availableVoices = payload.voices ?? [];
       setVoiceOptions(availableVoices.length > 0 ? availableVoices : DEFAULT_VOICE_OPTIONS);
+      setVoiceLoadingMessage("");
       setNarrationSettings((currentSettings) => ({
         ...currentSettings,
         voice: availableVoices.some((voiceOption) => voiceOption.name === currentSettings.voice)
@@ -243,8 +315,9 @@ export default function BookDetail() {
       }
 
       setVoiceOptions(DEFAULT_VOICE_OPTIONS);
+      setVoiceLoadingMessage("");
     } finally {
-      if (requestRef.current === currentRequestId) {
+      if (requestRef.current === currentRequestId && !keepLoading) {
         setLoadingVoiceOptions(false);
       }
     }
@@ -253,6 +326,10 @@ export default function BookDetail() {
   async function fetchBookData() {
     const requestId = requestRef.current + 1;
     requestRef.current = requestId;
+    if (voiceRetryTimeoutRef.current) {
+      window.clearTimeout(voiceRetryTimeoutRef.current);
+      voiceRetryTimeoutRef.current = null;
+    }
 
     setLoading(true);
     setNotFound(false);
@@ -263,6 +340,10 @@ export default function BookDetail() {
     setExportSubmitting(false);
     setGenerationErrorMessage("");
     setBook(null);
+    setBookQualityAction(null);
+    setBookQualityErrorMessage("");
+    setBookQualityLoading(false);
+    setBookQualityReport(null);
     setChapters([]);
     setSelectedChapterId(null);
     setDraftText("");
@@ -271,7 +352,9 @@ export default function BookDetail() {
     setLoadingVoiceOptions(true);
     setPlayerVisible(false);
     setPlayerChapterNumber(null);
+    setVoiceLoadingMessage("");
     setVoiceOptions(DEFAULT_VOICE_OPTIONS);
+    setVoiceConsistencyChart(null);
 
     try {
       const bookResponse = await fetch(`/api/book/${id}`);
@@ -331,6 +414,95 @@ export default function BookDetail() {
     } finally {
       if (requestRef.current === requestId) {
         setLoading(false);
+      }
+    }
+  }
+
+  async function fetchBookQualityReport(currentRequestId) {
+    const response = await fetch(`/api/book/${id}/qa/book-report`);
+    const payload = await response.json();
+
+    if (requestRef.current !== currentRequestId) {
+      return null;
+    }
+
+    if (!response.ok) {
+      throw new Error(payload?.detail ?? "Failed to run book QA.");
+    }
+
+    setBookQualityReport(payload);
+    return payload;
+  }
+
+  async function fetchVoiceConsistencyChart(currentRequestId) {
+    const response = await fetch(`/api/book/${id}/qa/voice-consistency-chart`);
+    const payload = await response.json();
+
+    if (requestRef.current !== currentRequestId) {
+      return null;
+    }
+
+    if (!response.ok) {
+      throw new Error(payload?.detail ?? "Failed to load voice consistency chart.");
+    }
+
+    setVoiceConsistencyChart(payload);
+    return payload;
+  }
+
+  async function handleRunBookQa() {
+    const currentRequestId = requestRef.current;
+    setBookQualityAction("run");
+    setBookQualityLoading(true);
+    setBookQualityErrorMessage("");
+
+    try {
+      await fetchBookQualityReport(currentRequestId);
+      await fetchVoiceConsistencyChart(currentRequestId);
+    } catch (error) {
+      if (requestRef.current === currentRequestId) {
+        setBookQualityErrorMessage(
+          error instanceof Error ? error.message : "Failed to run book QA.",
+        );
+      }
+    } finally {
+      if (requestRef.current === currentRequestId) {
+        setBookQualityLoading(false);
+        setBookQualityAction(null);
+      }
+    }
+  }
+
+  async function handleAutoMaster() {
+    const currentRequestId = requestRef.current;
+    setBookQualityAction("master");
+    setBookQualityLoading(true);
+    setBookQualityErrorMessage("");
+
+    try {
+      const response = await fetch(`/api/book/${id}/qa/auto-master`, { method: "POST" });
+      const payload = await response.json();
+
+      if (requestRef.current !== currentRequestId) {
+        return;
+      }
+
+      if (!response.ok) {
+        throw new Error(payload?.detail ?? "Auto-mastering failed.");
+      }
+
+      setBookQualityReport(payload.book_report);
+      await fetchVoiceConsistencyChart(currentRequestId);
+    } catch (error) {
+      if (requestRef.current === currentRequestId) {
+        setBookQualityErrorMessage(
+          error instanceof Error ? error.message : "Auto-mastering failed.",
+        );
+      }
+    } finally {
+      if (requestRef.current === currentRequestId) {
+        setBookQualityLoading(false);
+        setBookQualityAction(null);
       }
     }
   }
@@ -512,14 +684,19 @@ export default function BookDetail() {
         ...currentSnapshot,
         book_id: queuedExport.book_id,
         completed_at: null,
+        current_chapter_n: null,
+        current_format: null,
+        current_stage: "Queued",
         error_message: null,
         export_status: queuedExport.export_status,
         formats: Object.fromEntries(
           queuedExport.formats_requested.map((format) => [format, { status: "pending" }]),
         ),
         job_id: queuedExport.job_id,
+        progress_percent: 0,
         qa_report: null,
         started_at: queuedExport.started_at,
+        total_chapters: null,
       }));
       setExportDialogOpen(false);
       await fetchExportStatus(requestRef.current);
@@ -737,12 +914,186 @@ export default function BookDetail() {
 
           <div className="flex flex-col gap-6">
             <NarrationSettings
+              loadingMessage={voiceLoadingMessage}
               loadingVoices={loadingVoiceOptions}
               onChange={handleNarrationSettingsChange}
               selectedChapter={selectedChapter}
               settings={narrationSettings}
               voices={voiceOptions}
             />
+
+            <section className="rounded-[2rem] border border-white/10 bg-white/[0.05] p-5 text-white shadow-xl shadow-slate-950/20">
+              <div className="flex flex-col gap-5">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <div className="text-xs font-semibold uppercase tracking-[0.28em] text-emerald-200/75">
+                      Book Quality
+                    </div>
+                    <h2 className="mt-3 text-xl font-semibold">Gate 3 Overview</h2>
+                    <p className="mt-3 text-sm leading-7 text-slate-300">
+                      Run cross-chapter QA, inspect voice drift, and master the book before export.
+                    </p>
+                  </div>
+                  <div
+                    className={`inline-flex items-center rounded-full border px-4 py-2 text-[11px] font-semibold uppercase tracking-[0.18em] ${
+                      bookQualityReport
+                        ? getQualityBadgeTone(bookQualityReport.overall_grade)
+                        : "border-white/10 bg-slate-950/45 text-slate-300"
+                    }`}
+                  >
+                    {bookQualityReport ? `Grade ${bookQualityReport.overall_grade}` : "Not run"}
+                  </div>
+                </div>
+
+                {!bookQualityEligible ? (
+                  <div className="rounded-3xl border border-white/10 bg-slate-950/45 px-4 py-4 text-sm leading-7 text-slate-300">
+                    Gate 3 runs after every chapter is generated and chapter QA is complete.
+                  </div>
+                ) : null}
+
+                {bookQualityErrorMessage ? (
+                  <div className="rounded-3xl border border-rose-400/30 bg-rose-500/10 px-4 py-4 text-sm text-rose-100">
+                    {bookQualityErrorMessage}
+                  </div>
+                ) : null}
+
+                {bookQualityReport ? (
+                  <div className="grid gap-3 sm:grid-cols-3">
+                    <div className="rounded-3xl border border-white/10 bg-slate-950/45 px-4 py-4">
+                      <div className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">
+                        Export Readiness
+                      </div>
+                      <div className="mt-2 text-lg font-semibold text-white">
+                        {bookQualityReport.ready_for_export ? "Ready for Export" : "Issues must be resolved"}
+                      </div>
+                    </div>
+                    <div className="rounded-3xl border border-white/10 bg-slate-950/45 px-4 py-4">
+                      <div className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">
+                        Chapter Grades
+                      </div>
+                      <div className="mt-2 text-sm text-slate-300">
+                        A {bookQualityReport.chapters_grade_a} / B {bookQualityReport.chapters_grade_b} / C {bookQualityReport.chapters_grade_c} / F {bookQualityReport.chapters_grade_f}
+                      </div>
+                    </div>
+                    <div className="rounded-3xl border border-white/10 bg-slate-950/45 px-4 py-4">
+                      <div className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">
+                        Total Chapters
+                      </div>
+                      <div className="mt-2 text-lg font-semibold text-white">
+                        {bookQualityReport.total_chapters}
+                      </div>
+                    </div>
+                  </div>
+                ) : null}
+
+                {bookQualityReport ? (
+                  <div className="rounded-3xl border border-white/10 bg-slate-950/45 px-4 py-4">
+                    <div className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">
+                      Cross-Chapter Checks
+                    </div>
+                    <div className="mt-4 space-y-3">
+                      {Object.entries(bookQualityReport.cross_chapter_checks).map(([name, details]) => (
+                        <div className="flex flex-col gap-1 rounded-2xl border border-white/10 bg-slate-900/60 px-4 py-3" key={name}>
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div className="text-sm font-semibold capitalize text-white">
+                              {name.replaceAll("_", " ")}
+                            </div>
+                            <div className={`text-xs font-semibold uppercase tracking-[0.18em] ${getStatusTone(details.status)}`}>
+                              {details.status}
+                            </div>
+                          </div>
+                          <div className="text-sm text-slate-300">
+                            {details.message}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+
+                {voiceConsistencyChart?.chapters?.length > 0 ? (
+                  <div className="rounded-3xl border border-white/10 bg-slate-950/45 px-4 py-4">
+                    <div className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">
+                      Voice Consistency Chart
+                    </div>
+                    <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+                      {voiceConsistencyChart.chapters.map((chapter) => (
+                        <div className="rounded-2xl border border-white/10 bg-slate-900/60 px-4 py-3" key={chapter.number}>
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="text-sm font-semibold text-white">
+                              Chapter {chapter.number}
+                            </div>
+                            <div className={`inline-flex items-center rounded-full border px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] ${getQualityBadgeTone(chapter.grade)}`}>
+                              Grade {chapter.grade}
+                            </div>
+                          </div>
+                          <div className="mt-3 space-y-2 text-sm text-slate-300">
+                            <div>Pitch: {chapter.pitch ? `${chapter.pitch.toFixed(1)} Hz` : "n/a"}</div>
+                            <div>Rate: {chapter.rate ? `${chapter.rate.toFixed(1)} WPM` : "n/a"}</div>
+                            <div>Brightness: {chapter.brightness ? `${chapter.brightness.toFixed(0)} Hz` : "n/a"}</div>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+
+                {bookQualityReport?.recommendations?.length > 0 ? (
+                  <div className="rounded-3xl border border-white/10 bg-slate-950/45 px-4 py-4">
+                    <div className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">
+                      Recommendations
+                    </div>
+                    <ul className="mt-4 space-y-2 text-sm leading-7 text-slate-300">
+                      {bookQualityReport.recommendations.map((recommendation) => (
+                        <li key={recommendation}>• {recommendation}</li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+
+                {bookQualityReport?.export_blockers?.length > 0 ? (
+                  <div className="rounded-3xl border border-rose-400/30 bg-rose-500/10 px-4 py-4 text-sm text-rose-100">
+                    <div className="text-xs font-semibold uppercase tracking-[0.22em] text-rose-200/80">
+                      Export Blockers
+                    </div>
+                    <ul className="mt-4 space-y-2 leading-7">
+                      {bookQualityReport.export_blockers.map((blocker) => (
+                        <li key={blocker}>• {blocker}</li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+
+                {!bookQualityReport && bookQualityEligible ? (
+                  <div className="rounded-3xl border border-white/10 bg-slate-950/45 px-4 py-4 text-sm leading-7 text-slate-300">
+                    Run Book QA to compute cross-chapter consistency, ACX compliance, and mastering readiness.
+                  </div>
+                ) : null}
+
+                <div className="flex flex-wrap gap-3">
+                  <button
+                    className="inline-flex items-center justify-center rounded-full border border-emerald-300/25 bg-emerald-400/10 px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-emerald-100 transition hover:bg-emerald-400/20 disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/[0.04] disabled:text-slate-500"
+                    disabled={!bookQualityEligible || bookQualityBusy}
+                    onClick={() => {
+                      void handleRunBookQa();
+                    }}
+                    type="button"
+                  >
+                    {bookQualityLoading && bookQualityAction === "run" ? "Running Book QA..." : "Run Book QA"}
+                  </button>
+                  <button
+                    className="inline-flex items-center justify-center rounded-full border border-cyan-300/25 bg-cyan-400/10 px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-cyan-100 transition hover:bg-cyan-400/20 disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/[0.04] disabled:text-slate-500"
+                    disabled={!bookQualityEligible || bookQualityBusy}
+                    onClick={() => {
+                      void handleAutoMaster();
+                    }}
+                    type="button"
+                  >
+                    {bookQualityLoading && bookQualityAction === "master" ? "Auto-Mastering..." : "Auto-Master"}
+                  </button>
+                </div>
+              </div>
+            </section>
 
             <section className="rounded-[2rem] border border-white/10 bg-white/[0.05] p-5 text-white shadow-xl shadow-slate-950/20">
               <div className="flex flex-col gap-4">
@@ -780,7 +1131,15 @@ export default function BookDetail() {
                 ) : null}
 
                 {exportInProgress ? (
-                  <ExportProgressBar label="Building the audiobook package and validating output files." />
+                  <ExportProgressBar
+                    currentChapterN={exportSnapshot?.current_chapter_n}
+                    currentFormat={exportSnapshot?.current_format}
+                    currentStage={exportSnapshot?.current_stage}
+                    label="Building the audiobook package and validating output files."
+                    progressPercent={exportSnapshot?.progress_percent ?? null}
+                    startTime={exportSnapshot?.started_at}
+                    totalChapters={exportSnapshot?.total_chapters}
+                  />
                 ) : null}
 
                 {exportSnapshot?.qa_report ? (

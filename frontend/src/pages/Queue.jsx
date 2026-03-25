@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import AppShell from "../components/AppShell";
 import JobDetailsModal from "../components/JobDetailsModal";
+import ProgressHeartbeat from "../components/ProgressHeartbeat";
 import QueueJobCard from "../components/QueueJobCard";
 import QueueStats from "../components/QueueStats";
 
@@ -94,17 +95,20 @@ export default function Queue() {
   const [actionState, setActionState] = useState({});
   const [batchForm, setBatchForm] = useState(BATCH_DEFAULTS);
   const [batchModalOpen, setBatchModalOpen] = useState(false);
+  const [batchSubmitStartTime, setBatchSubmitStartTime] = useState(null);
   const [flashMessage, setFlashMessage] = useState("");
   const [jobs, setJobs] = useState([]);
   const [loading, setLoading] = useState(true);
   const [detailLoading, setDetailLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
   const [pollingError, setPollingError] = useState("");
+  const [pollRetryNonce, setPollRetryNonce] = useState(0);
   const [queueStats, setQueueStats] = useState(EMPTY_STATS);
   const [selectedJob, setSelectedJob] = useState(null);
   const [selectedJobId, setSelectedJobId] = useState(null);
   const [sortBy, setSortBy] = useState("priority");
   const [statusFilter, setStatusFilter] = useState("");
+  const [submittingBatch, setSubmittingBatch] = useState(false);
   const [totalCount, setTotalCount] = useState(0);
 
   selectedJobIdRef.current = selectedJobId;
@@ -186,7 +190,16 @@ export default function Queue() {
   useEffect(() => {
     let cancelled = false;
     let failureCount = 0;
-    let intervalId = null;
+    let timeoutId = null;
+
+    function scheduleNextPoll(delayMs) {
+      if (cancelled) {
+        return;
+      }
+      timeoutId = window.setTimeout(() => {
+        void poll(false);
+      }, delayMs);
+    }
 
     async function poll(showLoading) {
       try {
@@ -197,36 +210,33 @@ export default function Queue() {
 
         failureCount = 0;
         setPollingError("");
+        scheduleNextPoll(4000);
       } catch (error) {
         if (cancelled) {
           return;
         }
 
         failureCount += 1;
-        if (failureCount >= 3) {
-          setPollingError("Queue polling paused after 3 failed refresh attempts.");
-          if (intervalId !== null) {
-            window.clearInterval(intervalId);
-          }
+        if (failureCount >= 10) {
+          setPollingError("Connection lost — click to retry");
           return;
         }
 
-        setPollingError(`Retrying queue refresh (${failureCount}/3)...`);
+        const retryDelayMs = Math.min(2000 * (2 ** (failureCount - 1)), 8000);
+        setPollingError(`Retrying queue refresh in ${Math.round(retryDelayMs / 1000)}s (${failureCount}/10)...`);
+        scheduleNextPoll(retryDelayMs);
       }
     }
 
     void poll(true);
-    intervalId = window.setInterval(() => {
-      void poll(false);
-    }, 4000);
 
     return () => {
       cancelled = true;
-      if (intervalId !== null) {
-        window.clearInterval(intervalId);
+      if (timeoutId !== null) {
+        window.clearTimeout(timeoutId);
       }
     };
-  }, [statusFilter, selectedJobId]);
+  }, [statusFilter, selectedJobId, pollRetryNonce]);
 
   function setActionPending(jobId, action, pending) {
     setActionState((currentState) => ({
@@ -283,6 +293,8 @@ export default function Queue() {
   async function handleBatchSubmit(event) {
     event.preventDefault();
     setErrorMessage("");
+    setSubmittingBatch(true);
+    setBatchSubmitStartTime(Date.now());
 
     try {
       const response = await fetch("/api/queue/batch-all", {
@@ -302,6 +314,11 @@ export default function Queue() {
       setErrorMessage(
         error instanceof Error ? error.message : "Failed to queue parsed books for generation.",
       );
+    } finally {
+      if (mountedRef.current) {
+        setSubmittingBatch(false);
+        setBatchSubmitStartTime(null);
+      }
     }
   }
 
@@ -328,7 +345,8 @@ export default function Queue() {
             </div>
 
             <button
-              className="rounded-full border border-slate-950 bg-slate-950 px-5 py-3 text-sm font-medium text-white transition hover:bg-slate-800"
+              className="rounded-full border border-slate-950 bg-slate-950 px-5 py-3 text-sm font-medium text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60"
+              disabled={submittingBatch}
               onClick={() => setBatchModalOpen(true)}
               type="button"
             >
@@ -377,7 +395,20 @@ export default function Queue() {
 
         {pollingError ? (
           <div className="rounded-[1.5rem] border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
-            {pollingError}
+            {pollingError === "Connection lost — click to retry" ? (
+              <button
+                className="font-semibold underline underline-offset-4"
+                onClick={() => {
+                  setPollingError("");
+                  setPollRetryNonce((currentValue) => currentValue + 1);
+                }}
+                type="button"
+              >
+                {pollingError}
+              </button>
+            ) : (
+              pollingError
+            )}
           </div>
         ) : null}
 
@@ -430,7 +461,8 @@ export default function Queue() {
               </div>
 
               <button
-                className="rounded-full border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700 transition hover:border-slate-950 hover:text-slate-950"
+                className="rounded-full border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700 transition hover:border-slate-950 hover:text-slate-950 disabled:cursor-not-allowed disabled:opacity-60"
+                disabled={submittingBatch}
                 onClick={() => setBatchModalOpen(false)}
                 type="button"
               >
@@ -494,12 +526,31 @@ export default function Queue() {
                 Queue all parsed books for generation?
               </div>
 
+              {submittingBatch ? (
+                <ProgressHeartbeat
+                  isActive={submittingBatch}
+                  progressPercent={null}
+                  showETA={null}
+                  size="sm"
+                  stage="Queuing books..."
+                  startTime={batchSubmitStartTime}
+                />
+              ) : null}
+
               <div className="flex justify-end">
                 <button
-                  className="rounded-full border border-slate-950 bg-slate-950 px-5 py-3 text-sm font-medium text-white transition hover:bg-slate-800"
+                  className="inline-flex items-center justify-center gap-2 rounded-full border border-slate-950 bg-slate-950 px-5 py-3 text-sm font-medium text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60"
+                  disabled={submittingBatch}
                   type="submit"
                 >
-                  Confirm Batch Queue
+                  {submittingBatch ? (
+                    <>
+                      <span className="h-4 w-4 animate-spin rounded-full border-2 border-white/30 border-t-white" />
+                      Queueing...
+                    </>
+                  ) : (
+                    "Confirm Batch Queue"
+                  )}
                 </button>
               </div>
             </form>

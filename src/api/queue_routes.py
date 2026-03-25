@@ -24,6 +24,7 @@ from src.database import (
     get_db,
     utc_now,
 )
+from src.pipeline.queue_manager import DuplicateGenerationJobError
 
 router = APIRouter(prefix="/api/queue", tags=["queue"])
 
@@ -551,15 +552,19 @@ async def batch_queue_all_books(
         if active_job is not None:
             continue
 
-        job_id = await queue.enqueue_book(
-            book.id,
-            db,
-            priority=request.priority,
-            voice_name=request.voice or default_voice.name,
-            emotion=default_voice.emotion if request.emotion is None else request.emotion,
-            speed=default_voice.speed if request.speed is None else request.speed,
-            job_type=GenerationJobType.BATCH_ALL,
-        )
+        try:
+            job_id = await queue.enqueue_book(
+                book.id,
+                db,
+                priority=request.priority,
+                voice_name=request.voice or default_voice.name,
+                emotion=default_voice.emotion if request.emotion is None else request.emotion,
+                speed=default_voice.speed if request.speed is None else request.speed,
+                job_type=GenerationJobType.BATCH_ALL,
+            )
+        except DuplicateGenerationJobError:
+            continue
+
         job = db.query(GenerationJob).filter(GenerationJob.id == job_id).first()
         if job is None:
             continue

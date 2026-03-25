@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +23,7 @@ logger = logging.getLogger(__name__)
 MODEL_DIR_NAME = "Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit"
 BASE_MODEL_DIR_NAME = "Qwen3-TTS-12Hz-1.7B-Base-8bit"
 DEFAULT_SAMPLE_RATE = 22050
+ENGLISH_LANG_CODE = "en"
 VOICE_PRESETS: dict[str, dict[str, str]] = {
     "Ethan": {
         "speaker": "aiden",
@@ -54,6 +56,20 @@ SYNTHETIC_VOICE_FREQUENCIES: dict[str, int] = {
     "Aria": 250,
     "Leo": 175,
 }
+
+
+def compute_adaptive_timeout(text: str, speed: float = 1.0) -> float:
+    """Compute a chunk timeout from the expected narration duration."""
+
+    min_timeout = 15.0
+    max_timeout = 300.0
+    timeout_multiplier = 4.0
+
+    resolved_speed = max(speed, 0.1)
+    word_count = len(text.split())
+    expected_seconds = (word_count / 2.5) / resolved_speed
+    timeout = max(min_timeout, expected_seconds * timeout_multiplier)
+    return min(timeout, max_timeout)
 
 
 class Qwen3TTS(TTSEngine):
@@ -303,7 +319,7 @@ class Qwen3TTS(TTSEngine):
                     voice=speaker,
                     instruct=self._emotion_instruction(config.emotion),
                     speed=1.0,
-                    lang_code="english",
+                    lang_code=ENGLISH_LANG_CODE,
                     verbose=False,
                 )
             )
@@ -323,14 +339,15 @@ class Qwen3TTS(TTSEngine):
         if clone_config is None:
             raise ValueError(f"Cloned voice not found: {clone_name}")
         model = self._ensure_base_model_loaded()
+        prepared_ref_path = self._prepare_reference_audio(clone_config["ref_audio_path"])
 
         try:
             results = list(
                 model.generate(
                     text=config.text,
                     speed=1.0,
-                    lang_code="english",
-                    ref_audio=clone_config["ref_audio_path"],
+                    lang_code=ENGLISH_LANG_CODE,
+                    ref_audio=prepared_ref_path,
                     ref_text=clone_config["transcript"],
                     verbose=False,
                 )
@@ -338,11 +355,13 @@ class Qwen3TTS(TTSEngine):
         except Exception as exc:
             logger.exception("Cloned voice generation failed")
             raise RuntimeError(f"Qwen3-TTS cloned voice generation failed: {exc}") from exc
+        finally:
+            Path(prepared_ref_path).unlink(missing_ok=True)
 
         if not results:
             raise RuntimeError("Qwen3-TTS cloned voice generation returned no audio.")
 
-        return self._results_to_audio_segment(results, config.speed)
+        return self._trim_phoneme_bleed(self._results_to_audio_segment(results, config.speed))
 
     async def generate_chunk_with_timeout(
         self,
@@ -353,7 +372,10 @@ class Qwen3TTS(TTSEngine):
     ) -> AudioSegment:
         """Generate one chunk with best-effort timeout protection."""
 
-        timeout_seconds = get_application_settings().engine_config.chunk_timeout_seconds
+        timeout_seconds = compute_adaptive_timeout(text, speed)
+        configured_timeout = getattr(get_application_settings().engine_config, "chunk_timeout_seconds", None)
+        if configured_timeout is not None:
+            timeout_seconds = min(timeout_seconds, float(configured_timeout))
         try:
             return await asyncio.wait_for(
                 asyncio.to_thread(self._generate_chunk_sync, text, voice, emotion, speed),
@@ -378,6 +400,35 @@ class Qwen3TTS(TTSEngine):
         """Run chunk generation synchronously for async timeout wrappers."""
 
         return self.generate(text, voice=voice, emotion=emotion, speed=speed)
+
+    def _prepare_reference_audio(self, ref_audio_path: str) -> str:
+        """Append silence to cloned-voice references to reduce first-token bleed."""
+
+        ref_audio = AudioSegment.from_file(ref_audio_path)
+        silence = AudioSegment.silent(duration=500, frame_rate=ref_audio.frame_rate)
+        padded = (ref_audio + silence).set_channels(1)
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
+            temp_path = Path(handle.name)
+
+        padded.export(temp_path, format="wav")
+        return str(temp_path)
+
+    def _trim_phoneme_bleed(self, audio: AudioSegment, threshold_db: float = -20.0) -> AudioSegment:
+        """Remove a short cloned-voice transient when the first token bleeds from the reference."""
+
+        if len(audio) < 100:
+            return audio
+
+        head = audio[:100]
+        if head.dBFS == float("-inf") or head.dBFS <= threshold_db:
+            return audio
+
+        first_50 = audio[:50].dBFS
+        next_50 = audio[50:100].dBFS
+        if first_50 != float("-inf") and next_50 != float("-inf") and first_50 > next_50 + 6:
+            return audio[80:]
+        return audio
 
     def _results_to_audio_segment(self, results: list[Any], speed: float) -> AudioSegment:
         """Convert MLX generation results into a single AudioSegment."""

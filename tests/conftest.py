@@ -57,6 +57,14 @@ def isolated_generation_runtime() -> Generator[None, None, None]:
         generation_runtime._batch_orchestrator = None
 
 
+@pytest.fixture(autouse=True)
+def disable_sleep_prevention(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep queue tests from spawning platform-specific sleep-prevention processes."""
+
+    monkeypatch.setattr("src.pipeline.queue_manager.prevent_sleep", lambda: None)
+    monkeypatch.setattr("src.pipeline.queue_manager.allow_sleep", lambda: None)
+
+
 @pytest.fixture(scope="function")
 def test_db() -> Generator[Session, None, None]:
     """Create an isolated in-memory database session for tests."""

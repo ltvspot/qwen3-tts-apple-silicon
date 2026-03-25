@@ -50,6 +50,11 @@ export default function BatchControls({ actionLoading, batch, exportProgress, on
             <div>
               Speed: {batch?.avg_seconds_per_book ?? 0}s/book average, {queuedBooks} queued behind the active slot
             </div>
+            {batch?.summary ? (
+              <div>
+                Summary: {batch.summary}
+              </div>
+            ) : null}
             <div>
               Export batch: {exportStatus}
               {exportProgress ? ` (${exportProgress.completed}/${exportProgress.queued} completed)` : ""}

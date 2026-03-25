@@ -93,6 +93,17 @@ function createJsonResponse(payload, options = {}) {
   };
 }
 
+function createDeferredResponse() {
+  let resolve;
+
+  return {
+    promise: new Promise((resolver) => {
+      resolve = resolver;
+    }),
+    resolve,
+  };
+}
+
 async function waitFor(assertion, timeout = 2000) {
   const startTime = Date.now();
 
@@ -277,6 +288,100 @@ describe("Queue page", () => {
       expect(fetchMock.mock.calls[1][1].method).toBe("POST");
       expect(fetchMock.mock.calls[1][1].body).toContain('"priority":25');
       expect(container.textContent).toContain("All 2 parsed books queued for generation");
+    });
+  });
+
+  test("disables the batch submit button while the request is in flight", async () => {
+    const deferredBatch = createDeferredResponse();
+
+    fetchMock
+      .mockResolvedValueOnce(createJsonResponse(createQueuePayload()))
+      .mockImplementationOnce(() => deferredBatch.promise)
+      .mockResolvedValueOnce(createJsonResponse(createQueuePayload()));
+
+    await renderQueue();
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("Generate All Parsed Books");
+    });
+
+    await act(async () => {
+      Array.from(container.querySelectorAll("button"))
+        .find((button) => button.textContent.includes("Generate All Parsed Books"))
+        .dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("Confirm Batch Queue");
+    });
+
+    await act(async () => {
+      Array.from(container.querySelectorAll("button"))
+        .find((button) => button.textContent.includes("Confirm Batch Queue"))
+        .dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    await waitFor(() => {
+      const submitButton = Array.from(container.querySelectorAll("button"))
+        .find((button) => button.textContent.includes("Queueing..."));
+      expect(submitButton).toBeTruthy();
+      expect(submitButton.disabled).toBe(true);
+      expect(container.textContent).toContain("Queuing books...");
+      expect(container.textContent).toContain("Elapsed:");
+    });
+
+    await act(async () => {
+      deferredBatch.resolve(createJsonResponse({
+        books_queued: 1,
+        estimated_completion_seconds: 1200,
+        jobs_created: 1,
+        message: "All 1 parsed books queued for generation",
+        total_chapters: 42,
+      }));
+    });
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("All 1 parsed books queued for generation");
+    });
+  });
+
+  test("shows a retry action after repeated polling failures and resumes on click", async () => {
+    let attempts = 0;
+    fetchMock.mockImplementation((url) => {
+      if (!String(url).startsWith("/api/queue?")) {
+        throw new Error(`Unexpected fetch: ${url}`);
+      }
+
+      attempts += 1;
+      if (attempts <= 10) {
+        return Promise.reject(new Error("offline"));
+      }
+      return Promise.resolve(createJsonResponse(createQueuePayload()));
+    });
+
+    await renderQueue();
+
+    for (let index = 0; index < 9; index += 1) {
+      await act(async () => {
+        jest.advanceTimersByTime(8000);
+        await Promise.resolve();
+      });
+    }
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("Connection lost — click to retry");
+    });
+
+    await act(async () => {
+      Array.from(container.querySelectorAll("button"))
+        .find((button) => button.textContent.includes("Connection lost"))
+        .dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledTimes(11);
+      expect(container.textContent).toContain("The Count of Monte Cristo");
+      expect(container.textContent).not.toContain("Connection lost — click to retry");
     });
   });
 });

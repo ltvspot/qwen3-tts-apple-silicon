@@ -71,10 +71,12 @@ function createStatusSnapshot(overrides = {}) {
   return {
     book_id: 7,
     chapters: [],
+    current_chunk: null,
     current_chapter_n: null,
     eta_seconds: null,
     started_at: null,
     status: "idle",
+    total_chunks: null,
     ...overrides,
   };
 }
@@ -83,12 +85,17 @@ function createExportSnapshot(overrides = {}) {
   return {
     book_id: 7,
     completed_at: null,
+    current_chapter_n: null,
+    current_format: null,
+    current_stage: null,
     error_message: null,
     export_status: "idle",
     formats: {},
     job_id: null,
+    progress_percent: 0,
     qa_report: null,
     started_at: null,
+    total_chapters: null,
     ...overrides,
   };
 }
@@ -101,6 +108,68 @@ function createVoiceListPayload(overrides = {}) {
       { display_name: "Nova", is_cloned: false, name: "Nova" },
       { display_name: "Aria", is_cloned: false, name: "Aria" },
     ],
+    ...overrides,
+  };
+}
+
+function createBookQualityReport(overrides = {}) {
+  return {
+    book_id: 7,
+    chapters_grade_a: 2,
+    chapters_grade_b: 0,
+    chapters_grade_c: 0,
+    chapters_grade_f: 0,
+    cross_chapter_checks: {
+      acx_compliance: {
+        message: "All chapters satisfy ACX/Audible requirements.",
+        status: "pass",
+        violations: [],
+      },
+      chapter_transitions: {
+        issues: [],
+        message: "Chapter transitions are smooth and properly padded.",
+        status: "pass",
+      },
+      loudness_consistency: {
+        max_deviation_lu: 0.8,
+        mean_lufs: -20.0,
+        message: "All chapters are within the allowed loudness spread.",
+        status: "pass",
+      },
+      pacing_consistency: {
+        max_deviation_pct: 6.2,
+        mean_wpm: 154.0,
+        message: "Cross-chapter pacing is consistent.",
+        status: "pass",
+      },
+      voice_consistency: {
+        message: "Voice fingerprint remains consistent across the book.",
+        outlier_chapters: [],
+        status: "pass",
+      },
+    },
+    export_blockers: [],
+    overall_grade: "A",
+    ready_for_export: true,
+    recommendations: ["All chapters within ACX loudness range."],
+    title: "The Test Chronicle",
+    total_chapters: 2,
+    ...overrides,
+  };
+}
+
+function createVoiceConsistencyChart(overrides = {}) {
+  return {
+    book_median: {
+      brightness: 2300,
+      pitch: 142.5,
+      rate: 154,
+    },
+    chapters: [
+      { brightness: 2300, grade: "A", number: 1, pitch: 142.0, rate: 154.0 },
+      { brightness: 2310, grade: "A", number: 2, pitch: 143.0, rate: 155.0 },
+    ],
+    outlier_chapters: [],
     ...overrides,
   };
 }
@@ -262,6 +331,58 @@ describe("BookDetail page", () => {
     await act(async () => {
       resolveVoices(createJsonResponse(createVoiceListPayload()));
     });
+  });
+
+  test("retries voice loading while the engine is still warming up", async () => {
+    jest.useFakeTimers();
+    const book = createBook({});
+    const chapters = [createChapter({})];
+    let voiceRequests = 0;
+
+    fetchMock.mockImplementation((url) => {
+      if (url === "/api/book/7") {
+        return Promise.resolve(createJsonResponse(book));
+      }
+      if (url === "/api/book/7/chapters") {
+        return Promise.resolve(createJsonResponse(chapters));
+      }
+      if (url === "/api/book/7/status") {
+        return Promise.resolve(createJsonResponse(createStatusSnapshot()));
+      }
+      if (url === "/api/book/7/export/status") {
+        return Promise.resolve(createJsonResponse(createExportSnapshot()));
+      }
+      if (url === "/api/voice-lab/voices") {
+        voiceRequests += 1;
+        if (voiceRequests === 1) {
+          return Promise.resolve(createJsonResponse({
+            engine: "qwen3_tts",
+            loading: true,
+            voices: [],
+          }));
+        }
+        return Promise.resolve(createJsonResponse(createVoiceListPayload()));
+      }
+
+      throw new Error(`Unhandled fetch: ${url}`);
+    });
+
+    await renderBookDetail();
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain("retrying in 3s (attempt 1/20)");
+
+    await act(async () => {
+      jest.advanceTimersByTime(3000);
+      await Promise.resolve();
+    });
+
+    expect(container.textContent).not.toContain("retrying in 3s");
+
+    expect(voiceRequests).toBe(2);
+    jest.useRealTimers();
   });
 
   test("edits and saves chapter text through the chapter update API", async () => {
@@ -631,6 +752,33 @@ describe("BookDetail page", () => {
     });
   });
 
+  test("renders real export progress instead of a fake placeholder bar", async () => {
+    const book = createBook({});
+    const chapters = [createChapter({ status: "generated", audio_path: "7-the-test-chronicle/chapters/00-opening-credits.wav" })];
+
+    fetchMock
+      .mockResolvedValueOnce(createJsonResponse(book))
+      .mockResolvedValueOnce(createJsonResponse(chapters))
+      .mockResolvedValueOnce(createJsonResponse(createStatusSnapshot()))
+      .mockResolvedValueOnce(createJsonResponse(createExportSnapshot({
+        current_chapter_n: 3,
+        current_format: "mp3",
+        current_stage: "Encoding MP3 (chapter 3/10)",
+        export_status: "processing",
+        progress_percent: 45,
+        started_at: "2026-03-24T00:09:00+00:00",
+        total_chapters: 10,
+      })))
+      .mockResolvedValueOnce(createJsonResponse(createVoiceListPayload()));
+
+    await renderBookDetail();
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("45%");
+      expect(container.textContent).toContain("Encoding MP3 (chapter 3/10)");
+    });
+  });
+
   test("renders completed chapter controls and opens the bottom audio player", async () => {
     const book = createBook({});
     const chapters = [
@@ -684,5 +832,62 @@ describe("BookDetail page", () => {
       expect(container.textContent).toContain("Generated in 47.2s");
       expect(container.textContent).toContain("18.1 MB WAV");
     });
+  });
+
+  test("runs book QA on demand and renders the Gate 3 overview", async () => {
+    const book = createBook({ status: "generated" });
+    const chapters = [
+      createChapter({
+        audio_path: "7-the-test-chronicle/chapters/01-chapter-one.wav",
+        duration_seconds: 120,
+        id: 701,
+        number: 1,
+        qa_status: "approved",
+        status: "generated",
+        title: "Chapter One",
+        type: "chapter",
+      }),
+      createChapter({
+        audio_path: "7-the-test-chronicle/chapters/02-chapter-two.wav",
+        duration_seconds: 118,
+        id: 702,
+        number: 2,
+        qa_status: "approved",
+        status: "generated",
+        text_content: "Chapter two body text.",
+        title: "Chapter Two",
+        type: "chapter",
+      }),
+    ];
+
+    fetchMock
+      .mockResolvedValueOnce(createJsonResponse(book))
+      .mockResolvedValueOnce(createJsonResponse(chapters))
+      .mockResolvedValueOnce(createJsonResponse(createStatusSnapshot()))
+      .mockResolvedValueOnce(createJsonResponse(createExportSnapshot()))
+      .mockResolvedValueOnce(createJsonResponse(createVoiceListPayload()))
+      .mockResolvedValueOnce(createJsonResponse(createBookQualityReport()))
+      .mockResolvedValueOnce(createJsonResponse(createVoiceConsistencyChart()));
+
+    await renderBookDetail();
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("Run Book QA");
+    });
+
+    await act(async () => {
+      getButtonByText("Run Book QA").dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("Gate 3 Overview");
+      expect(container.textContent).toContain("Grade A");
+      expect(container.textContent).toContain("Ready for Export");
+      expect(container.textContent).toContain("Voice Consistency Chart");
+      expect(container.textContent).toContain("All chapters within ACX loudness range.");
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith("/api/book/7/qa/book-report");
+    expect(fetchMock).toHaveBeenCalledWith("/api/book/7/qa/voice-consistency-chart");
   });
 });

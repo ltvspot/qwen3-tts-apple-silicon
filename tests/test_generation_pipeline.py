@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from datetime import timedelta
 from pathlib import Path
@@ -13,7 +14,7 @@ from pydub.generators import Sine
 from sqlalchemy.orm import Session, sessionmaker
 
 from src.api import generation as generation_api
-from src.config import settings
+from src.config import FailureThresholdSettings, settings
 from src.database import (
     Book,
     BookStatus,
@@ -252,10 +253,17 @@ async def test_generate_chapter_writes_audio_and_metadata(test_db: Session) -> N
     assert chapter.status == ChapterStatus.GENERATED
     assert chapter.duration_seconds == duration
     assert chapter.audio_path == "1-signal-fires/chapters/01-ch01-first-light.wav"
+    assert chapter.current_chunk == chapter.total_chunks
+    assert chapter.total_chunks is not None
+    assert chapter.chunk_boundaries is not None
 
     audio_file = Path(settings.OUTPUTS_PATH) / chapter.audio_path
     assert audio_file.exists()
     assert audio_file.stat().st_size > 0
+    assert audio_file.with_suffix(".qa.json").exists()
+    boundaries = json.loads(chapter.chunk_boundaries)
+    assert isinstance(boundaries, list)
+    assert boundaries[0] == 0.0
 
     qa_record = (
         test_db.query(ChapterQARecord)
@@ -379,8 +387,8 @@ async def test_generate_chapter_retries_transient_failures_before_succeeding(tes
 
 
 @pytest.mark.asyncio
-async def test_generate_chapter_skips_invalid_chunks_and_flags_manual_review(test_db: Session) -> None:
-    """Persisted chapters should survive skipped invalid chunks but require manual QA review."""
+async def test_generate_chapter_keeps_invalid_chunks_and_flags_manual_review(test_db: Session) -> None:
+    """Repeated hard validation failures should still stitch audio and force manual review."""
 
     generator = AudiobookGenerator(ValidationFailureEngine())
     book = create_book(test_db, title="Manual Review Book")
@@ -400,7 +408,7 @@ async def test_generate_chapter_skips_invalid_chunks_and_flags_manual_review(tes
     assert chapter.status == ChapterStatus.GENERATED
     assert chapter.qa_status.value == "needs_review"
     assert chapter.qa_notes is not None
-    assert "skipped" in chapter.qa_notes
+    assert "FAILED" in chapter.qa_notes
     assert generator.engine.calls == 4
 
 
@@ -574,7 +582,14 @@ async def test_failed_generation_does_not_promote_book(test_db: Session) -> None
 async def test_generation_queue_stops_after_three_consecutive_chapter_failures(test_db: Session) -> None:
     """The queue should abort a full-book job after three consecutive chapter failures."""
 
-    queue = GenerationQueue(max_workers=1, consecutive_failure_threshold=3)
+    queue = GenerationQueue(
+        max_workers=1,
+        failure_thresholds=FailureThresholdSettings(
+            max_failure_rate_percent=50.0,
+            max_consecutive_failures=3,
+            min_chunks_for_rate=500,
+        ),
+    )
     session_factory = sessionmaker(
         bind=test_db.get_bind(),
         autoflush=False,
@@ -605,7 +620,7 @@ async def test_generation_queue_stops_after_three_consecutive_chapter_failures(t
 
     assert job_status is not None
     assert job_status.status == JobStatus.FAILED
-    assert db_job.error_message == "Generation stopped after 3 consecutive chapter failures."
+    assert db_job.error_message == "Stopped: 3 consecutive failures"
     assert [chapter.status for chapter in chapters] == [
         ChapterStatus.FAILED,
         ChapterStatus.FAILED,
@@ -740,6 +755,8 @@ def test_status_endpoints_return_generating_progress_and_eta(client, test_db: Se
 
     generating.status = ChapterStatus.GENERATING
     generating.started_at = now - timedelta(seconds=10)
+    generating.current_chunk = 5
+    generating.total_chunks = 12
 
     test_db.add(
         GenerationJob(
@@ -760,6 +777,8 @@ def test_status_endpoints_return_generating_progress_and_eta(client, test_db: Se
     book_payload = book_status_response.json()
     assert book_payload["status"] == "generating"
     assert book_payload["current_chapter_n"] == generating.number
+    assert book_payload["current_chunk"] == 5
+    assert book_payload["total_chunks"] == 12
     assert book_payload["eta_seconds"] == 45
 
     generating_payload = next(
@@ -768,12 +787,16 @@ def test_status_endpoints_return_generating_progress_and_eta(client, test_db: Se
     assert generating_payload["status"] == "generating"
     assert generating_payload["expected_total_seconds"] == 30.0
     assert generating_payload["progress_seconds"] == 15.0
+    assert generating_payload["current_chunk"] == 5
+    assert generating_payload["total_chunks"] == 12
 
     assert chapter_status_response.status_code == 200
     chapter_payload = chapter_status_response.json()
     assert chapter_payload["status"] == "generating"
     assert chapter_payload["progress_seconds"] == 15.0
     assert chapter_payload["expected_total_seconds"] == 30.0
+    assert chapter_payload["current_chunk"] == 5
+    assert chapter_payload["total_chunks"] == 12
 
 
 def test_status_endpoints_surface_generation_errors(client, test_db: Session) -> None:

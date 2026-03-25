@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -27,7 +28,12 @@ class LibraryScanner:
         root_path = manuscripts_path if manuscripts_path is not None else settings.FORMATTED_MANUSCRIPTS_PATH
         self.manuscripts_path = Path(root_path)
 
-    def scan(self, db_session: Session) -> dict[str, Any]:
+    def scan(
+        self,
+        db_session: Session,
+        *,
+        progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
         """
         Scan the manuscript library and add any new folders to the database.
 
@@ -53,37 +59,59 @@ class LibraryScanner:
 
         folders = sorted(path for path in self.manuscripts_path.iterdir() if path.is_dir())
         result["total_found"] = len(folders)
-
-        for folder in folders:
-            metadata = self._parse_folder_name(folder.name)
-            if metadata is None:
-                message = f"Unable to parse folder metadata: {folder.name}"
-                logger.warning(message)
-                result["errors"].append(message)
-                continue
-
-            existing = db_session.query(Book).filter(Book.folder_path == folder.name).first()
-            if existing is not None:
-                result["total_indexed"] += 1
-                continue
-
-            title, author = self._initial_book_fields(metadata["title"])
-            book = Book(
-                title=title,
-                subtitle=None,
-                author=author,
-                narrator=get_application_settings().narrator_name,
-                folder_path=folder.name,
-                status=BookStatus.NOT_STARTED,
-                page_count=metadata.get("page_count"),
-                trim_size=metadata.get("trim_size"),
+        if progress_callback is not None:
+            progress_callback(
+                {
+                    "files_found": result["total_found"],
+                    "files_processed": 0,
+                    "new_books": result["new_books"],
+                    "errors": list(result["errors"]),
+                }
             )
-            db_session.add(book)
-            result["total_indexed"] += 1
-            result["new_books"] += 1
 
-            if self._find_supported_manuscript_file(folder) is None:
-                logger.info("Indexed folder without a supported manuscript file: %s", folder.name)
+        processed_count = 0
+        for folder in folders:
+            try:
+                metadata = self._parse_folder_name(folder.name)
+                if metadata is None:
+                    message = f"Unable to parse folder metadata: {folder.name}"
+                    logger.warning(message)
+                    result["errors"].append(message)
+                    continue
+
+                existing = db_session.query(Book).filter(Book.folder_path == folder.name).first()
+                if existing is not None:
+                    result["total_indexed"] += 1
+                    continue
+
+                title, author = self._initial_book_fields(metadata["title"])
+                book = Book(
+                    title=title,
+                    subtitle=None,
+                    author=author,
+                    narrator=get_application_settings().narrator_name,
+                    folder_path=folder.name,
+                    status=BookStatus.NOT_STARTED,
+                    page_count=metadata.get("page_count"),
+                    trim_size=metadata.get("trim_size"),
+                )
+                db_session.add(book)
+                result["total_indexed"] += 1
+                result["new_books"] += 1
+
+                if self._find_supported_manuscript_file(folder) is None:
+                    logger.info("Indexed folder without a supported manuscript file: %s", folder.name)
+            finally:
+                processed_count += 1
+                if progress_callback is not None:
+                    progress_callback(
+                        {
+                            "files_found": result["total_found"],
+                            "files_processed": processed_count,
+                            "new_books": result["new_books"],
+                            "errors": list(result["errors"]),
+                        }
+                    )
 
         return result
 

@@ -1,37 +1,76 @@
 import PropTypes from "prop-types";
 import React from "react";
+import ProgressHeartbeat from "./ProgressHeartbeat";
 
-export default function ExportProgressBar({ label = "Export in progress..." }) {
+function buildStageLabel({
+  currentChapterN,
+  currentFormat,
+  currentStage,
+  totalChapters,
+}) {
+  if (currentStage) {
+    return currentStage;
+  }
+
+  if (currentFormat) {
+    const chapterSuffix = currentChapterN && totalChapters
+      ? ` (chapter ${currentChapterN}/${totalChapters})`
+      : "";
+    return `Exporting ${currentFormat.toUpperCase()}${chapterSuffix}`;
+  }
+
+  return "Exporting audiobook package...";
+}
+
+export default function ExportProgressBar({
+  currentChapterN = null,
+  currentFormat = null,
+  currentStage = null,
+  label = "Building the audiobook package and validating output files.",
+  progressPercent = null,
+  startTime = null,
+  totalChapters = null,
+}) {
+  const stageLabel = buildStageLabel({
+    currentChapterN,
+    currentFormat,
+    currentStage,
+    totalChapters,
+  });
+
   return (
     <div className="rounded-3xl border border-sky-300/20 bg-sky-400/10 p-4">
-      <div className="flex items-center justify-between gap-4">
-        <div>
-          <div className="text-xs font-semibold uppercase tracking-[0.26em] text-sky-200/75">
-            Processing
-          </div>
-          <p className="mt-2 text-sm text-sky-50">{label}</p>
+      <div>
+        <div className="text-xs font-semibold uppercase tracking-[0.26em] text-sky-200/75">
+          Processing
         </div>
-        <div className="flex items-center gap-2 rounded-full border border-sky-300/20 bg-slate-950/50 px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] text-sky-100">
-          <span
-            aria-hidden="true"
-            className="h-2.5 w-2.5 animate-pulse rounded-full bg-sky-300"
-          />
-          Running
-        </div>
+        <p className="mt-2 text-sm text-sky-50">{label}</p>
       </div>
 
-      <div
-        aria-label={label}
-        aria-valuetext={label}
-        className="mt-4 h-3 overflow-hidden rounded-full bg-slate-950/70"
-        role="progressbar"
-      >
-        <div className="h-full w-2/3 animate-pulse rounded-full bg-[linear-gradient(90deg,rgba(125,211,252,0.18),rgba(125,211,252,0.9),rgba(251,191,36,0.82))]" />
+      <div className="mt-4">
+        <ProgressHeartbeat
+          isActive
+          progressPercent={progressPercent}
+          showETA={null}
+          size="sm"
+          stage={stageLabel}
+          startTime={startTime}
+        />
       </div>
     </div>
   );
 }
 
 ExportProgressBar.propTypes = {
+  currentChapterN: PropTypes.number,
+  currentFormat: PropTypes.string,
+  currentStage: PropTypes.string,
   label: PropTypes.string,
+  progressPercent: PropTypes.number,
+  startTime: PropTypes.oneOfType([
+    PropTypes.instanceOf(Date),
+    PropTypes.number,
+    PropTypes.string,
+  ]),
+  totalChapters: PropTypes.number,
 };

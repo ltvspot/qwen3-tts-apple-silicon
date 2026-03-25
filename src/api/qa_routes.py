@@ -19,7 +19,10 @@ from src.database import (
     get_db,
     utc_now,
 )
+from src.pipeline.book_mastering import BookMasteringPipeline, MasteringReport
+from src.pipeline.book_qa import BookQAReport, VoiceConsistencyChart, get_voice_consistency_chart, run_book_qa
 from src.pipeline.qa_checker import apply_manual_review, build_qa_record_response
+from src.pipeline.quality_tracker import QualityTracker
 
 router = APIRouter(prefix="/api", tags=["qa"])
 
@@ -31,6 +34,7 @@ class QACheckResponse(BaseModel):
     status: str
     message: str
     value: float | None = None
+    details: dict | None = None
 
 
 class ChapterQAResponse(BaseModel):
@@ -45,6 +49,9 @@ class ChapterQAResponse(BaseModel):
     manual_notes: str | None = None
     manual_reviewed_by: str | None = None
     manual_reviewed_at: datetime | None = None
+    chapter_report: dict | None = None
+    qa_grade: str | None = None
+    ready_for_export: bool | None = None
 
 
 class ManualQAReviewRequest(BaseModel):
@@ -81,6 +88,9 @@ class DashboardChapterResponse(BaseModel):
     manual_reviewed_by: str | None = None
     manual_reviewed_at: datetime | None = None
     audio_url: str | None = None
+    chapter_report: dict | None = None
+    qa_grade: str | None = None
+    ready_for_export: bool | None = None
 
 
 class DashboardBookResponse(BaseModel):
@@ -127,6 +137,12 @@ class BatchApproveResponse(BaseModel):
     flagged: int
 
 
+class ApproveAllPassingResponse(BaseModel):
+    """Per-book approval response for chapters that fully passed automatic QA."""
+
+    approved: int
+
+
 class CatalogQASummaryResponse(BaseModel):
     """Catalog-wide QA summary."""
 
@@ -141,6 +157,18 @@ class CatalogQASummaryResponse(BaseModel):
     chapters_pending: int
 
 
+class BookQAReportResponse(BookQAReport):
+    """Serialized Gate 3 whole-book QA report."""
+
+
+class VoiceConsistencyChartResponse(VoiceConsistencyChart):
+    """Serialized voice consistency chart payload."""
+
+
+class BookMasteringResponse(MasteringReport):
+    """Serialized mastering report payload."""
+
+
 def _load_chapter_or_404(book_id: int, chapter_n: int, db: Session) -> Chapter:
     """Load a chapter row or raise a 404."""
 
@@ -152,6 +180,15 @@ def _load_chapter_or_404(book_id: int, chapter_n: int, db: Session) -> Chapter:
     if chapter is None:
         raise HTTPException(status_code=404, detail=f"Chapter {chapter_n} not found in book {book_id}")
     return chapter
+
+
+def _load_book_or_404(book_id: int, db: Session) -> Book:
+    """Load a book row or raise a 404."""
+
+    book = db.query(Book).filter(Book.id == book_id).first()
+    if book is None:
+        raise HTTPException(status_code=404, detail=f"Book {book_id} not found")
+    return book
 
 
 def _load_qa_record_or_404(book_id: int, chapter_n: int, db: Session) -> ChapterQARecord:
@@ -185,7 +222,7 @@ def _chapter_needs_manual_review(record: ChapterQARecord) -> bool:
 def _serialize_dashboard_chapter(record: ChapterQARecord, chapter: Chapter | None) -> DashboardChapterResponse:
     """Convert a QA record plus chapter metadata into dashboard form."""
 
-    payload = build_qa_record_response(record)
+    payload = build_qa_record_response(record, chapter)
     return DashboardChapterResponse(
         book_id=record.book_id,
         chapter_n=record.chapter_n,
@@ -203,6 +240,9 @@ def _serialize_dashboard_chapter(record: ChapterQARecord, chapter: Chapter | Non
             if chapter is not None and chapter.audio_path
             else None
         ),
+        chapter_report=payload["chapter_report"],
+        qa_grade=payload["qa_grade"],
+        ready_for_export=payload["ready_for_export"],
     )
 
 
@@ -270,9 +310,53 @@ def _group_dashboard_books(
 async def get_chapter_qa(book_id: int, chapter_n: int, db: Session = Depends(get_db)) -> ChapterQAResponse:
     """Return stored automatic and manual QA details for one chapter."""
 
-    _load_chapter_or_404(book_id, chapter_n, db)
+    chapter = _load_chapter_or_404(book_id, chapter_n, db)
     record = _load_qa_record_or_404(book_id, chapter_n, db)
-    return ChapterQAResponse(**build_qa_record_response(record))
+    return ChapterQAResponse(**build_qa_record_response(record, chapter))
+
+
+@router.get("/book/{book_id}/qa/book-report", response_model=BookQAReportResponse)
+async def get_book_qa_report(book_id: int, db: Session = Depends(get_db)) -> BookQAReportResponse:
+    """Run Gate 3 and return the full book-level QA report."""
+
+    _load_book_or_404(book_id, db)
+    try:
+        report = run_book_qa(book_id, db)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    QualityTracker.ensure_book_quality_snapshot(book_id, db)
+    db.commit()
+    return BookQAReportResponse(**report.model_dump(mode="json"))
+
+
+@router.get("/book/{book_id}/qa/voice-consistency-chart", response_model=VoiceConsistencyChartResponse)
+async def get_book_voice_consistency_chart(
+    book_id: int,
+    db: Session = Depends(get_db),
+) -> VoiceConsistencyChartResponse:
+    """Return the per-chapter voice fingerprint series used by the Book Detail UI."""
+
+    _load_book_or_404(book_id, db)
+    try:
+        chart = get_voice_consistency_chart(book_id, db)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return VoiceConsistencyChartResponse(**chart.model_dump(mode="json"))
+
+
+@router.post("/book/{book_id}/qa/auto-master", response_model=BookMasteringResponse)
+async def auto_master_book(book_id: int, db: Session = Depends(get_db)) -> BookMasteringResponse:
+    """Run the full book mastering pipeline, then return the fresh report."""
+
+    _load_book_or_404(book_id, db)
+    pipeline = BookMasteringPipeline()
+    try:
+        report = await pipeline.master_book(book_id, db)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    QualityTracker.ensure_book_quality_snapshot(book_id, db)
+    db.commit()
+    return BookMasteringResponse(**report.model_dump(mode="json"))
 
 
 @router.post("/book/{book_id}/chapter/{chapter_n}/qa", response_model=ManualQAReviewResponse)
@@ -304,6 +388,50 @@ async def review_chapter_qa(
         manual_reviewed_by=updated_record.manual_reviewed_by or request.reviewed_by,
         manual_reviewed_at=updated_record.manual_reviewed_at or utc_now(),
     )
+
+
+@router.post("/book/{book_id}/approve-all-passing", response_model=ApproveAllPassingResponse)
+async def approve_all_passing_chapters(
+    book_id: int,
+    db: Session = Depends(get_db),
+) -> ApproveAllPassingResponse:
+    """Approve every chapter in a book whose automated QA fully passed."""
+
+    book = db.query(Book).filter(Book.id == book_id).first()
+    if book is None:
+        raise HTTPException(status_code=404, detail=f"Book {book_id} not found")
+
+    chapters = {
+        chapter.number: chapter
+        for chapter in db.query(Chapter).filter(Chapter.book_id == book_id).all()
+    }
+    records = (
+        db.query(ChapterQARecord)
+        .filter(
+            ChapterQARecord.book_id == book_id,
+            ChapterQARecord.overall_status == QAAutomaticStatus.PASS,
+            ChapterQARecord.manual_status.is_(None),
+        )
+        .order_by(ChapterQARecord.chapter_n.asc())
+        .all()
+    )
+
+    approved = 0
+    for record in records:
+        chapter = chapters.get(record.chapter_n)
+        if chapter is None:
+            continue
+        apply_manual_review(
+            db,
+            chapter,
+            QAManualStatus.APPROVED,
+            "auto-approved",
+            record.manual_notes,
+        )
+        approved += 1
+
+    db.commit()
+    return ApproveAllPassingResponse(approved=approved)
 
 
 @router.get("/qa/dashboard", response_model=QADashboardResponse)

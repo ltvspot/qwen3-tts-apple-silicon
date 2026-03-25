@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 from collections.abc import Awaitable, Callable
@@ -24,6 +25,14 @@ from src.database import (
     utc_now,
 )
 from src.engines import AudioStitcher, ModelManager, TTSEngine, TextChunker
+from src.pipeline.chunk_validator import (
+    SEVERITY_ORDER,
+    ChunkValidationReport,
+    ChunkValidator,
+    ValidationSeverity,
+)
+from src.pipeline.pause_trimmer import PauseTrimmer
+from src.pipeline.pronunciation_watchlist import PronunciationWatchlist
 from src.pipeline.qa_checker import persist_qa_result, run_qa_checks_for_chapter
 
 logger = logging.getLogger(__name__)
@@ -62,6 +71,8 @@ class AudiobookGenerator:
         self.model_manager = model_manager
         self.output_path = Path(settings.OUTPUTS_PATH)
         self.retry_backoff_seconds: tuple[float, ...] = (0.5, 1.0)
+        self.chunk_validator = ChunkValidator()
+        self.pronunciation_watchlist = PronunciationWatchlist()
 
     def close(self) -> None:
         """Release the underlying engine if it has been loaded."""
@@ -76,10 +87,11 @@ class AudiobookGenerator:
         book_id: int,
         db_session: Session,
         progress_callback: Callable[[int, float], Awaitable[None]] | None = None,
+        chapter_completed_callback: Callable[[Chapter], Awaitable[None]] | None = None,
         should_cancel: Callable[[], bool] | None = None,
         force: bool = False,
         voice_name: str = "Ethan",
-        emotion: str | None = None,
+        emotion: str = "neutral",
         speed: float = 1.0,
     ) -> dict[str, Any]:
         """
@@ -142,6 +154,8 @@ class AudiobookGenerator:
                     speed=speed,
                 )
                 generated_chapters += 1
+                if chapter_completed_callback is not None:
+                    await chapter_completed_callback(chapter)
 
                 if progress_callback is not None:
                     await progress_callback(chapter.number, ((chapter_index + 1) / len(chapters)) * 100)
@@ -195,7 +209,7 @@ class AudiobookGenerator:
         should_cancel: Callable[[], bool] | None = None,
         force: bool = False,
         voice_name: str = "Ethan",
-        emotion: str | None = None,
+        emotion: str = "neutral",
         speed: float = 1.0,
     ) -> float:
         """Generate and persist audio for a single chapter."""
@@ -215,23 +229,56 @@ class AudiobookGenerator:
             chapter.word_count or 0,
         )
 
+        chunks = TextChunker.chunk_text(text_content, engine.max_chunk_chars)
         chapter.status = ChapterStatus.GENERATING
         chapter.started_at = utc_now()
         chapter.completed_at = None
         chapter.error_message = None
+        chapter.current_chunk = 0
+        chapter.total_chunks = len(chunks)
+        chapter.chunk_boundaries = None
+        chapter.generation_metadata = None
         db_session.commit()
 
         try:
-            chunks = TextChunker.chunk_text(text_content, engine.max_chunk_chars)
             audio_chunks = []
             chapter_speed = speed * self._chapter_speed(chapter)
             manual_review_notes: list[str] = []
+            gate1_summary = {
+                "chunks_total": len(chunks),
+                "chunks_pass_first_attempt": 0,
+                "chunks_regenerated": 0,
+                "chunks_with_warnings": 0,
+                "chunks_failed_final": 0,
+                "validation_issue_chunks": 0,
+                "avg_wer": None,
+            }
+            wer_values: list[float] = []
+            watchlist_matches = self.pronunciation_watchlist.check_text(text_content)
+            if watchlist_matches:
+                watchlist_terms = ", ".join(match["word"] for match in watchlist_matches)
+                logger.warning(
+                    "Pronunciation watchlist flagged book %s chapter %s: %s",
+                    book_id,
+                    chapter.number,
+                    watchlist_terms,
+                )
+                manual_review_notes.extend(
+                    [
+                        (
+                            "Pronunciation watchlist: "
+                            f"{match['word']} -> {match['pronunciation_guide']}. "
+                            f"{match['context']}"
+                        )
+                        for match in watchlist_matches
+                    ]
+                )
 
             for chunk_index, chunk in enumerate(chunks):
                 self._raise_if_cancelled(should_cancel)
 
                 try:
-                    audio = await self._generate_chunk_with_retry(
+                    audio, validation_report, failed_validation, attempts_used = await self._generate_chunk_with_retry(
                         chunk,
                         chunk_index=chunk_index,
                         voice_name=voice_name,
@@ -240,11 +287,14 @@ class AudiobookGenerator:
                         chapter_number=chapter.number,
                         book_id=book_id,
                         should_cancel=should_cancel,
+                        expected_sample_rate=getattr(engine, "sample_rate", None),
                     )
                 except ChunkGenerationExhaustedError as exc:
                     note = (
                         f"Chunk {chunk_index} failed after 3 attempts and was skipped: {exc}"
                     )
+                    gate1_summary["chunks_failed_final"] += 1
+                    gate1_summary["validation_issue_chunks"] += 1
                     manual_review_notes.append(note)
                     logger.error(
                         "Skipping book %s chapter %s chunk %s after exhausted retries: %s",
@@ -255,7 +305,63 @@ class AudiobookGenerator:
                     )
                     continue
 
+                if attempts_used == 1 and not validation_report.issues:
+                    gate1_summary["chunks_pass_first_attempt"] += 1
+                if attempts_used > 1:
+                    gate1_summary["chunks_regenerated"] += 1
+
+                audio, pauses_trimmed = PauseTrimmer.trim_excessive_pauses(audio)
+                if pauses_trimmed > 0:
+                    logger.info(
+                        "Chunk %s for book %s chapter %s trimmed %s excessive pauses",
+                        chunk_index,
+                        book_id,
+                        chapter.number,
+                        pauses_trimmed,
+                    )
+
+                warning_messages = self._validation_messages(
+                    validation_report,
+                    minimum_severity=ValidationSeverity.WARNING,
+                )
+                fail_messages = self._validation_messages(
+                    validation_report,
+                    minimum_severity=ValidationSeverity.FAIL,
+                )
+
+                if warning_messages:
+                    gate1_summary["chunks_with_warnings"] += 1
+                    logger.warning(
+                        "Chunk %d validation issues for book %s ch %s: %s",
+                        chunk_index,
+                        book_id,
+                        chapter.number,
+                        "; ".join(warning_messages),
+                    )
+
+                if validation_report.issues:
+                    gate1_summary["validation_issue_chunks"] += 1
+
+                for result in validation_report.results:
+                    if result.check != "text_alignment" or not result.details:
+                        continue
+                    wer = result.details.get("wer")
+                    if isinstance(wer, (int, float)):
+                        wer_values.append(float(wer))
+
+                if failed_validation and fail_messages:
+                    gate1_summary["chunks_failed_final"] += 1
+                    manual_review_notes.append(
+                        f"Chunk {validation_report.chunk_index} FAILED: {'; '.join(fail_messages)}"
+                    )
+                elif warning_messages:
+                    manual_review_notes.append(
+                        f"Chunk {validation_report.chunk_index} validation warnings: {'; '.join(warning_messages)}"
+                    )
+
                 audio_chunks.append(audio)
+                chapter.current_chunk = chunk_index + 1
+                db_session.commit()
 
                 if progress_callback is not None:
                     await progress_callback((chunk_index + 1) / len(chunks))
@@ -266,7 +372,8 @@ class AudiobookGenerator:
                     f"Chapter {chapter.number} produced no valid audio chunks after retries."
                 )
 
-            final_audio = AudioStitcher.stitch(audio_chunks)
+            stitch_result = AudioStitcher.stitch_with_metadata(audio_chunks)
+            final_audio = stitch_result.audio
             audio_path = self._get_chapter_audio_path(book_id, chapter)
             audio_path.parent.mkdir(parents=True, exist_ok=True)
             await asyncio.to_thread(final_audio.export, str(audio_path), format="wav")
@@ -275,6 +382,12 @@ class AudiobookGenerator:
             chapter.audio_path = str(audio_path.relative_to(self.output_path))
             chapter.duration_seconds = duration
             chapter.status = ChapterStatus.GENERATED
+            chapter.current_chunk = len(chunks)
+            chapter.total_chunks = len(chunks)
+            chapter.chunk_boundaries = json.dumps(stitch_result.chunk_boundaries)
+            if wer_values:
+                gate1_summary["avg_wer"] = round(sum(wer_values) / len(wer_values), 4)
+            chapter.generation_metadata = json.dumps({"gate1": gate1_summary})
             chapter.completed_at = utc_now()
             chapter.audio_file_size_bytes = audio_path.stat().st_size
             db_session.commit()
@@ -310,12 +423,20 @@ class AudiobookGenerator:
             chapter.started_at = None
             chapter.completed_at = None
             chapter.error_message = None
+            chapter.current_chunk = None
+            chapter.total_chunks = None
+            chapter.chunk_boundaries = None
+            chapter.generation_metadata = None
             db_session.commit()
             raise
         except Exception as exc:
             chapter.status = ChapterStatus.FAILED
             chapter.completed_at = utc_now()
             chapter.error_message = str(exc)
+            chapter.current_chunk = None
+            chapter.total_chunks = None
+            chapter.chunk_boundaries = None
+            chapter.generation_metadata = None
             db_session.commit()
             raise
 
@@ -330,18 +451,19 @@ class AudiobookGenerator:
         chapter_number: int,
         book_id: int,
         should_cancel: Callable[[], bool] | None,
-    ) -> Any:
-        """Generate one chunk with retries for transient engine failures."""
+        expected_sample_rate: int | None,
+    ) -> tuple[Any, ChunkValidationReport, bool, int]:
+        """Generate and validate one chunk with retries for transient failures and hard QA failures."""
 
         max_attempts = len(self.retry_backoff_seconds) + 1
         for attempt in range(1, max_attempts + 1):
             self._raise_if_cancelled(should_cancel)
             try:
                 audio = await self._generate_chunk(
-                    text,
+                    self._vary_retry_text(text, attempt),
                     voice_name=voice_name,
                     emotion=emotion,
-                    speed=speed,
+                    speed=self._vary_retry_speed(speed, attempt),
                 )
             except PERMANENT_GENERATION_ERRORS:
                 raise
@@ -369,31 +491,42 @@ class AudiobookGenerator:
                 await asyncio.sleep(backoff)
                 continue
 
-            try:
-                self._validate_chunk(audio, chunk_index, text)
-                return audio
-            except ValueError as exc:
-                if attempt >= max_attempts:
-                    logger.error(
-                        "Chunk validation exhausted retries for book %s chapter %s chunk %s: %s",
-                        book_id,
-                        chapter_number,
-                        chunk_index,
-                        exc,
-                    )
-                    raise ChunkGenerationExhaustedError(str(exc)) from exc
-
-                backoff = self.retry_backoff_seconds[attempt - 1]
+            validation_report = self.chunk_validator.validate(
+                audio,
+                text,
+                voice_name,
+                speed,
+                chunk_index=chunk_index,
+                expected_sample_rate=expected_sample_rate,
+            )
+            if validation_report.needs_regeneration and attempt < max_attempts:
                 logger.warning(
-                    "Retrying generation for book %s chapter %s chunk %s after validation failure (%s/%s): %s",
+                    "Chunk %s for book %s chapter %s failed validation, regenerating (%s/%s): %s",
+                    chunk_index,
                     book_id,
                     chapter_number,
-                    chunk_index,
-                    attempt,
+                    attempt + 1,
                     max_attempts,
-                    exc,
+                    "; ".join(
+                        self._validation_messages(
+                            validation_report,
+                            minimum_severity=ValidationSeverity.FAIL,
+                        )
+                    ),
                 )
-                await asyncio.sleep(backoff)
+                continue
+
+            if validation_report.needs_regeneration:
+                logger.error(
+                    "Chunk %s for book %s chapter %s failed validation after %s attempts, marking for manual review",
+                    chunk_index,
+                    book_id,
+                    chapter_number,
+                    max_attempts,
+                )
+                return (audio, validation_report, True, attempt)
+
+            return (audio, validation_report, False, attempt)
 
         raise RuntimeError("Chunk generation retry loop exited unexpectedly.")
 
@@ -425,35 +558,46 @@ class AudiobookGenerator:
             self.model_manager.record_chunk(asyncio.get_running_loop().time() - started_at)
         return audio
 
-    def _validate_chunk(self, chunk: AudioSegment, chunk_index: int, expected_text: str) -> None:
-        """Validate one generated chunk before it is stitched into a chapter."""
-
-        if len(chunk) < 100:
-            raise ValueError(f"Chunk {chunk_index} too short: {len(chunk)}ms (min 100ms)")
-        if len(chunk) > 120_000:
-            raise ValueError(f"Chunk {chunk_index} too long: {len(chunk)}ms (max 120s)")
-        if chunk.dBFS < -55:
-            raise ValueError(f"Chunk {chunk_index} is nearly silent: {chunk.dBFS:.1f} dBFS")
-        if chunk.max_dBFS > -0.1:
-            raise ValueError(f"Chunk {chunk_index} is clipping: peak {chunk.max_dBFS:.1f} dBFS")
-
-        word_count = len(expected_text.split())
-        if word_count > 3:
-            expected_max_ms = int((word_count / 0.5) * 1000)
-            if len(chunk) > expected_max_ms:
-                raise ValueError(
-                    f"Chunk {chunk_index} duration {len(chunk)}ms is disproportionate "
-                    f"to text length ({word_count} words)"
-                )
-
     def _flag_manual_review(self, chapter: Chapter, notes: list[str]) -> None:
-        """Mark chapters with skipped chunks for manual QA review."""
+        """Mark chapters with generation warnings for manual QA review."""
 
         if not notes:
             return
 
         chapter.qa_status = QAStatus.NEEDS_REVIEW
-        chapter.qa_notes = "\n".join(notes)
+        existing_notes = (chapter.qa_notes or "").strip()
+        next_notes = "\n".join(notes)
+        chapter.qa_notes = next_notes if not existing_notes else f"{existing_notes}\n{next_notes}"
+
+    def _validation_messages(
+        self,
+        report: ChunkValidationReport,
+        *,
+        minimum_severity: ValidationSeverity,
+    ) -> list[str]:
+        """Return formatted validation messages at or above the requested severity."""
+
+        return [
+            f"{result.check}: {result.message}"
+            for result in report.results
+            if SEVERITY_ORDER[result.severity] >= SEVERITY_ORDER[minimum_severity]
+        ]
+
+    def _vary_retry_speed(self, speed: float, attempt: int) -> float:
+        """Apply a tiny speed variation on retries to avoid identical outputs."""
+
+        if attempt <= 1:
+            return speed
+
+        variation = 0.02 * (1 if attempt % 2 == 0 else -1)
+        return max(0.5, min(2.0, speed + variation))
+
+    def _vary_retry_text(self, text: str, attempt: int) -> str:
+        """Apply a tiny textual perturbation on retries to diversify generation."""
+
+        if attempt <= 1:
+            return text
+        return f"{text}{' ' * (attempt - 1)}"
 
     async def _get_engine(self) -> TTSEngine:
         """Return the active engine, loading it lazily when needed."""

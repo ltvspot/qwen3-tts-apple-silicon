@@ -24,6 +24,48 @@ function createClonedVoicesPayload(clonedVoices) {
   };
 }
 
+function createDeferredResponse() {
+  let resolve;
+
+  return {
+    promise: new Promise((resolver) => {
+      resolve = resolver;
+    }),
+    resolve,
+  };
+}
+
+class MockXMLHttpRequest {
+  static latest = null;
+  static onSend = null;
+
+  constructor() {
+    this.open = jest.fn();
+    this.send = jest.fn((body) => {
+      const formData = body;
+      MockXMLHttpRequest.onSend?.(formData);
+      expect(formData.get("voice_name")).toBe("kent-zimering");
+      expect(formData.get("display_name")).toBe("Kent Zimering Clone");
+      expect(formData.get("transcript")).toBe("This is the exact reference transcript.");
+      expect(formData.get("notes")).toBe("Clean studio sample.");
+      expect(formData.get("reference_audio").name).toBe("kent.wav");
+
+      this.status = 200;
+      this.response = {
+        audio_duration_seconds: 2.5,
+        display_name: "Kent Zimering Clone",
+        message: "Voice cloned successfully",
+        success: true,
+        voice_name: "kent-zimering",
+      };
+      this.responseText = JSON.stringify(this.response);
+      this.onload?.();
+    });
+    this.upload = {};
+    MockXMLHttpRequest.latest = this;
+  }
+}
+
 function getButtonByText(container, label) {
   return Array.from(container.querySelectorAll("button")).find((button) =>
     button.textContent.includes(label),
@@ -71,6 +113,7 @@ describe("VoiceLab page", () => {
   let confirmMock;
   let container;
   let fetchMock;
+  let originalXHR;
   let promptMock;
   let root;
 
@@ -83,6 +126,7 @@ describe("VoiceLab page", () => {
 
     fetchMock = jest.fn();
     global.fetch = fetchMock;
+    originalXHR = global.XMLHttpRequest;
 
     window.localStorage.clear();
     confirmMock = jest.spyOn(window, "confirm").mockReturnValue(true);
@@ -100,6 +144,7 @@ describe("VoiceLab page", () => {
 
     container.remove();
     delete global.fetch;
+    global.XMLHttpRequest = originalXHR;
   });
 
   async function renderVoiceLab() {
@@ -340,55 +385,49 @@ describe("VoiceLab page", () => {
   });
 
   test("clones a voice, refreshes the clone list, and exposes it in the audition selector", async () => {
+    global.XMLHttpRequest = MockXMLHttpRequest;
     const voicePayload = createVoiceListPayload([
       { display_name: "Ethan", is_cloned: false, name: "Ethan" },
       { display_name: "Nova", is_cloned: false, name: "Nova" },
     ]);
     const clonedVoices = [];
+    let cloneCreated = false;
+    MockXMLHttpRequest.onSend = () => {
+      cloneCreated = true;
+    };
 
     fetchMock.mockImplementation((url, options = {}) => {
       if (url === "/api/voice-lab/voices") {
+        if (cloneCreated && !voicePayload.voices.some((voice) => voice.name === "kent-zimering")) {
+          voicePayload.voices = [
+            ...voicePayload.voices,
+            { display_name: "Kent Zimering Clone", is_cloned: true, name: "kent-zimering" },
+          ];
+        }
         return Promise.resolve(createJsonResponse(voicePayload));
       }
 
       if (url === "/api/voice-lab/cloned-voices") {
+        if (cloneCreated && clonedVoices.length === 0) {
+          clonedVoices.splice(0, clonedVoices.length, {
+            audio_duration_seconds: 2.5,
+            created_at: "2026-03-24T00:00:00+00:00",
+            created_by: "Tim",
+            display_name: "Kent Zimering Clone",
+            is_enabled: true,
+            notes: "Clean studio sample.",
+            voice_name: "kent-zimering",
+          });
+        }
         return Promise.resolve(createJsonResponse(createClonedVoicesPayload(clonedVoices)));
       }
 
       if (url === "/api/voice-lab/clone") {
-        const formData = options.body;
-        expect(formData.get("voice_name")).toBe("kent-zimering");
-        expect(formData.get("display_name")).toBe("Kent Zimering Clone");
-        expect(formData.get("transcript")).toBe("This is the exact reference transcript.");
-        expect(formData.get("notes")).toBe("Clean studio sample.");
-        expect(formData.get("reference_audio").name).toBe("kent.wav");
-
-        voicePayload.voices = [
-          ...voicePayload.voices,
-          { display_name: "Kent Zimering Clone", is_cloned: true, name: "kent-zimering" },
-        ];
-        clonedVoices.splice(0, clonedVoices.length, {
-          audio_duration_seconds: 2.5,
-          created_at: "2026-03-24T00:00:00+00:00",
-          created_by: "Tim",
-          display_name: "Kent Zimering Clone",
-          is_enabled: true,
-          notes: "Clean studio sample.",
-          voice_name: "kent-zimering",
-        });
-
-        return Promise.resolve(
-          createJsonResponse({
-            audio_duration_seconds: 2.5,
-            display_name: "Kent Zimering Clone",
-            message: "Voice cloned successfully",
-            success: true,
-            voice_name: "kent-zimering",
-          }),
-        );
+        throw new Error("Clone requests should use XMLHttpRequest.");
       }
 
       if (url === "/api/voice-lab/cloned-voices/kent-zimering") {
+        cloneCreated = false;
         voicePayload.voices = voicePayload.voices.filter((voice) => voice.name !== "kent-zimering");
         clonedVoices.splice(0, clonedVoices.length);
         return Promise.resolve(
@@ -496,5 +535,122 @@ describe("VoiceLab page", () => {
     });
 
     expect(window.confirm).toHaveBeenCalledWith('Delete voice "kent-zimering"?');
+    MockXMLHttpRequest.onSend = null;
+  });
+
+  test("shows a preview heartbeat during generation and hides it after completion", async () => {
+    jest.useFakeTimers();
+    const deferredPreview = createDeferredResponse();
+
+    fetchMock.mockImplementation((url) => {
+      if (url === "/api/voice-lab/voices") {
+        return Promise.resolve(
+          createJsonResponse(
+            createVoiceListPayload([
+              { display_name: "Ethan", is_cloned: false, name: "Ethan" },
+            ]),
+          ),
+        );
+      }
+
+      if (url === "/api/voice-lab/cloned-voices") {
+        return Promise.resolve(createJsonResponse(createClonedVoicesPayload([])));
+      }
+
+      if (url === "/api/voice-lab/test") {
+        return deferredPreview.promise;
+      }
+
+      throw new Error(`Unhandled fetch: ${url}`);
+    });
+
+    await renderVoiceLab();
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain("1 available voice");
+
+    await act(async () => {
+      getButtonByText(container, "Generate Preview").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+    });
+
+    expect(container.textContent).toContain("Synthesizing audio...");
+    expect(container.textContent).toContain("Elapsed:");
+
+    await act(async () => {
+      jest.advanceTimersByTime(1500);
+      await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain("Processing...");
+
+    await act(async () => {
+      deferredPreview.resolve(
+        createJsonResponse({
+          audio_url: "/audio/voices/heartbeat.wav",
+          duration_seconds: 2.8,
+        }),
+      );
+      await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain("Generated Preview");
+    expect(container.textContent).not.toContain("Synthesizing audio...");
+
+    jest.useRealTimers();
+  });
+
+  test("retries voice loading when the engine reports loading state", async () => {
+    jest.useFakeTimers();
+    let voiceRequests = 0;
+
+    fetchMock.mockImplementation((url) => {
+      if (url === "/api/voice-lab/voices") {
+        voiceRequests += 1;
+        if (voiceRequests === 1) {
+          return Promise.resolve(createJsonResponse({
+            engine: "qwen3_tts",
+            loading: true,
+            message: "TTS engine is loading. Voices will be available shortly.",
+            voices: [],
+          }));
+        }
+
+        return Promise.resolve(
+          createJsonResponse(
+            createVoiceListPayload([
+              { display_name: "Ethan", is_cloned: false, name: "Ethan" },
+              { display_name: "Nova", is_cloned: false, name: "Nova" },
+            ]),
+          ),
+        );
+      }
+
+      if (url === "/api/voice-lab/cloned-voices") {
+        return Promise.resolve(createJsonResponse(createClonedVoicesPayload([])));
+      }
+
+      throw new Error(`Unhandled fetch: ${url}`);
+    });
+
+    await renderVoiceLab();
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain("retrying in 3s (attempt 1/20)");
+
+    await act(async () => {
+      jest.advanceTimersByTime(3000);
+      await Promise.resolve();
+    });
+
+    expect(container.textContent).toContain("2 available voices");
+
+    expect(voiceRequests).toBe(2);
+    jest.useRealTimers();
   });
 });

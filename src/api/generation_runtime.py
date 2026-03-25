@@ -67,6 +67,12 @@ def get_queue() -> GenerationQueue:
     return _queue
 
 
+def peek_queue() -> GenerationQueue | None:
+    """Return the existing generation queue singleton without constructing one."""
+
+    return _queue
+
+
 def get_resource_monitor() -> ResourceMonitor:
     """Return the shared resource monitor for the output volume."""
 

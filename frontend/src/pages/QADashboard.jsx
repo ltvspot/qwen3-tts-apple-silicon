@@ -125,6 +125,7 @@ export default function QADashboard() {
   const requestRef = useRef(0);
 
   const [actionError, setActionError] = useState("");
+  const [actionMessage, setActionMessage] = useState("");
   const [actionPendingId, setActionPendingId] = useState(null);
   const [dashboard, setDashboard] = useState({ books_needing_review: [], summary: null });
   const [errorMessage, setErrorMessage] = useState("");
@@ -214,6 +215,7 @@ export default function QADashboard() {
     const actionId = `${chapter.book_id}-${chapter.chapter_n}`;
     setActionPendingId(actionId);
     setActionError("");
+    setActionMessage("");
 
     try {
       const response = await fetch(`/api/book/${chapter.book_id}/chapter/${chapter.chapter_n}/qa`, {
@@ -257,6 +259,42 @@ export default function QADashboard() {
     if (saved && mountedRef.current) {
       setFlagChapter(null);
       setFlagNotes("");
+    }
+  }
+
+  async function handleApproveAllPassing(book) {
+    const actionId = `book-${book.book_id}-approve-all`;
+    setActionPendingId(actionId);
+    setActionError("");
+    setActionMessage("");
+
+    try {
+      const response = await fetch(`/api/book/${book.book_id}/approve-all-passing`, {
+        method: "POST",
+      });
+      if (!response.ok) {
+        throw new Error("Unable to approve all passing chapters for this book.");
+      }
+
+      const payload = await response.json();
+      if (!mountedRef.current) {
+        return;
+      }
+
+      setActionMessage(
+        `Approved ${payload.approved} passing chapter${payload.approved === 1 ? "" : "s"} for ${book.book_title}.`,
+      );
+      await loadDashboard({ showLoading: false });
+    } catch (error) {
+      if (mountedRef.current) {
+        setActionError(
+          error instanceof Error ? error.message : "Unable to approve all passing chapters.",
+        );
+      }
+    } finally {
+      if (mountedRef.current) {
+        setActionPendingId(null);
+      }
     }
   }
 
@@ -339,6 +377,11 @@ export default function QADashboard() {
             {errorMessage}
           </div>
         ) : null}
+        {actionMessage ? (
+          <div className="rounded-3xl border border-emerald-200 bg-emerald-50 px-5 py-4 text-sm text-emerald-800">
+            {actionMessage}
+          </div>
+        ) : null}
         {actionError ? (
           <div className="rounded-3xl border border-rose-200 bg-rose-50 px-5 py-4 text-sm text-rose-700">
             {actionError}
@@ -388,15 +431,29 @@ export default function QADashboard() {
                           <QAStatusBadge label={`${book.chapters_pending_manual} pending`} status="pending" />
                         </div>
 
-                        <button
-                          className="inline-flex items-center justify-center rounded-full border border-slate-200 px-5 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-slate-700 transition hover:border-slate-300 hover:text-slate-950"
-                          onClick={() =>
-                            setExpandedBookId((current) => (current === book.book_id ? null : book.book_id))
-                          }
-                          type="button"
-                        >
-                          {expanded ? "Hide Chapters" : "Review Chapters"}
-                        </button>
+                        <div className="flex flex-wrap justify-end gap-2">
+                          <button
+                            className="inline-flex items-center justify-center rounded-full border border-emerald-200 bg-emerald-50 px-5 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-emerald-800 transition hover:bg-emerald-100 disabled:cursor-not-allowed disabled:opacity-60"
+                            disabled={book.chapters_pass === 0 || actionPendingId === `book-${book.book_id}-approve-all`}
+                            onClick={() => {
+                              void handleApproveAllPassing(book);
+                            }}
+                            type="button"
+                          >
+                            {actionPendingId === `book-${book.book_id}-approve-all`
+                              ? "Approving..."
+                              : "Approve All Passing"}
+                          </button>
+                          <button
+                            className="inline-flex items-center justify-center rounded-full border border-slate-200 px-5 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-slate-700 transition hover:border-slate-300 hover:text-slate-950"
+                            onClick={() =>
+                              setExpandedBookId((current) => (current === book.book_id ? null : book.book_id))
+                            }
+                            type="button"
+                          >
+                            {expanded ? "Hide Chapters" : "Review Chapters"}
+                          </button>
+                        </div>
                       </div>
                     </div>
 
