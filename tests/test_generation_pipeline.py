@@ -16,6 +16,7 @@ from src.database import (
     Book,
     BookStatus,
     Chapter,
+    ChapterQARecord,
     ChapterStatus,
     ChapterType,
     GenerationJob,
@@ -162,6 +163,13 @@ async def test_generate_chapter_writes_audio_and_metadata(test_db: Session) -> N
     audio_file = Path(settings.OUTPUTS_PATH) / chapter.audio_path
     assert audio_file.exists()
     assert audio_file.stat().st_size > 0
+
+    qa_record = (
+        test_db.query(ChapterQARecord)
+        .filter(ChapterQARecord.book_id == book.id, ChapterQARecord.chapter_n == chapter.number)
+        .first()
+    )
+    assert qa_record is not None
 
 
 @pytest.mark.asyncio

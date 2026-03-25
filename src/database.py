@@ -15,6 +15,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     create_engine,
     inspect,
     text,
@@ -81,6 +82,21 @@ class QAStatus(str, Enum):
     NOT_REVIEWED = "not_reviewed"
     NEEDS_REVIEW = "needs_review"
     APPROVED = "approved"
+
+
+class QAAutomaticStatus(str, Enum):
+    """Automatic QA outcomes produced by audio analysis."""
+
+    PASS = "pass"
+    WARNING = "warning"
+    FAIL = "fail"
+
+
+class QAManualStatus(str, Enum):
+    """Manual QA review decisions stored per chapter."""
+
+    APPROVED = "approved"
+    FLAGGED = "flagged"
 
 
 class GenerationJobStatus(str, Enum):
@@ -194,6 +210,34 @@ class Chapter(Base):
 
     book: Mapped["Book"] = relationship(back_populates="chapters")
     generation_jobs: Mapped[list["GenerationJob"]] = relationship(back_populates="chapter")
+
+
+class ChapterQARecord(Base):
+    """Automatic and manual QA details for a generated chapter."""
+
+    __tablename__ = "qa_status"
+    __table_args__ = (
+        UniqueConstraint("book_id", "chapter_n", name="uq_qa_status_book_chapter"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    book_id: Mapped[int] = mapped_column(ForeignKey("books.id"), nullable=False, index=True)
+    chapter_n: Mapped[int] = mapped_column(Integer, nullable=False)
+    overall_status: Mapped[QAAutomaticStatus] = mapped_column(
+        SqlEnum(QAAutomaticStatus, native_enum=False, validate_strings=True),
+        nullable=False,
+    )
+    qa_details: Mapped[str] = mapped_column(Text, nullable=False)
+    manual_status: Mapped[QAManualStatus | None] = mapped_column(
+        SqlEnum(QAManualStatus, native_enum=False, validate_strings=True),
+        nullable=True,
+    )
+    manual_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    manual_reviewed_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    manual_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+
+    book: Mapped["Book"] = relationship()
 
 
 class VoicePreset(Base):

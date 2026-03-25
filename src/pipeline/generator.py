@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session, selectinload
 from src.config import settings
 from src.database import Book, BookGenerationStatus, BookStatus, Chapter, ChapterStatus, ChapterType, utc_now
 from src.engines import AudioStitcher, TTSEngine, TextChunker
+from src.pipeline.qa_checker import persist_qa_result, run_qa_checks_for_chapter
 
 logger = logging.getLogger(__name__)
 
@@ -230,6 +231,18 @@ class AudiobookGenerator:
             chapter.completed_at = utc_now()
             chapter.audio_file_size_bytes = audio_path.stat().st_size
             db_session.commit()
+
+            try:
+                qa_result = await run_qa_checks_for_chapter(chapter)
+                persist_qa_result(db_session, chapter, qa_result)
+                db_session.commit()
+            except Exception:
+                db_session.rollback()
+                logger.exception(
+                    "Automatic QA failed for book %s chapter %s after successful generation",
+                    book_id,
+                    chapter.number,
+                )
 
             logger.info(
                 "Generated book %s chapter %s -> %s (%.2fs)",
