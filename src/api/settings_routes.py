@@ -9,6 +9,7 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ValidationError
 
 from src.config import ApplicationSettings, get_settings_manager, settings
+from src.engines.voice_cloner import VoiceCloner
 from src.engines.qwen3_tts import VOICE_PRESETS
 
 router = APIRouter(prefix="/api", tags=["settings"])
@@ -27,11 +28,9 @@ def _discover_voice_names() -> list[str]:
     """Return the known selectable voice names for the settings schema."""
 
     discovered = list(VOICE_PRESETS.keys())
-    voices_root = Path(settings.VOICES_PATH).resolve()
-    if voices_root.exists():
-        for path in sorted(voices_root.iterdir()):
-            if path.is_dir() and path.name not in discovered:
-                discovered.append(path.name)
+    for voice_name in VoiceCloner(Path(settings.VOICES_PATH)).list_cloned_voices():
+        if voice_name not in discovered:
+            discovered.append(voice_name)
     return discovered
 
 

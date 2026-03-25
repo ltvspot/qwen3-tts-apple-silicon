@@ -1,6 +1,5 @@
 import React, { useEffect, useState } from "react";
-
-const DEFAULT_VOICES = ["Ethan", "Nova", "Aria"];
+import VoiceSelector from "./VoiceSelector";
 
 const EMOTION_PRESETS = [
   "neutral",
@@ -56,15 +55,22 @@ function getChapterSummary(selectedChapter) {
     : `Chapter ${selectedChapter.number}`;
 }
 
-export default function NarrationSettings({ onChange, selectedChapter, settings }) {
+export default function NarrationSettings({
+  loadingVoices = false,
+  onChange,
+  selectedChapter,
+  settings,
+  voices = [],
+}) {
   const [customEmotion, setCustomEmotion] = useState(settings.emotion ?? "");
-  const [loading, setLoading] = useState(true);
-  const [voices, setVoices] = useState([]);
 
-  useEffect(() => {
-    setVoices(DEFAULT_VOICES);
-    setLoading(false);
-  }, []);
+  const availableVoices = voices.length > 0
+    ? voices
+    : [
+        { name: "Ethan", display_name: "Ethan", is_cloned: false },
+        { name: "Nova", display_name: "Nova", is_cloned: false },
+        { name: "Aria", display_name: "Aria", is_cloned: false },
+      ];
 
   useEffect(() => {
     setCustomEmotion(settings.emotion ?? "");
@@ -139,21 +145,18 @@ export default function NarrationSettings({ onChange, selectedChapter, settings 
           <label className="block text-sm font-semibold text-white" htmlFor="voice-select">
             Voice
           </label>
-          {loading ? (
+          {loadingVoices ? (
             <div className="mt-3 text-sm text-slate-400">Loading voices...</div>
           ) : (
-            <select
+            <VoiceSelector
+              ariaLabel="Narration voice"
               className="mt-3 w-full rounded-2xl border border-white/10 bg-slate-950/55 px-4 py-3 text-sm text-white outline-none transition focus:border-sky-300/40"
+              emptyLabel="No voices available"
               id="voice-select"
-              onChange={(event) => handleVoiceChange(event.target.value)}
+              onChange={handleVoiceChange}
               value={settings.voice}
-            >
-              {voices.map((voice) => (
-                <option key={voice} value={voice}>
-                  {voice}
-                </option>
-              ))}
-            </select>
+              voices={availableVoices}
+            />
           )}
         </div>
 
@@ -201,17 +204,17 @@ export default function NarrationSettings({ onChange, selectedChapter, settings 
           <input
             className="mt-4 w-full accent-amber-300"
             id="speed-range"
-            max="1.3"
-            min="0.8"
+            max="2.0"
+            min="0.5"
             onChange={(event) => handleSpeedChange(event.target.value)}
             step="0.05"
             type="range"
             value={settings.speed}
           />
           <div className="mt-2 flex justify-between text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
-            <span>0.8x</span>
+            <span>0.5x</span>
             <span>1.0x</span>
-            <span>1.3x</span>
+            <span>2.0x</span>
           </div>
         </div>
 

@@ -11,6 +11,7 @@ from src.database import (
     Chapter,
     ChapterStatus,
     ChapterType,
+    ClonedVoice,
     ExportJob,
     GenerationJob,
     GenerationJobStatus,
@@ -26,6 +27,7 @@ def test_database_schema_and_basic_crud(test_db: Session) -> None:
     assert set(inspector.get_table_names()) == {
         "books",
         "chapters",
+        "cloned_voices",
         "export_jobs",
         "generation_jobs",
         "job_history",
@@ -85,6 +87,7 @@ def test_database_schema_and_basic_crud(test_db: Session) -> None:
 
     stored_book = test_db.query(Book).one()
     stored_chapter = test_db.query(Chapter).one()
+    stored_cloned_voices = test_db.query(ClonedVoice).count()
     stored_export_jobs = test_db.query(ExportJob).count()
     stored_app_settings = test_db.query(AppSetting).count()
     stored_voice_preset = test_db.query(VoicePreset).one()
@@ -94,6 +97,7 @@ def test_database_schema_and_basic_crud(test_db: Session) -> None:
     assert stored_book.narrator == "Kent Zimering"
     assert stored_book.status == "not_started"
     assert stored_book.export_status == "idle"
+    assert stored_cloned_voices == 0
     assert stored_export_jobs == 0
     assert stored_app_settings == 0
     assert stored_chapter.book_id == stored_book.id

@@ -93,6 +93,18 @@ function createExportSnapshot(overrides = {}) {
   };
 }
 
+function createVoiceListPayload(overrides = {}) {
+  return {
+    engine: "qwen3_tts",
+    voices: [
+      { display_name: "Ethan", is_cloned: false, name: "Ethan" },
+      { display_name: "Nova", is_cloned: false, name: "Nova" },
+      { display_name: "Aria", is_cloned: false, name: "Aria" },
+    ],
+    ...overrides,
+  };
+}
+
 async function waitFor(assertion, timeout = 2000) {
   const startTime = Date.now();
 
@@ -197,7 +209,8 @@ describe("BookDetail page", () => {
       .mockResolvedValueOnce(createJsonResponse(book))
       .mockResolvedValueOnce(createJsonResponse(chapters))
       .mockResolvedValueOnce(createJsonResponse(createStatusSnapshot()))
-      .mockResolvedValueOnce(createJsonResponse(createExportSnapshot()));
+      .mockResolvedValueOnce(createJsonResponse(createExportSnapshot()))
+      .mockResolvedValueOnce(createJsonResponse(createVoiceListPayload()));
 
     await renderBookDetail();
 
@@ -210,6 +223,7 @@ describe("BookDetail page", () => {
     expect(fetchMock.mock.calls[1][0]).toBe("/api/book/7/chapters");
     expect(fetchMock.mock.calls[2][0]).toBe("/api/book/7/status");
     expect(fetchMock.mock.calls[3][0]).toBe("/api/book/7/export/status");
+    expect(fetchMock.mock.calls[4][0]).toBe("/api/voice-lab/voices");
     expect(container.textContent).toContain("A Test Story");
     expect(container.textContent).toContain("Jane Doe");
     expect(container.textContent).toContain("Narrated by Kent Zimering");
@@ -248,6 +262,7 @@ describe("BookDetail page", () => {
       .mockResolvedValueOnce(createJsonResponse(chapters))
       .mockResolvedValueOnce(createJsonResponse(createStatusSnapshot()))
       .mockResolvedValueOnce(createJsonResponse(createExportSnapshot()))
+      .mockResolvedValueOnce(createJsonResponse(createVoiceListPayload()))
       .mockResolvedValueOnce(createJsonResponse(updatedChapter));
 
     await renderBookDetail();
@@ -280,19 +295,19 @@ describe("BookDetail page", () => {
     });
 
     await waitFor(() => {
-      expect(fetchMock).toHaveBeenCalledTimes(5);
+      expect(fetchMock).toHaveBeenCalledTimes(6);
       expect(container.textContent).toContain(updatedChapter.text_content);
       expect(container.textContent).toContain("6 words");
     });
 
-    expect(fetchMock.mock.calls[4][0]).toBe("/api/book/7/chapter/2/text");
-    expect(fetchMock.mock.calls[4][1]).toMatchObject({
+    expect(fetchMock.mock.calls[5][0]).toBe("/api/book/7/chapter/2/text");
+    expect(fetchMock.mock.calls[5][1]).toMatchObject({
       method: "PUT",
       headers: {
         "Content-Type": "application/json",
       },
     });
-    expect(fetchMock.mock.calls[4][1].body).toBe(
+    expect(fetchMock.mock.calls[5][1].body).toBe(
       JSON.stringify({ text_content: updatedChapter.text_content }),
     );
   });
@@ -315,13 +330,30 @@ describe("BookDetail page", () => {
       .mockResolvedValueOnce(createJsonResponse(book))
       .mockResolvedValueOnce(createJsonResponse(chapters))
       .mockResolvedValueOnce(createJsonResponse(createStatusSnapshot()))
-      .mockResolvedValueOnce(createJsonResponse(createExportSnapshot()));
+      .mockResolvedValueOnce(createJsonResponse(createExportSnapshot()))
+      .mockResolvedValueOnce(
+        createJsonResponse(
+          createVoiceListPayload({
+            voices: [
+              { display_name: "Ethan", is_cloned: false, name: "Ethan" },
+              { display_name: "Kent Zimering Clone", is_cloned: true, name: "kent-zimering" },
+            ],
+          }),
+        ),
+      );
 
     await renderBookDetail();
 
     await waitFor(() => {
       expect(container.textContent).toContain("Opening credits text.");
     });
+
+    const voiceSelect = container.querySelector('select[aria-label="Narration voice"]');
+    await act(async () => {
+      setFormValue(voiceSelect, "kent-zimering", "change");
+    });
+
+    expect(voiceSelect.value).toBe("kent-zimering");
 
     await act(async () => {
       getButtonByText("Dramatic Reading").dispatchEvent(new MouseEvent("click", { bubbles: true }));
@@ -363,6 +395,7 @@ describe("BookDetail page", () => {
     });
 
     expect(emotionInput.value).toBe("dramatic");
+    expect(voiceSelect.value).toBe("kent-zimering");
   });
 
   test("renders a not-found state when the book record is missing", async () => {
@@ -403,6 +436,7 @@ describe("BookDetail page", () => {
       .mockResolvedValueOnce(createJsonResponse(chapters))
       .mockResolvedValueOnce(createJsonResponse(createStatusSnapshot()))
       .mockResolvedValueOnce(createJsonResponse(createExportSnapshot()))
+      .mockResolvedValueOnce(createJsonResponse(createVoiceListPayload()))
       .mockResolvedValueOnce(createJsonResponse({
         book_id: 7,
         job_id: 91,
@@ -511,6 +545,7 @@ describe("BookDetail page", () => {
       .mockResolvedValueOnce(createJsonResponse(chapters))
       .mockResolvedValueOnce(createJsonResponse(statusSnapshot))
       .mockResolvedValueOnce(createJsonResponse(createExportSnapshot()))
+      .mockResolvedValueOnce(createJsonResponse(createVoiceListPayload()))
       .mockResolvedValueOnce(createJsonResponse({
         book_id: 7,
         export_status: "processing",
@@ -601,7 +636,8 @@ describe("BookDetail page", () => {
       .mockResolvedValueOnce(createJsonResponse(book))
       .mockResolvedValueOnce(createJsonResponse(chapters))
       .mockResolvedValueOnce(createJsonResponse(statusSnapshot))
-      .mockResolvedValueOnce(createJsonResponse(createExportSnapshot()));
+      .mockResolvedValueOnce(createJsonResponse(createExportSnapshot()))
+      .mockResolvedValueOnce(createJsonResponse(createVoiceListPayload()));
 
     await renderBookDetail();
 

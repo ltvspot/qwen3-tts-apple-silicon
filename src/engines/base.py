@@ -13,8 +13,10 @@ class Voice:
     """Represents a TTS voice exposed by an engine."""
 
     name: str
+    display_name: str | None = None
     description: str | None = None
     language: str = "en-US"
+    is_cloned: bool = False
 
 
 @dataclass(slots=True)

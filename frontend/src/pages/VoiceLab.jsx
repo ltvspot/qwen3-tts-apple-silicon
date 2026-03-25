@@ -1,7 +1,10 @@
 import React, { useEffect, useState } from "react";
 import AppShell from "../components/AppShell";
 import AudioPlayer from "../components/AudioPlayer";
+import ClonedVoicesList from "../components/ClonedVoicesList";
+import VoiceCloneForm from "../components/VoiceCloneForm";
 import VoicePresetManager from "../components/VoicePresetManager";
+import VoiceSelector from "../components/VoiceSelector";
 
 const DEFAULT_TEST_TEXT = "This is the Alexandria Audiobook Narrator. Test your voice settings here with any text you like.";
 const EMOTION_PRESETS = ["neutral", "warm", "dramatic", "energetic", "contemplative", "authoritative"];
@@ -33,6 +36,14 @@ function writeStoredPresets(presets) {
   }
 
   window.localStorage.setItem(PRESET_STORAGE_KEY, JSON.stringify(presets));
+}
+
+function selectVoiceValue(voices, currentVoice, fallbackIndex = 0) {
+  if (voices.some((voiceOption) => voiceOption.name === currentVoice)) {
+    return currentVoice;
+  }
+
+  return voices[fallbackIndex]?.name ?? voices[0]?.name ?? "";
 }
 
 function VoiceControls({
@@ -73,24 +84,16 @@ function VoiceControls({
           <label className="block text-sm font-semibold text-slate-900" htmlFor={`${fieldKey}-voice`}>
             Voice
           </label>
-          <select
-            aria-label={label === "Voice A" ? "Primary voice" : "Compare voice"}
+          <VoiceSelector
+            ariaLabel={label === "Voice A" ? "Primary voice" : "Compare voice"}
             className="mt-2 w-full rounded-2xl border border-slate-300 bg-slate-50 px-4 py-3 text-slate-900 outline-none transition focus:border-slate-950 focus:bg-white"
-            disabled={loadingVoices || voices.length === 0}
+            disabled={loadingVoices}
+            emptyLabel="No voices available"
             id={`${fieldKey}-voice`}
-            onChange={(event) => onVoiceChange(event.target.value)}
-            value={voices.length === 0 ? "" : voice}
-          >
-            {voices.length === 0 ? (
-              <option value="">No voices available</option>
-            ) : (
-              voices.map((voiceOption) => (
-                <option key={voiceOption.name} value={voiceOption.name}>
-                  {voiceOption.name}
-                </option>
-              ))
-            )}
-          </select>
+            onChange={onVoiceChange}
+            value={voice}
+            voices={voices}
+          />
         </div>
 
         <div>
@@ -135,17 +138,17 @@ function VoiceControls({
             aria-label={label === "Voice A" ? "Primary speed" : "Compare speed"}
             className="mt-3 w-full accent-slate-950"
             id={`${fieldKey}-speed`}
-            max="1.3"
-            min="0.8"
+            max="2.0"
+            min="0.5"
             onChange={(event) => onSpeedChange(Number.parseFloat(event.target.value))}
             step="0.05"
             type="range"
             value={speed}
           />
           <div className="mt-2 flex justify-between text-xs font-medium uppercase tracking-[0.14em] text-slate-500">
-            <span>0.8x</span>
+            <span>0.5x</span>
             <span>1.0x</span>
-            <span>1.3x</span>
+            <span>2.0x</span>
           </div>
         </div>
 
@@ -175,16 +178,21 @@ function VoiceControls({
 }
 
 export default function VoiceLab() {
+  const [activeTab, setActiveTab] = useState("audition");
   const [audioUrl, setAudioUrl] = useState("");
+  const [clonedVoices, setClonedVoices] = useState([]);
+  const [clonedVoicesError, setClonedVoicesError] = useState("");
   const [compareAudioUrl, setCompareAudioUrl] = useState("");
   const [compareDuration, setCompareDuration] = useState(0);
   const [compareEmotion, setCompareEmotion] = useState("neutral");
   const [compareSpeed, setCompareSpeed] = useState(1.0);
   const [compareVoice, setCompareVoice] = useState("Nova");
+  const [deletingVoiceName, setDeletingVoiceName] = useState("");
   const [duration, setDuration] = useState(0);
   const [engineName, setEngineName] = useState("");
   const [errorMessage, setErrorMessage] = useState("");
   const [generationTarget, setGenerationTarget] = useState("");
+  const [loadingClonedVoices, setLoadingClonedVoices] = useState(true);
   const [loadingVoices, setLoadingVoices] = useState(true);
   const [mode, setMode] = useState("single");
   const [presets, setPresets] = useState([]);
@@ -194,53 +202,57 @@ export default function VoiceLab() {
   const [emotion, setEmotion] = useState("neutral");
   const [speed, setSpeed] = useState(1.0);
 
-  useEffect(() => {
-    let isActive = true;
+  async function loadVoices() {
+    setLoadingVoices(true);
 
-    const bootstrap = async () => {
-      setPresets(readStoredPresets());
-
-      try {
-        const response = await fetch("/api/voice-lab/voices");
-        if (!response.ok) {
-          throw new Error("Failed to fetch voices.");
-        }
-
-        const payload = await response.json();
-        if (!isActive) {
-          return;
-        }
-
-        const availableVoices = payload.voices ?? [];
-        setEngineName(payload.engine ?? "");
-        setVoices(availableVoices);
-        setVoice((currentVoice) =>
-          availableVoices.some((voiceOption) => voiceOption.name === currentVoice)
-            ? currentVoice
-            : (availableVoices[0]?.name ?? ""),
-        );
-        setCompareVoice((currentVoice) =>
-          availableVoices.some((voiceOption) => voiceOption.name === currentVoice)
-            ? currentVoice
-            : (availableVoices[1]?.name ?? availableVoices[0]?.name ?? ""),
-        );
-      } catch (error) {
-        if (isActive) {
-          setErrorMessage(error instanceof Error ? error.message : "Failed to load voices.");
-        }
-        console.error("Error fetching voices:", error);
-      } finally {
-        if (isActive) {
-          setLoadingVoices(false);
-        }
+    try {
+      const response = await fetch("/api/voice-lab/voices");
+      if (!response.ok) {
+        throw new Error("Failed to fetch voices.");
       }
-    };
 
-    void bootstrap();
+      const payload = await response.json();
+      const availableVoices = payload.voices ?? [];
+      setEngineName(payload.engine ?? "");
+      setVoices(availableVoices);
+      setVoice((currentVoice) => selectVoiceValue(availableVoices, currentVoice, 0));
+      setCompareVoice((currentVoice) => selectVoiceValue(availableVoices, currentVoice, 1));
+      setErrorMessage("");
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "Failed to load voices.");
+      console.error("Error fetching voices:", error);
+    } finally {
+      setLoadingVoices(false);
+    }
+  }
 
-    return () => {
-      isActive = false;
-    };
+  async function loadClonedVoices() {
+    setLoadingClonedVoices(true);
+
+    try {
+      const response = await fetch("/api/voice-lab/cloned-voices");
+      if (!response.ok) {
+        throw new Error("Failed to fetch cloned voices.");
+      }
+
+      const payload = await response.json();
+      setClonedVoices(payload.cloned_voices ?? []);
+      setClonedVoicesError("");
+    } catch (error) {
+      setClonedVoices([]);
+      setClonedVoicesError(
+        error instanceof Error ? error.message : "Failed to load cloned voices.",
+      );
+      console.error("Error fetching cloned voices:", error);
+    } finally {
+      setLoadingClonedVoices(false);
+    }
+  }
+
+  useEffect(() => {
+    setPresets(readStoredPresets());
+    void loadVoices();
+    void loadClonedVoices();
   }, []);
 
   const handleGenerateAudio = async (isCompare = false) => {
@@ -342,6 +354,7 @@ export default function VoiceLab() {
 
     setEmotion(preset.emotion ?? "neutral");
     setSpeed(Number(preset.speed) || 1.0);
+    setActiveTab("audition");
     setMode("single");
   };
 
@@ -351,9 +364,42 @@ export default function VoiceLab() {
     writeStoredPresets(nextPresets);
   };
 
+  async function handleCloneCreated() {
+    await Promise.all([loadVoices(), loadClonedVoices()]);
+    setActiveTab("clone");
+  }
+
+  async function handleDeleteClonedVoice(voiceName) {
+    if (!window.confirm(`Delete voice "${voiceName}"?`)) {
+      return;
+    }
+
+    setDeletingVoiceName(voiceName);
+    setClonedVoicesError("");
+
+    try {
+      const response = await fetch(`/api/voice-lab/cloned-voices/${voiceName}`, {
+        method: "DELETE",
+      });
+
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null);
+        throw new Error(payload?.detail ?? "Failed to delete cloned voice.");
+      }
+
+      await Promise.all([loadVoices(), loadClonedVoices()]);
+    } catch (error) {
+      setClonedVoicesError(
+        error instanceof Error ? error.message : "Failed to delete cloned voice.",
+      );
+    } finally {
+      setDeletingVoiceName("");
+    }
+  }
+
   return (
     <AppShell
-      description="Audition narration settings, compare alternate deliveries, and save the combinations that deserve a place in the production workflow."
+      description="Audition narration settings, compare alternate deliveries, and create reference-based cloned voices that can be reused in production generation."
       title="Voice Lab"
     >
       <div className="space-y-8">
@@ -363,10 +409,10 @@ export default function VoiceLab() {
               Narration Tuning
             </p>
             <h2 className="mt-4 max-w-2xl text-4xl font-semibold leading-tight">
-              Test a paragraph, pressure the edges, and hear where the voice breaks.
+              Pressure the voice before it reaches a full book.
             </h2>
             <p className="mt-4 max-w-2xl text-sm leading-7 text-slate-200/85">
-              Voice Lab exists for one purpose: catch bad tone choices early. Keep the text short, compare deliveries, and only save the presets you would trust on a real book.
+              Test a paragraph, compare nearby settings, and promote only the voices that survive real scrutiny. If the built-ins miss the target, build a clone from a clean reference.
             </p>
           </div>
 
@@ -390,10 +436,10 @@ export default function VoiceLab() {
             </div>
 
             <div className="rounded-[2rem] border border-slate-200 bg-white px-6 py-5 shadow-xl shadow-slate-900/5">
-              <p className="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">Presets Saved</p>
-              <p className="mt-3 text-3xl font-semibold text-slate-950">{presets.length}</p>
+              <p className="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">Cloned Voices</p>
+              <p className="mt-3 text-3xl font-semibold text-slate-950">{clonedVoices.length}</p>
               <p className="mt-2 text-sm text-slate-600">
-                Reusable combinations persisted locally in this browser.
+                Reference-backed voices saved for future narration jobs.
               </p>
             </div>
           </div>
@@ -405,170 +451,214 @@ export default function VoiceLab() {
           </div>
         ) : null}
 
-        <section className="grid gap-6 lg:grid-cols-[1.1fr,0.9fr]">
-          <div className="rounded-[2rem] border border-slate-200 bg-white p-6 shadow-xl shadow-slate-900/5">
-            <div className="flex items-start justify-between gap-4">
-              <div>
-                <p className="text-xs font-semibold uppercase tracking-[0.28em] text-slate-500">
-                  Test Passage
-                </p>
-                <h3 className="mt-2 text-2xl font-semibold text-slate-950">Text to synthesize</h3>
-              </div>
-              <div className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold uppercase tracking-[0.16em] text-slate-600">
-                5000 char max
-              </div>
-            </div>
-            <textarea
-              aria-label="Test text"
-              className="mt-6 h-44 w-full resize-none rounded-[1.75rem] border border-slate-300 bg-slate-50 px-5 py-4 text-base leading-7 text-slate-900 outline-none transition focus:border-slate-950 focus:bg-white"
-              maxLength={5000}
-              onChange={(event) => setTestText(event.target.value)}
-              placeholder="Enter text to generate audio..."
-              value={testText}
-            />
-            <div className="mt-3 flex items-center justify-between text-sm text-slate-500">
-              <span>Use a paragraph long enough to expose pacing issues.</span>
-              <span>{testText.length} / 5000 characters</span>
-            </div>
-          </div>
-
-          <div className="rounded-[2rem] border border-slate-200 bg-[linear-gradient(135deg,rgba(251,191,36,0.1)_0%,rgba(14,165,233,0.08)_100%)] p-6 shadow-xl shadow-slate-900/5">
-            <p className="text-xs font-semibold uppercase tracking-[0.28em] text-slate-500">Workflow</p>
-            <h3 className="mt-2 text-2xl font-semibold text-slate-950">How to use this page well</h3>
-            <ol className="mt-5 space-y-4 text-sm leading-7 text-slate-700">
-              <li>1. Start with a paragraph that includes dialogue, punctuation, and at least one hard cadence change.</li>
-              <li>2. Generate a neutral baseline before adding style direction or speed changes.</li>
-              <li>3. Compare two close variants instead of jumping across wildly different settings.</li>
-            </ol>
-          </div>
-        </section>
-
         <section className="rounded-[2rem] border border-slate-200 bg-white p-4 shadow-xl shadow-slate-900/5">
           <div className="flex flex-wrap gap-3">
             <button
               className={`rounded-full px-5 py-3 text-sm font-semibold transition ${
-                mode === "single"
+                activeTab === "audition"
                   ? "bg-slate-950 text-amber-200"
                   : "bg-slate-100 text-slate-700 hover:bg-slate-200"
               }`}
-              onClick={() => setMode("single")}
+              onClick={() => setActiveTab("audition")}
               type="button"
             >
-              Single Voice
+              Audition Voices
             </button>
             <button
               className={`rounded-full px-5 py-3 text-sm font-semibold transition ${
-                mode === "compare"
+                activeTab === "clone"
                   ? "bg-slate-950 text-amber-200"
                   : "bg-slate-100 text-slate-700 hover:bg-slate-200"
               }`}
-              onClick={() => setMode("compare")}
+              onClick={() => setActiveTab("clone")}
               type="button"
             >
-              Compare Voices
+              Clone Voice
             </button>
           </div>
         </section>
 
-        {mode === "single" ? (
-          <div className="grid gap-6 xl:grid-cols-[0.9fr,1.1fr]">
-            <div className="space-y-6">
-              <VoiceControls
-                audioUrl=""
-                duration={0}
-                emotion={emotion}
-                generateLabel="Generate Preview"
-                generating={generationTarget === "primary"}
-                label="Voice A"
-                loadingVoices={loadingVoices}
-                onEmotionChange={setEmotion}
-                onGenerate={() => {
-                  void handleGenerateAudio(false);
-                }}
-                onQuickEmotionSelect={setEmotion}
-                onSpeedChange={setSpeed}
-                onVoiceChange={setVoice}
-                speed={speed}
-                showPreview={false}
-                subtitle="Primary voice settings"
-                voice={voice}
-                voices={voices}
-              />
-
-              <button
-                className="inline-flex w-full items-center justify-center rounded-full border border-emerald-300 bg-emerald-50 px-5 py-3 text-sm font-semibold text-emerald-800 transition hover:border-emerald-400 hover:bg-emerald-100"
-                onClick={handleSavePreset}
-                type="button"
-              >
-                Save Preset
-              </button>
-            </div>
-
-            <div className="space-y-6">
-              {audioUrl ? (
-                <AudioPlayer audioUrl={audioUrl} duration={duration} title="Generated Preview" />
-              ) : (
-                <div className="flex min-h-[24rem] items-center justify-center rounded-[2rem] border border-dashed border-slate-300 bg-white px-8 py-12 text-center shadow-xl shadow-slate-900/5">
+        {activeTab === "audition" ? (
+          <div className="space-y-8">
+            <section className="grid gap-6 lg:grid-cols-[1.1fr,0.9fr]">
+              <div className="rounded-[2rem] border border-slate-200 bg-white p-6 shadow-xl shadow-slate-900/5">
+                <div className="flex items-start justify-between gap-4">
                   <div>
                     <p className="text-xs font-semibold uppercase tracking-[0.28em] text-slate-500">
-                      Preview Slot
+                      Test Passage
                     </p>
-                    <h3 className="mt-3 text-2xl font-semibold text-slate-950">No audio generated yet</h3>
-                    <p className="mt-3 max-w-md text-sm leading-7 text-slate-600">
-                      Run a preview from the settings panel to inspect pacing, download the clip, and decide whether the voice deserves a preset.
-                    </p>
+                    <h3 className="mt-2 text-2xl font-semibold text-slate-950">Text to synthesize</h3>
+                  </div>
+                  <div className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold uppercase tracking-[0.16em] text-slate-600">
+                    5000 char max
                   </div>
                 </div>
-              )}
+                <textarea
+                  aria-label="Test text"
+                  className="mt-6 h-44 w-full resize-none rounded-[1.75rem] border border-slate-300 bg-slate-50 px-5 py-4 text-base leading-7 text-slate-900 outline-none transition focus:border-slate-950 focus:bg-white"
+                  maxLength={5000}
+                  onChange={(event) => setTestText(event.target.value)}
+                  placeholder="Enter text to generate audio..."
+                  value={testText}
+                />
+                <div className="mt-3 flex items-center justify-between text-sm text-slate-500">
+                  <span>Use a paragraph long enough to expose pacing issues.</span>
+                  <span>{testText.length} / 5000 characters</span>
+                </div>
+              </div>
 
-              <VoicePresetManager
-                onDeletePreset={handleDeletePreset}
-                onLoadPreset={handleLoadPreset}
-                presets={presets}
-              />
-            </div>
+              <div className="rounded-[2rem] border border-slate-200 bg-[linear-gradient(135deg,rgba(251,191,36,0.1)_0%,rgba(14,165,233,0.08)_100%)] p-6 shadow-xl shadow-slate-900/5">
+                <p className="text-xs font-semibold uppercase tracking-[0.28em] text-slate-500">Workflow</p>
+                <h3 className="mt-2 text-2xl font-semibold text-slate-950">How to use this page well</h3>
+                <ol className="mt-5 space-y-4 text-sm leading-7 text-slate-700">
+                  <li>1. Start with a neutral baseline before adding style direction or speed changes.</li>
+                  <li>2. Compare two nearby settings instead of jumping across radically different voices.</li>
+                  <li>3. If none of the built-ins land, create a cloned voice from a high-quality sample.</li>
+                </ol>
+              </div>
+            </section>
+
+            <section className="rounded-[2rem] border border-slate-200 bg-white p-4 shadow-xl shadow-slate-900/5">
+              <div className="flex flex-wrap gap-3">
+                <button
+                  className={`rounded-full px-5 py-3 text-sm font-semibold transition ${
+                    mode === "single"
+                      ? "bg-slate-950 text-amber-200"
+                      : "bg-slate-100 text-slate-700 hover:bg-slate-200"
+                  }`}
+                  onClick={() => setMode("single")}
+                  type="button"
+                >
+                  Single Voice
+                </button>
+                <button
+                  className={`rounded-full px-5 py-3 text-sm font-semibold transition ${
+                    mode === "compare"
+                      ? "bg-slate-950 text-amber-200"
+                      : "bg-slate-100 text-slate-700 hover:bg-slate-200"
+                  }`}
+                  onClick={() => setMode("compare")}
+                  type="button"
+                >
+                  Compare Voices
+                </button>
+              </div>
+            </section>
+
+            {mode === "single" ? (
+              <div className="grid gap-6 xl:grid-cols-[0.9fr,1.1fr]">
+                <div className="space-y-6">
+                  <VoiceControls
+                    audioUrl=""
+                    duration={0}
+                    emotion={emotion}
+                    generateLabel="Generate Preview"
+                    generating={generationTarget === "primary"}
+                    label="Voice A"
+                    loadingVoices={loadingVoices}
+                    onEmotionChange={setEmotion}
+                    onGenerate={() => {
+                      void handleGenerateAudio(false);
+                    }}
+                    onQuickEmotionSelect={setEmotion}
+                    onSpeedChange={setSpeed}
+                    onVoiceChange={setVoice}
+                    speed={speed}
+                    showPreview={false}
+                    subtitle="Primary voice settings"
+                    voice={voice}
+                    voices={voices}
+                  />
+
+                  <button
+                    className="inline-flex w-full items-center justify-center rounded-full border border-emerald-300 bg-emerald-50 px-5 py-3 text-sm font-semibold text-emerald-800 transition hover:border-emerald-400 hover:bg-emerald-100"
+                    onClick={handleSavePreset}
+                    type="button"
+                  >
+                    Save Preset
+                  </button>
+                </div>
+
+                <div className="space-y-6">
+                  {audioUrl ? (
+                    <AudioPlayer audioUrl={audioUrl} duration={duration} title="Generated Preview" />
+                  ) : (
+                    <div className="flex min-h-[24rem] items-center justify-center rounded-[2rem] border border-dashed border-slate-300 bg-white px-8 py-12 text-center shadow-xl shadow-slate-900/5">
+                      <div>
+                        <p className="text-xs font-semibold uppercase tracking-[0.28em] text-slate-500">
+                          Preview Slot
+                        </p>
+                        <h3 className="mt-3 text-2xl font-semibold text-slate-950">No audio generated yet</h3>
+                        <p className="mt-3 max-w-md text-sm leading-7 text-slate-600">
+                          Run a preview from the settings panel to inspect pacing, download the clip, and decide whether the voice deserves a preset.
+                        </p>
+                      </div>
+                    </div>
+                  )}
+
+                  <VoicePresetManager
+                    onDeletePreset={handleDeletePreset}
+                    onLoadPreset={handleLoadPreset}
+                    presets={presets}
+                  />
+                </div>
+              </div>
+            ) : (
+              <div className="grid gap-6 xl:grid-cols-2">
+                <VoiceControls
+                  audioUrl={audioUrl}
+                  duration={duration}
+                  emotion={emotion}
+                  generateLabel="Generate Voice A"
+                  generating={generationTarget === "primary"}
+                  label="Voice A"
+                  loadingVoices={loadingVoices}
+                  onEmotionChange={setEmotion}
+                  onGenerate={() => {
+                    void handleGenerateAudio(false);
+                  }}
+                  onQuickEmotionSelect={setEmotion}
+                  onSpeedChange={setSpeed}
+                  onVoiceChange={setVoice}
+                  speed={speed}
+                  subtitle="Left-side comparison"
+                  voice={voice}
+                  voices={voices}
+                />
+                <VoiceControls
+                  audioUrl={compareAudioUrl}
+                  duration={compareDuration}
+                  emotion={compareEmotion}
+                  generateLabel="Generate Voice B"
+                  generating={generationTarget === "compare"}
+                  label="Voice B"
+                  loadingVoices={loadingVoices}
+                  onEmotionChange={setCompareEmotion}
+                  onGenerate={() => {
+                    void handleGenerateAudio(true);
+                  }}
+                  onQuickEmotionSelect={setCompareEmotion}
+                  onSpeedChange={setCompareSpeed}
+                  onVoiceChange={setCompareVoice}
+                  speed={compareSpeed}
+                  subtitle="Right-side comparison"
+                  voice={compareVoice}
+                  voices={voices}
+                />
+              </div>
+            )}
           </div>
         ) : (
-          <div className="grid gap-6 xl:grid-cols-2">
-            <VoiceControls
-              audioUrl={audioUrl}
-              duration={duration}
-              emotion={emotion}
-              generateLabel="Generate Voice A"
-              generating={generationTarget === "primary"}
-              label="Voice A"
-              loadingVoices={loadingVoices}
-              onEmotionChange={setEmotion}
-              onGenerate={() => {
-                void handleGenerateAudio(false);
+          <div className="grid gap-6 xl:grid-cols-[1fr,0.95fr]">
+            <VoiceCloneForm onCloned={handleCloneCreated} />
+            <ClonedVoicesList
+              deletingVoiceName={deletingVoiceName}
+              errorMessage={clonedVoicesError}
+              loading={loadingClonedVoices}
+              onDelete={(voiceName) => {
+                void handleDeleteClonedVoice(voiceName);
               }}
-              onQuickEmotionSelect={setEmotion}
-              onSpeedChange={setSpeed}
-              onVoiceChange={setVoice}
-              speed={speed}
-              subtitle="Left-side comparison"
-              voice={voice}
-              voices={voices}
-            />
-            <VoiceControls
-              audioUrl={compareAudioUrl}
-              duration={compareDuration}
-              emotion={compareEmotion}
-              generateLabel="Generate Voice B"
-              generating={generationTarget === "compare"}
-              label="Voice B"
-              loadingVoices={loadingVoices}
-              onEmotionChange={setCompareEmotion}
-              onGenerate={() => {
-                void handleGenerateAudio(true);
-              }}
-              onQuickEmotionSelect={setCompareEmotion}
-              onSpeedChange={setCompareSpeed}
-              onVoiceChange={setCompareVoice}
-              speed={compareSpeed}
-              subtitle="Right-side comparison"
-              voice={compareVoice}
-              voices={voices}
+              voices={clonedVoices}
             />
           </div>
         )}

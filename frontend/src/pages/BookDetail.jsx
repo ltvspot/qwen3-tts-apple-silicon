@@ -17,6 +17,12 @@ const DEFAULT_NARRATION_SETTINGS = {
   engine: "qwen3_tts",
 };
 
+const DEFAULT_VOICE_OPTIONS = [
+  { name: "Ethan", display_name: "Ethan", is_cloned: false },
+  { name: "Nova", display_name: "Nova", is_cloned: false },
+  { name: "Aria", display_name: "Aria", is_cloned: false },
+];
+
 function chapterHasUnsavedChanges(selectedChapter, draftText, editMode) {
   if (!editMode || !selectedChapter) {
     return false;
@@ -99,6 +105,7 @@ export default function BookDetail() {
   const [generationErrorMessage, setGenerationErrorMessage] = useState("");
   const [generationSnapshot, setGenerationSnapshot] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [loadingVoiceOptions, setLoadingVoiceOptions] = useState(true);
   const [narrationSettings, setNarrationSettings] = useState(DEFAULT_NARRATION_SETTINGS);
   const [notFound, setNotFound] = useState(false);
   const [playerChapterNumber, setPlayerChapterNumber] = useState(null);
@@ -106,6 +113,7 @@ export default function BookDetail() {
   const [saveErrorMessage, setSaveErrorMessage] = useState("");
   const [saving, setSaving] = useState(false);
   const [selectedChapterId, setSelectedChapterId] = useState(null);
+  const [voiceOptions, setVoiceOptions] = useState(DEFAULT_VOICE_OPTIONS);
 
   const mergedChapters = useMemo(
     () => mergeChaptersWithGeneration(chapters, generationSnapshot),
@@ -209,6 +217,39 @@ export default function BookDetail() {
     }
   }
 
+  async function fetchVoiceOptions(currentRequestId) {
+    try {
+      const response = await fetch("/api/voice-lab/voices");
+      if (!response.ok) {
+        throw new Error("Failed to fetch voices.");
+      }
+
+      const payload = await response.json();
+      if (requestRef.current !== currentRequestId) {
+        return;
+      }
+
+      const availableVoices = payload.voices ?? [];
+      setVoiceOptions(availableVoices.length > 0 ? availableVoices : DEFAULT_VOICE_OPTIONS);
+      setNarrationSettings((currentSettings) => ({
+        ...currentSettings,
+        voice: availableVoices.some((voiceOption) => voiceOption.name === currentSettings.voice)
+          ? currentSettings.voice
+          : (availableVoices[0]?.name ?? DEFAULT_NARRATION_SETTINGS.voice),
+      }));
+    } catch (error) {
+      if (requestRef.current !== currentRequestId) {
+        return;
+      }
+
+      setVoiceOptions(DEFAULT_VOICE_OPTIONS);
+    } finally {
+      if (requestRef.current === currentRequestId) {
+        setLoadingVoiceOptions(false);
+      }
+    }
+  }
+
   async function fetchBookData() {
     const requestId = requestRef.current + 1;
     requestRef.current = requestId;
@@ -227,8 +268,10 @@ export default function BookDetail() {
     setDraftText("");
     setEditMode(false);
     setGenerationSnapshot(null);
+    setLoadingVoiceOptions(true);
     setPlayerVisible(false);
     setPlayerChapterNumber(null);
+    setVoiceOptions(DEFAULT_VOICE_OPTIONS);
 
     try {
       const bookResponse = await fetch(`/api/book/${id}`);
@@ -269,6 +312,7 @@ export default function BookDetail() {
 
       await fetchGenerationStatus(requestId);
       await fetchExportStatus(requestId);
+      await fetchVoiceOptions(requestId);
     } catch (error) {
       if (requestRef.current !== requestId) {
         return;
@@ -686,9 +730,11 @@ export default function BookDetail() {
 
           <div className="flex flex-col gap-6">
             <NarrationSettings
+              loadingVoices={loadingVoiceOptions}
               onChange={handleNarrationSettingsChange}
               selectedChapter={selectedChapter}
               settings={narrationSettings}
+              voices={voiceOptions}
             />
 
             <section className="rounded-[2rem] border border-white/10 bg-white/[0.05] p-5 text-white shadow-xl shadow-slate-950/20">

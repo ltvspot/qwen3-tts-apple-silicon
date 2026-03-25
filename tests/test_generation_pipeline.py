@@ -8,6 +8,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
+from pydub.generators import Sine
 from sqlalchemy.orm import Session, sessionmaker
 
 from src.api import generation as generation_api
@@ -24,6 +25,7 @@ from src.database import (
     utc_now,
 )
 from src.engines.qwen3_tts import Qwen3TTS
+from src.engines.voice_cloner import VoiceCloner
 from src.pipeline.generator import AudiobookGenerator, GenerationCancelled
 from src.pipeline.queue_manager import GenerationQueue, JobStatus
 
@@ -228,6 +230,38 @@ async def test_generate_book_processes_all_chapters_and_uses_credit_speed(test_d
     assert first_chapter.audio_path == "1-the-golden-thread/chapters/01-ch01-the-beginning.wav"
     assert closing.audio_path == "1-the-golden-thread/chapters/02-closing-credits.wav"
     assert requested_speeds == [0.9, 1.0, 0.9]
+
+
+@pytest.mark.asyncio
+async def test_generate_book_accepts_persisted_cloned_voice(test_db: Session, tmp_path: Path) -> None:
+    """Book generation should accept a persisted cloned voice ID."""
+
+    reference_path = tmp_path / "kent.wav"
+    Sine(215).to_audio_segment(duration=2500).set_channels(1).export(reference_path, format="wav")
+    VoiceCloner(settings.VOICES_PATH).clone_voice(
+        "kent-zimering",
+        reference_path,
+        "This is the cloned reference transcript.",
+    )
+
+    engine = Qwen3TTS(backend="synthetic")
+    generator = AudiobookGenerator(engine)
+    book = create_book(test_db, title="Cloned Voice Book")
+    create_chapter(
+        test_db,
+        book_id=book.id,
+        number=1,
+        title="Using a Clone",
+        chapter_type=ChapterType.CHAPTER,
+        text="This chapter should generate with the cloned voice name.",
+    )
+
+    result = await generator.generate_book(book.id, test_db, voice_name="kent-zimering")
+
+    assert result["status"] == "success"
+    generated_chapter = test_db.query(Chapter).filter(Chapter.book_id == book.id).one()
+    assert generated_chapter.status == ChapterStatus.GENERATED
+    assert generated_chapter.audio_path == "1-cloned-voice-book/chapters/01-ch01-using-a-clone.wav"
 
 
 @pytest.mark.asyncio

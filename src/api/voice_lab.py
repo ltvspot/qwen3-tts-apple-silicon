@@ -3,29 +3,36 @@
 from __future__ import annotations
 
 import logging
+import tempfile
 import uuid
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
 
 from src.config import settings
 from src.engines import AudioStitcher, Qwen3TTS, TextChunker
+from src.engines.voice_cloner import VoiceCloner
+from src.database import ClonedVoice, get_db
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["voice-lab"])
+DEFAULT_CREATED_BY = "Tim"
 
 
 class VoiceSummary(BaseModel):
     """Response model for a single available voice."""
 
     name: str
+    display_name: str | None = None
     description: str | None = None
     language: str = "en-US"
+    is_cloned: bool = False
 
 
 class VoiceListResponse(BaseModel):
@@ -41,7 +48,7 @@ class VoiceTestRequest(BaseModel):
     text: str = Field(..., max_length=5000)
     voice: str = Field(default="Ethan", min_length=1, max_length=100)
     emotion: str = Field(default="neutral", max_length=100)
-    speed: float = Field(default=1.0, ge=0.8, le=1.3)
+    speed: float = Field(default=1.0, ge=0.5, le=2.0)
 
 
 class VoiceTestResponse(BaseModel):
@@ -51,6 +58,41 @@ class VoiceTestResponse(BaseModel):
     duration_seconds: float
     text_used: str
     settings: dict[str, Any]
+
+
+class CloneVoiceResponse(BaseModel):
+    """Response returned when a clone is created or updated."""
+
+    success: bool
+    voice_name: str
+    display_name: str
+    audio_duration_seconds: float
+    message: str
+
+
+class ClonedVoiceSummary(BaseModel):
+    """Serialized cloned voice metadata."""
+
+    voice_name: str
+    display_name: str
+    audio_duration_seconds: float
+    created_at: str
+    created_by: str | None = None
+    is_enabled: bool
+    notes: str | None = None
+
+
+class ClonedVoiceListResponse(BaseModel):
+    """Response payload for listing cloned voices."""
+
+    cloned_voices: list[ClonedVoiceSummary]
+
+
+class DeleteClonedVoiceResponse(BaseModel):
+    """Response returned when a cloned voice is removed."""
+
+    success: bool
+    message: str
 
 
 @lru_cache(maxsize=1)
@@ -77,6 +119,41 @@ def release_engine() -> None:
     engine = _build_engine()
     engine.unload()
     _build_engine.cache_clear()
+
+
+def _voice_cloner() -> VoiceCloner:
+    """Return the voice cloner bound to the current voices directory."""
+
+    return VoiceCloner(settings.VOICES_PATH)
+
+
+def _cloned_voice_records(db: Session) -> list[ClonedVoice]:
+    """Return enabled cloned voices ordered by creation time."""
+
+    return (
+        db.query(ClonedVoice)
+        .filter(ClonedVoice.is_enabled.is_(True))
+        .order_by(ClonedVoice.created_at.desc(), ClonedVoice.id.desc())
+        .all()
+    )
+
+
+def _serialize_cloned_voice(record: ClonedVoice, *, cloner: VoiceCloner) -> ClonedVoiceSummary | None:
+    """Convert a cloned voice database record into its API representation."""
+
+    assets = cloner.get_voice_assets(record.voice_name)
+    if assets is None:
+        return None
+
+    return ClonedVoiceSummary(
+        voice_name=record.voice_name,
+        display_name=record.display_name,
+        audio_duration_seconds=round(cloner.get_audio_duration(assets["ref_audio_path"]), 2),
+        created_at=record.created_at.isoformat(),
+        created_by=record.created_by,
+        is_enabled=record.is_enabled,
+        notes=record.notes,
+    )
 
 
 @router.post("/api/voice-lab/test", response_model=VoiceTestResponse)
@@ -131,16 +208,144 @@ async def test_voice(request: VoiceTestRequest) -> VoiceTestResponse:
 
 
 @router.get("/api/voice-lab/voices", response_model=VoiceListResponse)
-async def get_voices() -> VoiceListResponse:
+async def get_voices(db: Session = Depends(get_db)) -> VoiceListResponse:
     """Return the currently available voices for the configured engine."""
 
     try:
         engine = get_engine()
-        voices = [VoiceSummary(name=voice.name, description=voice.description, language=voice.language) for voice in engine.list_voices()]
+        cloned_lookup = {
+            record.voice_name: record
+            for record in _cloned_voice_records(db)
+        }
+        voices = []
+        for voice in engine.list_voices():
+            cloned_record = cloned_lookup.get(voice.name)
+            voices.append(
+                VoiceSummary(
+                    name=voice.name,
+                    display_name=(
+                        cloned_record.display_name
+                        if cloned_record is not None
+                        else (voice.display_name or voice.name)
+                    ),
+                    description=voice.description,
+                    language=voice.language,
+                    is_cloned=cloned_record is not None or voice.is_cloned,
+                )
+            )
         return VoiceListResponse(engine=engine.name, voices=voices)
     except Exception as exc:
         logger.exception("Failed to list voices")
         raise HTTPException(status_code=500, detail=f"Failed to list voices: {exc}") from exc
+
+
+@router.post("/api/voice-lab/clone", response_model=CloneVoiceResponse)
+async def clone_voice(
+    voice_name: str = Form(...),
+    display_name: str = Form(...),
+    reference_audio: UploadFile = File(...),
+    transcript: str = Form(...),
+    notes: str = Form(default=""),
+    db: Session = Depends(get_db),
+) -> CloneVoiceResponse:
+    """Create or update a cloned voice from uploaded reference audio."""
+
+    cloner = _voice_cloner()
+    suffix = Path(reference_audio.filename or "").suffix or ".wav"
+    temporary_path: Path | None = None
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+            temp_file.write(await reference_audio.read())
+            temporary_path = Path(temp_file.name)
+
+        audio_path, transcript_path = cloner.clone_voice(
+            voice_name=voice_name,
+            reference_audio_path=temporary_path,
+            transcript=transcript,
+        )
+        canonical_name = cloner.validate_voice_name(voice_name)
+
+        cloned_voice = (
+            db.query(ClonedVoice)
+            .filter(ClonedVoice.voice_name == canonical_name)
+            .first()
+        )
+        if cloned_voice is None:
+            cloned_voice = ClonedVoice(
+                voice_name=canonical_name,
+                display_name=display_name.strip() or canonical_name,
+                reference_audio_path=audio_path,
+                transcript_path=transcript_path,
+                created_by=DEFAULT_CREATED_BY,
+                notes=notes.strip() or None,
+                is_enabled=True,
+            )
+            db.add(cloned_voice)
+        else:
+            cloned_voice.display_name = display_name.strip() or canonical_name
+            cloned_voice.reference_audio_path = audio_path
+            cloned_voice.transcript_path = transcript_path
+            cloned_voice.created_by = cloned_voice.created_by or DEFAULT_CREATED_BY
+            cloned_voice.notes = notes.strip() or None
+            cloned_voice.is_enabled = True
+
+        db.commit()
+        duration_seconds = round(cloner.get_audio_duration(audio_path), 2)
+        logger.info("Cloned voice saved: %s", canonical_name)
+        return CloneVoiceResponse(
+            success=True,
+            voice_name=canonical_name,
+            display_name=display_name.strip() or canonical_name,
+            audio_duration_seconds=duration_seconds,
+            message="Voice cloned successfully",
+        )
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        db.rollback()
+        logger.exception("Voice cloning failed")
+        raise HTTPException(status_code=500, detail=f"Voice cloning failed: {exc}") from exc
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+@router.get("/api/voice-lab/cloned-voices", response_model=ClonedVoiceListResponse)
+async def get_cloned_voices(db: Session = Depends(get_db)) -> ClonedVoiceListResponse:
+    """Return persisted cloned voice metadata."""
+
+    cloner = _voice_cloner()
+    voices = [
+        payload
+        for record in _cloned_voice_records(db)
+        if (payload := _serialize_cloned_voice(record, cloner=cloner)) is not None
+    ]
+    return ClonedVoiceListResponse(cloned_voices=voices)
+
+
+@router.delete("/api/voice-lab/cloned-voices/{voice_name}", response_model=DeleteClonedVoiceResponse)
+async def delete_cloned_voice(voice_name: str, db: Session = Depends(get_db)) -> DeleteClonedVoiceResponse:
+    """Delete a cloned voice from the database and filesystem."""
+
+    cloner = _voice_cloner()
+    record = db.query(ClonedVoice).filter(ClonedVoice.voice_name == voice_name).first()
+    deleted_assets = cloner.delete_voice(voice_name)
+
+    if record is None and not deleted_assets:
+        raise HTTPException(status_code=404, detail=f"Cloned voice not found: {voice_name}")
+
+    if record is not None:
+        db.delete(record)
+        db.commit()
+    else:
+        db.rollback()
+
+    return DeleteClonedVoiceResponse(
+        success=True,
+        message=f"Voice deleted: {voice_name}",
+    )
 
 
 @router.get("/audio/voices/{filename}", include_in_schema=False)

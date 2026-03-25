@@ -290,6 +290,22 @@ class AppSetting(Base):
     value: Mapped[str] = mapped_column(Text, nullable=False)
 
 
+class ClonedVoice(Base):
+    """Metadata for a persisted cloned voice reference."""
+
+    __tablename__ = "cloned_voices"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    voice_name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    display_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    reference_audio_path: Mapped[str] = mapped_column(String(500), nullable=False)
+    transcript_path: Mapped[str] = mapped_column(String(500), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+    created_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    is_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
 class VoicePreset(Base):
     """Saved TTS preset configuration."""
 

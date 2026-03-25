@@ -14,6 +14,7 @@ from pydub.generators import Sine
 
 from src.config import get_application_settings, settings
 from src.engines.base import AudioGenerationConfig, TTSEngine, Voice
+from src.engines.voice_cloner import VoiceCloner
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +76,7 @@ class Qwen3TTS(TTSEngine):
         self.sample_rate = DEFAULT_SAMPLE_RATE
         self._resolved_backend: str | None = None
         self._supported_speakers: set[str] = set()
-        self._cloned_voices: dict[str, dict[str, str]] = {}
+        self.voice_cloner = VoiceCloner(settings.VOICES_PATH)
 
     @property
     def name(self) -> str:
@@ -135,7 +136,6 @@ class Qwen3TTS(TTSEngine):
 
         self.model = None
         self.base_model = None
-        self._cloned_voices.clear()
         self.loaded = False
         self._resolved_backend = None
         self.sample_rate = DEFAULT_SAMPLE_RATE
@@ -145,14 +145,16 @@ class Qwen3TTS(TTSEngine):
         """Return app-facing voice presets and any runtime cloned voices."""
 
         voices = [
-            Voice(name=name, description=profile["description"])
+            Voice(name=name, display_name=name, description=profile["description"])
             for name, profile in VOICE_PRESETS.items()
         ]
-        for clone_name in sorted(self._cloned_voices):
+        for clone_name in self.voice_cloner.list_cloned_voices():
             voices.append(
                 Voice(
                     name=clone_name,
+                    display_name=clone_name,
                     description="Cloned runtime voice from a reference sample.",
+                    is_cloned=True,
                 )
             )
         return voices
@@ -208,23 +210,9 @@ class Qwen3TTS(TTSEngine):
     def clone_voice(self, ref_audio_path: str, transcript: str, output_voice_name: str) -> str:
         """Register a reference sample for later voice-cloned generation."""
 
-        ref_path = Path(ref_audio_path)
-        if not ref_path.exists():
-            raise ValueError(f"Reference audio not found: {ref_audio_path}")
-
-        cleaned_transcript = transcript.strip()
-        if not cleaned_transcript:
-            raise ValueError("Transcript cannot be empty.")
-
-        cleaned_name = output_voice_name.strip()
-        if not cleaned_name:
-            raise ValueError("Output voice name cannot be empty.")
-
-        self._cloned_voices[cleaned_name] = {
-            "ref_audio_path": str(ref_path),
-            "transcript": cleaned_transcript,
-        }
-        logger.info("Registered cloned voice '%s' using %s", cleaned_name, ref_path)
+        self.voice_cloner.clone_voice(output_voice_name, ref_audio_path, transcript)
+        cleaned_name = self.voice_cloner.validate_voice_name(output_voice_name)
+        logger.info("Registered cloned voice '%s' using %s", cleaned_name, ref_audio_path)
         return cleaned_name
 
     def _resolve_backend(self) -> str:
@@ -286,12 +274,9 @@ class Qwen3TTS(TTSEngine):
         if not normalized:
             raise ValueError("Voice cannot be empty.")
 
-        clone_match = next(
-            (clone_name for clone_name in self._cloned_voices if clone_name.lower() == normalized.lower()),
-            None,
-        )
-        if clone_match is not None:
-            return ("clone", clone_match)
+        clone_assets = self.voice_cloner.get_voice_assets(normalized)
+        if clone_assets is not None:
+            return ("clone", clone_assets["voice_name"])
 
         for alias, profile in VOICE_PRESETS.items():
             if alias.lower() == normalized.lower():
@@ -333,7 +318,9 @@ class Qwen3TTS(TTSEngine):
     def _generate_cloned_audio(self, config: AudioGenerationConfig, clone_name: str) -> AudioSegment:
         """Generate audio using the Base model and a stored voice reference."""
 
-        clone_config = self._cloned_voices[clone_name]
+        clone_config = self.voice_cloner.get_voice_assets(clone_name)
+        if clone_config is None:
+            raise ValueError(f"Cloned voice not found: {clone_name}")
         model = self._ensure_base_model_loaded()
 
         try:
