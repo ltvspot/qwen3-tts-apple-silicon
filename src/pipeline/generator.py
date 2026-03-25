@@ -9,10 +9,20 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
+from pydub.audio_segment import AudioSegment
 from sqlalchemy.orm import Session, selectinload
 
 from src.config import settings
-from src.database import Book, BookGenerationStatus, BookStatus, Chapter, ChapterStatus, ChapterType, utc_now
+from src.database import (
+    Book,
+    BookGenerationStatus,
+    BookStatus,
+    Chapter,
+    ChapterStatus,
+    ChapterType,
+    QAStatus,
+    utc_now,
+)
 from src.engines import AudioStitcher, TTSEngine, TextChunker
 from src.pipeline.qa_checker import persist_qa_result, run_qa_checks_for_chapter
 
@@ -24,6 +34,10 @@ PERMANENT_GENERATION_ERRORS = (FileNotFoundError, ValueError)
 
 class GenerationCancelled(Exception):
     """Raised when an in-flight generation job has been cancelled."""
+
+
+class ChunkGenerationExhaustedError(RuntimeError):
+    """Raised when a chunk fails generation or validation across all retry attempts."""
 
 
 def _slugify(value: str, *, fallback: str, max_length: int) -> str:
@@ -43,7 +57,7 @@ class AudiobookGenerator:
 
         self.engine = engine
         self.output_path = Path(settings.OUTPUTS_PATH)
-        self.retry_backoff_seconds: tuple[float, ...] = (0.25, 0.75)
+        self.retry_backoff_seconds: tuple[float, ...] = (0.5, 1.0)
 
     def close(self) -> None:
         """Release the underlying engine if it has been loaded."""
@@ -205,25 +219,46 @@ class AudiobookGenerator:
             chunks = TextChunker.chunk_text(text_content, self.engine.max_chunk_chars)
             audio_chunks = []
             chapter_speed = speed * self._chapter_speed(chapter)
+            manual_review_notes: list[str] = []
 
             for chunk_index, chunk in enumerate(chunks):
                 self._raise_if_cancelled(should_cancel)
 
-                audio = await self._generate_chunk_with_retry(
-                    chunk,
-                    voice_name=voice_name,
-                    emotion=emotion,
-                    speed=chapter_speed,
-                    chapter_number=chapter.number,
-                    book_id=book_id,
-                    should_cancel=should_cancel,
-                )
+                try:
+                    audio = await self._generate_chunk_with_retry(
+                        chunk,
+                        chunk_index=chunk_index,
+                        voice_name=voice_name,
+                        emotion=emotion,
+                        speed=chapter_speed,
+                        chapter_number=chapter.number,
+                        book_id=book_id,
+                        should_cancel=should_cancel,
+                    )
+                except ChunkGenerationExhaustedError as exc:
+                    note = (
+                        f"Chunk {chunk_index} failed after 3 attempts and was skipped: {exc}"
+                    )
+                    manual_review_notes.append(note)
+                    logger.error(
+                        "Skipping book %s chapter %s chunk %s after exhausted retries: %s",
+                        book_id,
+                        chapter.number,
+                        chunk_index,
+                        exc,
+                    )
+                    continue
+
                 audio_chunks.append(audio)
 
                 if progress_callback is not None:
                     await progress_callback((chunk_index + 1) / len(chunks))
 
             self._raise_if_cancelled(should_cancel)
+            if not audio_chunks:
+                raise RuntimeError(
+                    f"Chapter {chapter.number} produced no valid audio chunks after retries."
+                )
 
             final_audio = AudioStitcher.stitch(audio_chunks)
             audio_path = self._get_chapter_audio_path(book_id, chapter)
@@ -241,9 +276,12 @@ class AudiobookGenerator:
             try:
                 qa_result = await run_qa_checks_for_chapter(chapter)
                 persist_qa_result(db_session, chapter, qa_result)
+                self._flag_manual_review(chapter, manual_review_notes)
                 db_session.commit()
             except Exception:
                 db_session.rollback()
+                self._flag_manual_review(chapter, manual_review_notes)
+                db_session.commit()
                 logger.exception(
                     "Automatic QA failed for book %s chapter %s after successful generation",
                     book_id,
@@ -277,6 +315,7 @@ class AudiobookGenerator:
         self,
         text: str,
         *,
+        chunk_index: int,
         voice_name: str,
         emotion: str | None,
         speed: float,
@@ -290,30 +329,58 @@ class AudiobookGenerator:
         for attempt in range(1, max_attempts + 1):
             self._raise_if_cancelled(should_cancel)
             try:
-                return await asyncio.to_thread(
-                    self.engine.generate,
+                audio = await self._generate_chunk(
                     text,
-                    voice_name,
-                    emotion,
-                    speed,
+                    voice_name=voice_name,
+                    emotion=emotion,
+                    speed=speed,
                 )
             except PERMANENT_GENERATION_ERRORS:
                 raise
             except TRANSIENT_GENERATION_ERRORS as exc:
                 if attempt >= max_attempts:
                     logger.error(
-                        "Transient generation error exhausted retries for book %s chapter %s: %s",
+                        "Transient generation error exhausted retries for book %s chapter %s chunk %s: %s",
                         book_id,
                         chapter_number,
+                        chunk_index,
                         exc,
                     )
-                    raise
+                    raise ChunkGenerationExhaustedError(str(exc)) from exc
 
                 backoff = self.retry_backoff_seconds[attempt - 1]
                 logger.warning(
-                    "Retrying generation for book %s chapter %s after transient error (%s/%s): %s",
+                    "Retrying generation for book %s chapter %s chunk %s after transient error (%s/%s): %s",
                     book_id,
                     chapter_number,
+                    chunk_index,
+                    attempt,
+                    max_attempts,
+                    exc,
+                )
+                await asyncio.sleep(backoff)
+                continue
+
+            try:
+                self._validate_chunk(audio, chunk_index, text)
+                return audio
+            except ValueError as exc:
+                if attempt >= max_attempts:
+                    logger.error(
+                        "Chunk validation exhausted retries for book %s chapter %s chunk %s: %s",
+                        book_id,
+                        chapter_number,
+                        chunk_index,
+                        exc,
+                    )
+                    raise ChunkGenerationExhaustedError(str(exc)) from exc
+
+                backoff = self.retry_backoff_seconds[attempt - 1]
+                logger.warning(
+                    "Retrying generation for book %s chapter %s chunk %s after validation failure (%s/%s): %s",
+                    book_id,
+                    chapter_number,
+                    chunk_index,
                     attempt,
                     max_attempts,
                     exc,
@@ -321,6 +388,58 @@ class AudiobookGenerator:
                 await asyncio.sleep(backoff)
 
         raise RuntimeError("Chunk generation retry loop exited unexpectedly.")
+
+    async def _generate_chunk(
+        self,
+        text: str,
+        *,
+        voice_name: str,
+        emotion: str | None,
+        speed: float,
+    ) -> AudioSegment:
+        """Generate a single audio chunk, using engine-level timeouts when available."""
+
+        timeout_generate = getattr(self.engine, "generate_chunk_with_timeout", None)
+        if callable(timeout_generate):
+            return await timeout_generate(text, voice_name, emotion=emotion, speed=speed)
+
+        return await asyncio.to_thread(
+            self.engine.generate,
+            text,
+            voice_name,
+            emotion,
+            speed,
+        )
+
+    def _validate_chunk(self, chunk: AudioSegment, chunk_index: int, expected_text: str) -> None:
+        """Validate one generated chunk before it is stitched into a chapter."""
+
+        if len(chunk) < 100:
+            raise ValueError(f"Chunk {chunk_index} too short: {len(chunk)}ms (min 100ms)")
+        if len(chunk) > 120_000:
+            raise ValueError(f"Chunk {chunk_index} too long: {len(chunk)}ms (max 120s)")
+        if chunk.dBFS < -55:
+            raise ValueError(f"Chunk {chunk_index} is nearly silent: {chunk.dBFS:.1f} dBFS")
+        if chunk.max_dBFS > -0.1:
+            raise ValueError(f"Chunk {chunk_index} is clipping: peak {chunk.max_dBFS:.1f} dBFS")
+
+        word_count = len(expected_text.split())
+        if word_count > 3:
+            expected_max_ms = int((word_count / 0.5) * 1000)
+            if len(chunk) > expected_max_ms:
+                raise ValueError(
+                    f"Chunk {chunk_index} duration {len(chunk)}ms is disproportionate "
+                    f"to text length ({word_count} words)"
+                )
+
+    def _flag_manual_review(self, chapter: Chapter, notes: list[str]) -> None:
+        """Mark chapters with skipped chunks for manual QA review."""
+
+        if not notes:
+            return
+
+        chapter.qa_status = QAStatus.NEEDS_REVIEW
+        chapter.qa_notes = "\n".join(notes)
 
     def _ensure_engine_loaded(self) -> None:
         """Load the engine on first generation request."""

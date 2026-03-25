@@ -150,7 +150,29 @@ class FlakyEngine:
         self.calls += 1
         if self.calls < 3:
             raise TimeoutError("temporary timeout")
-        return AudioSegment.silent(duration=250)
+        return Sine(220).to_audio_segment(duration=250, volume=-6.0)
+
+
+class ValidationFailureEngine:
+    """Test engine that produces one invalid chunk repeatedly."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.loaded = False
+        self.max_chunk_chars = 15
+
+    def load(self) -> None:
+        self.loaded = True
+
+    def unload(self) -> None:
+        self.loaded = False
+
+    def generate(self, text: str, voice: str, emotion: str | None = None, speed: float = 1.0) -> AudioSegment:
+        del voice, emotion, speed
+        self.calls += 1
+        if "Invalid chunk." in text:
+            return AudioSegment.silent(duration=250)
+        return Sine(220).to_audio_segment(duration=400, volume=-6.0)
 
 
 class ConsecutiveFailureGenerator:
@@ -331,6 +353,32 @@ async def test_generate_chapter_retries_transient_failures_before_succeeding(tes
     assert duration == 0.25
     assert generator.engine.calls == 3
     assert chapter.status == ChapterStatus.GENERATED
+
+
+@pytest.mark.asyncio
+async def test_generate_chapter_skips_invalid_chunks_and_flags_manual_review(test_db: Session) -> None:
+    """Persisted chapters should survive skipped invalid chunks but require manual QA review."""
+
+    generator = AudiobookGenerator(ValidationFailureEngine())
+    book = create_book(test_db, title="Manual Review Book")
+    chapter = create_chapter(
+        test_db,
+        book_id=book.id,
+        number=1,
+        title="Mixed Quality Chapter",
+        chapter_type=ChapterType.CHAPTER,
+        text="Valid chunk. Invalid chunk.",
+    )
+
+    duration = await generator.generate_chapter(book.id, chapter, test_db)
+
+    test_db.refresh(chapter)
+    assert duration > 0
+    assert chapter.status == ChapterStatus.GENERATED
+    assert chapter.qa_status.value == "needs_review"
+    assert chapter.qa_notes is not None
+    assert "skipped" in chapter.qa_notes
+    assert generator.engine.calls == 4
 
 
 @pytest.mark.asyncio

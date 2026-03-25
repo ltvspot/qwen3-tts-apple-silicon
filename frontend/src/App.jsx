@@ -3,6 +3,7 @@ import { BrowserRouter as Router, Route, Routes } from "react-router-dom";
 import ErrorBoundary from "./components/ErrorBoundary";
 import BookDetail from "./pages/BookDetail";
 import Library from "./pages/Library";
+import NotFound from "./pages/NotFound";
 import QA from "./pages/QA";
 import Queue from "./pages/Queue";
 import Settings from "./pages/Settings";
@@ -19,6 +20,7 @@ function App() {
           <Route path="/queue" element={<Queue />} />
           <Route path="/qa" element={<QA />} />
           <Route path="/settings" element={<Settings />} />
+          <Route path="*" element={<NotFound />} />
         </Routes>
       </ErrorBoundary>
     </Router>

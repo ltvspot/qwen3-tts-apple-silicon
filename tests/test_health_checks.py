@@ -44,6 +44,24 @@ async def test_check_output_directory_writable_reports_permission_error(
 
 
 @pytest.mark.asyncio
+async def test_check_output_directory_writable_ignores_cleanup_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Cleanup errors should not fail an otherwise successful writability check."""
+
+    monkeypatch.setattr(health_checks.settings, "OUTPUTS_PATH", str(tmp_path / "outputs"))
+
+    def raise_cleanup_error(self, missing_ok=False):
+        del self, missing_ok
+        raise PermissionError("cleanup denied")
+
+    monkeypatch.setattr(Path, "unlink", raise_cleanup_error)
+
+    await health_checks.check_output_directory_writable()
+
+
+@pytest.mark.asyncio
 async def test_run_all_health_checks_returns_warning_summary_for_noncritical_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

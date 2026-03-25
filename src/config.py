@@ -59,6 +59,12 @@ class EngineSettings(BaseModel):
         min_length=1,
         description="Filesystem path to the active TTS model directory.",
     )
+    chunk_timeout_seconds: int = Field(
+        default=120,
+        ge=10,
+        le=600,
+        description="Max seconds allowed for generating a single text chunk.",
+    )
 
 
 class OutputSettings(BaseModel):

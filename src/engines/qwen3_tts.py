@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -343,6 +344,41 @@ class Qwen3TTS(TTSEngine):
 
         return self._results_to_audio_segment(results, config.speed)
 
+    async def generate_chunk_with_timeout(
+        self,
+        text: str,
+        voice: str,
+        emotion: str | None = None,
+        speed: float = 1.0,
+    ) -> AudioSegment:
+        """Generate one chunk with best-effort timeout protection."""
+
+        timeout_seconds = get_application_settings().engine_config.chunk_timeout_seconds
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(self._generate_chunk_sync, text, voice, emotion, speed),
+                timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            snippet = text.strip().replace("\n", " ")[:50]
+            logger.error(
+                "Chunk generation timed out after %ss for text: %s...",
+                timeout_seconds,
+                snippet,
+            )
+            raise TimeoutError(f"Generation timed out after {timeout_seconds}s") from exc
+
+    def _generate_chunk_sync(
+        self,
+        text: str,
+        voice: str,
+        emotion: str | None = None,
+        speed: float = 1.0,
+    ) -> AudioSegment:
+        """Run chunk generation synchronously for async timeout wrappers."""
+
+        return self.generate(text, voice=voice, emotion=emotion, speed=speed)
+
     def _results_to_audio_segment(self, results: list[Any], speed: float) -> AudioSegment:
         """Convert MLX generation results into a single AudioSegment."""
 
@@ -404,16 +440,25 @@ class Qwen3TTS(TTSEngine):
 
         if speed == 1.0:
             return audio
-        adjusted = audio._spawn(audio.raw_data, overrides={"frame_rate": int(audio.frame_rate * speed)})
+        new_frame_rate = int(audio.frame_rate * speed)
+        adjusted = audio._spawn(audio.raw_data, overrides={"frame_rate": new_frame_rate})
+        # Resample back to the original frame rate so downstream tools see
+        # a consistent sample rate while the perceived speed has changed.
         return adjusted.set_frame_rate(audio.frame_rate)
 
     def _normalize_audio(self, audio: AudioSegment) -> AudioSegment:
-        """Normalize audio toward a consistent output level."""
+        """Normalize audio toward a consistent output level with peak limiting."""
 
         if audio.dBFS == float("-inf"):
             return audio
         target_dbfs = -18.0
-        return audio.apply_gain(target_dbfs - audio.dBFS)
+        normalized = audio.apply_gain(target_dbfs - audio.dBFS)
+        # Peak limiter: if normalization pushed peaks above -0.5 dBFS,
+        # reduce gain to prevent hard clipping / digital distortion.
+        peak_dbfs = normalized.max_dBFS
+        if peak_dbfs > -0.5:
+            normalized = normalized.apply_gain(-0.5 - peak_dbfs)
+        return normalized
 
     def _float_audio_to_segment(self, waveform: np.ndarray, sample_rate: int) -> AudioSegment:
         """Convert a float waveform in [-1, 1] to a mono 16-bit AudioSegment."""

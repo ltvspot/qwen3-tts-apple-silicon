@@ -35,6 +35,7 @@ def test_get_settings_returns_current_shape(client, test_db: Session, tmp_path: 
     assert payload["narrator_name"] == "Kent Zimering"
     assert payload["default_voice"]["name"] == "Ethan"
     assert payload["output_preferences"]["mp3_bitrate"] == 192
+    assert payload["engine_config"]["chunk_timeout_seconds"] == 120
 
 
 def test_put_settings_partial_update_deep_merges(client, test_db: Session, tmp_path: Path, monkeypatch) -> None:
@@ -84,6 +85,7 @@ def test_put_settings_full_update_replaces_payload(client, test_db: Session, tmp
             },
             "engine_config": {
                 "model_path": "models/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit",
+                "chunk_timeout_seconds": 180,
             },
             "output_preferences": {
                 "mp3_bitrate": 320,
@@ -100,6 +102,7 @@ def test_put_settings_full_update_replaces_payload(client, test_db: Session, tmp
     payload = response.json()
     assert payload["settings"]["narrator_name"] == "Alex Narrator"
     assert payload["settings"]["default_voice"]["name"] == "Nova"
+    assert payload["settings"]["engine_config"]["chunk_timeout_seconds"] == 180
     assert payload["settings"]["output_preferences"]["sample_rate"] == 48000
     assert payload["settings"]["output_preferences"]["include_album_art"] is False
 
@@ -115,6 +118,7 @@ def test_get_settings_schema_returns_json_schema(client) -> None:
     voice_name = payload["$defs"]["VoiceSettings"]["properties"]["name"]
     assert "Ethan" in voice_name["enum"]
     assert payload["$defs"]["OutputSettings"]["properties"]["mp3_bitrate"]["enum"] == [128, 192, 256, 320]
+    assert payload["$defs"]["EngineSettings"]["properties"]["chunk_timeout_seconds"]["default"] == 120
 
 
 def test_put_settings_invalid_values_returns_400(client, test_db: Session, tmp_path: Path, monkeypatch) -> None:

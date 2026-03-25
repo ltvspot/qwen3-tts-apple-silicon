@@ -85,7 +85,10 @@ async def check_output_directory_writable() -> None:
     except Exception as exc:  # pragma: no cover - exercised through tests
         raise HealthCheckError(f"Output directory not writable: {output_dir} ({exc})") from exc
     finally:
-        test_file.unlink(missing_ok=True)
+        try:
+            test_file.unlink(missing_ok=True)
+        except (OSError, PermissionError):
+            pass
 
 
 async def run_all_health_checks() -> StartupHealthSummary:
