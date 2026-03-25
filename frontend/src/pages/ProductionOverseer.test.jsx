@@ -313,4 +313,48 @@ describe("Production Overseer page", () => {
       expect(container.textContent).toContain("Chapter 7 peak exceeds -3 dB.");
     });
   });
+
+  test("shows actionable empty states when no overseer data exists yet", async () => {
+    fetchMock.mockImplementation((url) => {
+      if (url === "/api/queue?limit=10&offset=0") {
+        return Promise.resolve(createJsonResponse({ jobs: [], queue_stats: { total_books_in_queue: 0, total_chapters: 0 } }));
+      }
+      if (url === "/api/batch/progress") {
+        return Promise.resolve(createJsonResponse(null));
+      }
+      if (url === "/api/monitoring/resources") {
+        return Promise.resolve(createJsonResponse(null));
+      }
+      if (url === "/api/monitoring/model") {
+        return Promise.resolve(createJsonResponse(null));
+      }
+      if (url === "/api/overseer/quality-trend?last_n=20") {
+        return Promise.resolve(createJsonResponse({
+          alerts: [],
+          avg_chunks_regenerated: 0,
+          avg_gate1_pass_rate: 0,
+          avg_gate2_grade: 0,
+          avg_generation_rtf: 0,
+          books_analyzed: 0,
+          gate3_grade_distribution: { A: 0, B: 0, C: 0, F: 0 },
+          recent_books: [],
+          trend: "stable",
+          trend_points: [],
+        }));
+      }
+      if (url === "/api/overseer/flagged-items?limit=50") {
+        return Promise.resolve(createJsonResponse({ items: [] }));
+      }
+      throw new Error(`Unexpected fetch: ${url}`);
+    });
+
+    await renderPage();
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("No completed quality snapshots yet.");
+      expect(container.textContent).toContain("No overseer report available yet.");
+      expect(container.textContent).toContain("Open Queue");
+      expect(container.textContent).toContain("Open Library");
+    });
+  });
 });

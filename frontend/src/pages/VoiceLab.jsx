@@ -375,6 +375,10 @@ export default function VoiceLab() {
     };
   }, []);
 
+  useEffect(() => {
+    document.title = "Voice Lab | Alexandria Audiobook Narrator";
+  }, []);
+
   const handleGenerateAudio = async (isCompare = false) => {
     const selectedVoice = isCompare ? compareVoice : voice;
     const selectedEmotion = isCompare ? compareEmotion : emotion;

@@ -265,6 +265,7 @@ export default function ProductionOverseer() {
   const queueDepth = overview.queue?.queue_stats?.total_books_in_queue ?? 0;
   const trend = overview.trend;
   const recentBooks = trend?.recent_books ?? [];
+  const hasRecentBooks = recentBooks.length > 0;
   const selectedVerification = selectedReport?.export_verification ?? null;
   const selectedGate3 = selectedReport?.gate3_report ?? null;
   const readinessChecks = selectedVerification?.checks ?? [];
@@ -394,7 +395,25 @@ export default function ProductionOverseer() {
                 <tbody className="divide-y divide-slate-100 bg-white">
                   {recentBooks.length === 0 ? (
                     <tr>
-                      <td className="px-4 py-6 text-slate-500" colSpan="7">No completed quality snapshots yet.</td>
+                      <td className="px-4 py-6 text-slate-500" colSpan="7">
+                        <div className="flex flex-wrap items-center justify-between gap-3">
+                          <div>No completed quality snapshots yet. Run chapter generation and Gate 3 QA to populate the overseer trendline.</div>
+                          <div className="flex flex-wrap gap-2">
+                            <a
+                              className="rounded-full border border-slate-300 px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.18em] text-slate-700 transition hover:border-slate-900 hover:text-slate-950"
+                              href="/queue"
+                            >
+                              Open Queue
+                            </a>
+                            <a
+                              className="rounded-full bg-slate-950 px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.18em] text-white transition hover:bg-slate-800"
+                              href="/"
+                            >
+                              Open Library
+                            </a>
+                          </div>
+                        </div>
+                      </td>
                     </tr>
                   ) : recentBooks.map((book) => {
                     const ready = ["A", "B"].includes(book.gate3_overall_grade);
@@ -603,7 +622,30 @@ export default function ProductionOverseer() {
                 </div>
               </div>
             ) : (
-              <div className="text-sm text-slate-600">Select a recent book to inspect its full overseer report.</div>
+              <div className="rounded-[1.25rem] border border-dashed border-slate-300 bg-slate-50 px-4 py-5 text-sm text-slate-700">
+                <div className="font-semibold text-slate-900">
+                  {hasRecentBooks ? "Select a recent book to inspect its full overseer report." : "No overseer report available yet."}
+                </div>
+                <div className="mt-2">
+                  {hasRecentBooks
+                    ? "Pick a completed book from the trend table to inspect manuscript validation, flagged chapters, and export readiness."
+                    : "Generate a book, run Gate 2 and Gate 3 QA, then return here for the cross-book oversight view."}
+                </div>
+                <div className="mt-4 flex flex-wrap gap-2">
+                  <a
+                    className="rounded-full border border-slate-300 px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.18em] text-slate-700 transition hover:border-slate-900 hover:text-slate-950"
+                    href="/queue"
+                  >
+                    Open Queue
+                  </a>
+                  <a
+                    className="rounded-full bg-slate-950 px-3 py-1.5 text-xs font-semibold uppercase tracking-[0.18em] text-white transition hover:bg-slate-800"
+                    href="/"
+                  >
+                    Open Library
+                  </a>
+                </div>
+              </div>
             )}
           </SectionCard>
         </div>

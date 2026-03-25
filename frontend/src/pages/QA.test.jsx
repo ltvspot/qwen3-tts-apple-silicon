@@ -169,6 +169,8 @@ describe("QA dashboard page", () => {
       expect(container.textContent).toContain("Pending Manual");
     });
 
+    expect(document.title).toBe("QA Dashboard | Alexandria Audiobook Narrator");
+
     const selects = Array.from(container.querySelectorAll("select"));
     await act(async () => {
       setFormValue(selects[0], "pending_review");
@@ -399,6 +401,28 @@ describe("QA dashboard page", () => {
       expect(fetchMock.mock.calls[1][0]).toBe("/api/book/15/chapter/1/qa");
       expect(container.textContent).toContain("Flagged by Tim");
       expect(container.textContent).toContain("Long silence after paragraph three.");
+    });
+  });
+
+  test("shows an actionable empty state when no QA data exists yet", async () => {
+    fetchMock.mockResolvedValueOnce(createJsonResponse(createDashboardPayload({
+      books_needing_review: [],
+      summary: {
+        books_reviewed: 0,
+        chapters_fail: 0,
+        chapters_pass: 0,
+        chapters_pending_manual: 0,
+        chapters_reviewed: 0,
+        chapters_warning: 0,
+      },
+    })));
+
+    await renderQA();
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("No QA Data Yet");
+      expect(container.textContent).toContain("Open Queue");
+      expect(container.textContent).toContain("Open Library");
     });
   });
 });

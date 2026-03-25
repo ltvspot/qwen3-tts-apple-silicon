@@ -35,6 +35,16 @@ def test_api_routes_not_intercepted(client: TestClient) -> None:
     assert response.headers.get("content-type", "").startswith("application/json")
 
 
+def test_unknown_api_path_returns_json_404(client: TestClient) -> None:
+    """Unknown API GET routes should not be swallowed by the SPA catch-all."""
+
+    response = client.get("/api/qa/pending")
+
+    assert response.status_code == 404
+    assert response.headers.get("content-type", "").startswith("application/json")
+    assert response.json()["detail"] == "API route '/api/qa/pending' not found."
+
+
 def test_root_serves_frontend_or_404(client: TestClient) -> None:
     """Root path should serve index.html if frontend build exists."""
 

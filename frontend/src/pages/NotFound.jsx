@@ -1,8 +1,12 @@
-import React from "react";
+import React, { useEffect } from "react";
 import { Link } from "react-router-dom";
 import AppShell from "../components/AppShell";
 
 export default function NotFound() {
+  useEffect(() => {
+    document.title = "Page Not Found | Alexandria Audiobook Narrator";
+  }, []);
+
   return (
     <AppShell
       title="Page Not Found"

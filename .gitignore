@@ -7,12 +7,18 @@ __pycache__/
 *.sqlite3
 
 alexandria.db
+alexandria.db-shm
+alexandria.db-wal
+alexandria.db.bak
 
 Formatted Manuscripts/
 models/
 
 frontend/build/
 frontend/node_modules/
+frontend/node_modules.broken*/
+.playwright-cli/
+logs/
 
 outputs/*
 !outputs/.gitkeep

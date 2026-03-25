@@ -192,6 +192,7 @@ describe("Queue page", () => {
       expect(container.textContent).toContain("400");
     });
 
+    expect(document.title).toBe("Queue | Alexandria Audiobook Narrator");
     expect(fetchMock.mock.calls[0][0]).toBe("/api/queue?limit=100&offset=0");
 
     await act(async () => {

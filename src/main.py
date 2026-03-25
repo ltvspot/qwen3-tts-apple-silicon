@@ -12,7 +12,7 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -129,6 +129,9 @@ if _frontend_build.exists() and (_frontend_build / "index.html").exists():
     @app.get("/{full_path:path}")
     async def serve_spa(full_path: str):
         """Catch-all: serve index.html for any non-API route (React Router handles client routing)."""
+
+        if full_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail=f"API route '/{full_path}' not found.")
 
         file_path = _frontend_build / full_path
         if full_path and file_path.exists() and file_path.is_file():

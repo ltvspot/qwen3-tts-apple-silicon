@@ -284,6 +284,10 @@ export default function Library() {
     void fetchLibrary(statusFilter);
   }, [statusFilter]);
 
+  useEffect(() => {
+    document.title = "Library | Alexandria Audiobook Narrator";
+  }, []);
+
   useEffect(() => () => {
     stopScanPolling();
   }, []);

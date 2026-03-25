@@ -288,6 +288,7 @@ describe("BookDetail page", () => {
       expect(container.textContent).toContain("Opening credits text.");
     });
 
+    expect(document.title).toBe("The Test Chronicle | Alexandria Audiobook Narrator");
     expect(fetchMock.mock.calls[0][0]).toBe("/api/book/7");
     expect(fetchMock.mock.calls[1][0]).toBe("/api/book/7/chapters");
     expect(fetchMock.mock.calls[2][0]).toBe("/api/book/7/status");
@@ -749,6 +750,93 @@ describe("BookDetail page", () => {
 
     await waitFor(() => {
       expect(clipboardWriteMock).toHaveBeenCalledWith("http://localhost/api/book/7/export/download/mp3");
+    });
+  });
+
+  test("marks a historical partial export as past export available instead of ready to download", async () => {
+    const book = createBook({});
+    const chapters = [
+      createChapter({
+        audio_path: "7-the-test-chronicle/chapters/00-opening-credits.wav",
+        audio_file_size_bytes: 19000000,
+        completed_at: "2026-03-24T00:00:47+00:00",
+        duration_seconds: 252,
+        id: 701,
+        status: "generated",
+        title: "Opening Credits",
+      }),
+      createChapter({
+        id: 702,
+        number: 1,
+        status: "pending",
+        text_content: "Chapter one text.",
+        title: "Chapter One",
+        type: "chapter",
+        word_count: 500,
+      }),
+      createChapter({
+        id: 703,
+        number: 2,
+        status: "pending",
+        text_content: "Chapter two text.",
+        title: "Chapter Two",
+        type: "chapter",
+        word_count: 500,
+      }),
+    ];
+
+    fetchMock
+      .mockResolvedValueOnce(createJsonResponse(book))
+      .mockResolvedValueOnce(createJsonResponse(chapters))
+      .mockResolvedValueOnce(createJsonResponse(createStatusSnapshot({
+        chapters: [
+          {
+            audio_duration_seconds: 252,
+            audio_file_size_bytes: 19000000,
+            chapter_n: 0,
+            error_message: null,
+            generated_at: "2026-03-24T00:00:47+00:00",
+            generation_seconds: 47.2,
+            expected_total_seconds: 23.4,
+            progress_seconds: null,
+            started_at: "2026-03-24T00:00:00+00:00",
+            status: "completed",
+          },
+        ],
+      })))
+      .mockResolvedValueOnce(createJsonResponse(createExportSnapshot({
+        completed_at: "2026-03-24T00:10:00+00:00",
+        export_status: "completed",
+        formats: {
+          mp3: {
+            completed_at: "2026-03-24T00:10:00+00:00",
+            download_url: "/api/book/7/export/download/mp3",
+            error_message: null,
+            file_name: "The Test Chronicle.mp3",
+            file_size_bytes: 487923048,
+            status: "completed",
+          },
+        },
+        qa_report: {
+          book_id: 7,
+          book_title: "The Test Chronicle",
+          chapter_summary: [],
+          chapters_approved: 1,
+          chapters_flagged: 0,
+          chapters_included: 1,
+          chapters_warnings: 0,
+          export_approved: true,
+          export_date: "2026-03-24T00:10:00+00:00",
+          notes: "Partial export completed.",
+        },
+      })))
+      .mockResolvedValueOnce(createJsonResponse(createVoiceListPayload()));
+
+    await renderBookDetail();
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("Past export available");
+      expect(container.textContent).toContain("Generate the remaining chapters and re-export for a complete audiobook.");
     });
   });
 

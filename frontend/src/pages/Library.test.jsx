@@ -195,6 +195,7 @@ describe("Library page", () => {
       expect(getBookIds()).toEqual([1, 2, 3]);
     });
 
+    expect(document.title).toBe("Library | Alexandria Audiobook Narrator");
     expect(fetchMock.mock.calls).toHaveLength(2);
     expect(fetchMock.mock.calls[0][0]).toBe("/api/library?limit=500&offset=0");
     expect(fetchMock.mock.calls[1][0]).toBe("/api/library?limit=500&offset=2");

@@ -173,6 +173,22 @@ export default function BookDetail() {
     ([, format]) => format?.status === "error",
   );
   const exportInProgress = exportSubmitting || exportSnapshot?.export_status === "processing";
+  const lastExportChapterCount = exportSnapshot?.qa_report?.chapters_included ?? 0;
+  const exportHasArtifacts = exportCompletedFormats.length > 0;
+  const exportNeedsRefresh = (
+    exportHasArtifacts &&
+    mergedChapters.length > 0 &&
+    lastExportChapterCount < mergedChapters.length
+  );
+  const exportStatusLabel = exportSnapshot?.export_status === "processing"
+    ? "Export running"
+    : exportSnapshot?.export_status === "error"
+      ? "Export error"
+      : exportNeedsRefresh
+        ? "Past export available"
+        : exportHasArtifacts
+          ? "Ready to download"
+          : "Not exported";
   const bookQualityEligible = chapters.length > 0 && chapters.every((chapter) => chapter.status === "generated");
   const bookQualityBusy = bookQualityLoading || bookQualityAction !== null;
 
@@ -185,6 +201,20 @@ export default function BookDetail() {
   useEffect(() => {
     void fetchBookData();
   }, [id]);
+
+  useEffect(() => {
+    if (notFound) {
+      document.title = "Book Not Found | Alexandria Audiobook Narrator";
+      return;
+    }
+
+    if (book?.title) {
+      document.title = `${book.title} | Alexandria Audiobook Narrator`;
+      return;
+    }
+
+    document.title = "Book Detail | Alexandria Audiobook Narrator";
+  }, [book?.title, notFound]);
 
   useEffect(() => () => {
     if (voiceRetryTimeoutRef.current) {
@@ -1108,19 +1138,20 @@ export default function BookDetail() {
                     </p>
                   </div>
                   <div className="inline-flex items-center rounded-full border border-white/10 bg-slate-950/45 px-4 py-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-300">
-                    {exportSnapshot?.export_status === "completed"
-                      ? "Ready to download"
-                      : exportSnapshot?.export_status === "processing"
-                        ? "Export running"
-                        : exportSnapshot?.export_status === "error"
-                          ? "Export error"
-                          : "Not exported"}
+                    {exportStatusLabel}
                   </div>
                 </div>
 
                 {exportSnapshot?.completed_at ? (
                   <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
                     Last export: {formatTimestamp(exportSnapshot.completed_at) ?? "Unknown"}
+                  </div>
+                ) : null}
+
+                {exportNeedsRefresh ? (
+                  <div className="rounded-3xl border border-amber-300/25 bg-amber-400/10 px-4 py-4 text-sm leading-7 text-amber-100">
+                    A past export file is available, but this book has {mergedChapters.length - lastExportChapterCount} chapter
+                    {mergedChapters.length - lastExportChapterCount === 1 ? "" : "s"} missing from the latest export. Generate the remaining chapters and re-export for a complete audiobook.
                   </div>
                 ) : null}
 

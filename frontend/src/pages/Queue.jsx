@@ -120,6 +120,10 @@ export default function Queue() {
     };
   }, []);
 
+  useEffect(() => {
+    document.title = "Queue | Alexandria Audiobook Narrator";
+  }, []);
+
   async function loadJobDetails(jobId, { showLoading = true } = {}) {
     const requestId = detailRequestRef.current + 1;
     detailRequestRef.current = requestId;

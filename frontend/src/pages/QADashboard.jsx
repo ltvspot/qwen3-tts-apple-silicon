@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
+import { Link } from "react-router-dom";
 import AppShell from "../components/AppShell";
 import ChapterQACard from "../components/ChapterQACard";
 import QAStatusBadge from "../components/QAStatusBadge";
@@ -144,6 +145,10 @@ export default function QADashboard() {
     };
   }, []);
 
+  useEffect(() => {
+    document.title = "QA Dashboard | Alexandria Audiobook Narrator";
+  }, []);
+
   async function loadDashboard({ showLoading = true } = {}) {
     const requestId = requestRef.current + 1;
     requestRef.current = requestId;
@@ -209,6 +214,8 @@ export default function QADashboard() {
     selectedBookId,
     sortBy,
   );
+  const hasAnyReviewedBooks = dashboard.books_needing_review.length > 0;
+  const hasActiveFilters = Boolean(statusFilter || selectedBookId);
   const visibleSummary = summarizeBooks(visibleBooks);
 
   async function submitManualReview(chapter, manualStatus, notes = "") {
@@ -397,10 +404,40 @@ export default function QADashboard() {
 
           {!loading && visibleBooks.length === 0 ? (
             <div className="rounded-3xl border border-dashed border-slate-300 bg-white px-6 py-12 text-center shadow-sm">
-              <div className="text-sm font-semibold uppercase tracking-[0.24em] text-slate-500">No Matching QA Data</div>
+              <div className="text-sm font-semibold uppercase tracking-[0.24em] text-slate-500">
+                {hasAnyReviewedBooks ? "No Matching QA Data" : "No QA Data Yet"}
+              </div>
               <p className="mt-3 text-sm text-slate-600">
-                Generate a chapter to populate automatic QA, or loosen the current filters.
+                {hasAnyReviewedBooks
+                  ? "Loosen the current filters, or jump back to the queue to review a different job."
+                  : "Generate a chapter to populate automatic QA, then return here for automatic and manual review."}
               </p>
+              <div className="mt-6 flex flex-wrap justify-center gap-3">
+                {hasActiveFilters ? (
+                  <button
+                    className="inline-flex items-center justify-center rounded-full border border-slate-300 px-5 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-slate-700 transition hover:border-slate-900 hover:text-slate-950"
+                    onClick={() => {
+                      setSelectedBookId("");
+                      setStatusFilter("");
+                    }}
+                    type="button"
+                  >
+                    Clear Filters
+                  </button>
+                ) : null}
+                <Link
+                  className="inline-flex items-center justify-center rounded-full border border-slate-300 px-5 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-slate-700 transition hover:border-slate-900 hover:text-slate-950"
+                  to="/queue"
+                >
+                  Open Queue
+                </Link>
+                <Link
+                  className="inline-flex items-center justify-center rounded-full bg-slate-950 px-5 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-white transition hover:bg-slate-800"
+                  to="/"
+                >
+                  Open Library
+                </Link>
+              </div>
             </div>
           ) : null}
 

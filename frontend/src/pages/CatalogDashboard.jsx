@@ -140,6 +140,10 @@ export default function CatalogDashboard() {
     };
   }, []);
 
+  useEffect(() => {
+    document.title = "Catalog Dashboard | Alexandria Audiobook Narrator";
+  }, []);
+
   async function loadBatchEstimate(config) {
     setBatchEstimateLoading(true);
     setBatchEstimateError("");
