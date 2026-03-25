@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 import tempfile
 import uuid
-from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +13,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from src.api import generation_runtime
 from src.config import settings
 from src.engines import AudioStitcher, Qwen3TTS, TextChunker
 from src.engines.voice_cloner import VoiceCloner
@@ -95,30 +95,17 @@ class DeleteClonedVoiceResponse(BaseModel):
     message: str
 
 
-@lru_cache(maxsize=1)
-def _build_engine() -> Qwen3TTS:
-    """Create and cache the configured TTS engine."""
+async def get_engine() -> Qwen3TTS:
+    """Return the shared TTS engine instance managed by the runtime."""
 
-    engine = Qwen3TTS()
-    engine.load()
+    engine = await generation_runtime.get_model_manager().get_engine()
     return engine
-
-
-def get_engine() -> Qwen3TTS:
-    """Return the cached TTS engine instance."""
-
-    return _build_engine()
 
 
 def release_engine() -> None:
     """Unload the cached engine, if one has been created."""
 
-    if _build_engine.cache_info().currsize == 0:
-        return
-
-    engine = _build_engine()
-    engine.unload()
-    _build_engine.cache_clear()
+    generation_runtime.release_model_manager()
 
 
 def _voice_cloner() -> VoiceCloner:
@@ -165,7 +152,7 @@ async def test_voice(request: VoiceTestRequest) -> VoiceTestResponse:
         raise HTTPException(status_code=400, detail="Text cannot be empty.")
 
     try:
-        engine = get_engine()
+        engine = await get_engine()
         chunks = TextChunker.chunk_text(text, engine.max_chunk_chars)
         logger.info("Generating voice lab test with %s text chunks", len(chunks))
 
@@ -212,7 +199,7 @@ async def get_voices(db: Session = Depends(get_db)) -> VoiceListResponse:
     """Return the currently available voices for the configured engine."""
 
     try:
-        engine = get_engine()
+        engine = await get_engine()
         cloned_lookup = {
             record.voice_name: record
             for record in _cloned_voice_records(db)

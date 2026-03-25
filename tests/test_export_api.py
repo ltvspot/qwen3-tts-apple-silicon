@@ -8,7 +8,17 @@ from urllib.parse import unquote
 from sqlalchemy.orm import Session
 
 from src.api import export_routes
-from src.database import Book, BookExportStatus, BookStatus, ExportJob, utc_now
+from src.database import (
+    Book,
+    BookExportStatus,
+    BookStatus,
+    Chapter,
+    ChapterStatus,
+    ChapterType,
+    ExportJob,
+    QAStatus,
+    utc_now,
+)
 from src.pipeline.exporter import get_export_output_path
 
 
@@ -25,6 +35,27 @@ def _create_book(test_db: Session, *, title: str = "Export API Book") -> Book:
     test_db.commit()
     test_db.refresh(book)
     return book
+
+
+def _create_ready_chapter(test_db: Session, *, book_id: int, number: int = 1) -> Chapter:
+    """Create one generated and QA-approved chapter."""
+
+    chapter = Chapter(
+        book_id=book_id,
+        number=number,
+        title=f"Chapter {number}",
+        type=ChapterType.CHAPTER,
+        text_content="Ready for export.",
+        word_count=4,
+        status=ChapterStatus.GENERATED,
+        qa_status=QAStatus.APPROVED,
+        audio_path=f"exports/{book_id}/chapter-{number}.wav",
+        duration_seconds=12.5,
+    )
+    test_db.add(chapter)
+    test_db.commit()
+    test_db.refresh(chapter)
+    return chapter
 
 
 def test_post_export_creates_processing_job_and_returns_queue_payload(
@@ -141,6 +172,62 @@ def test_get_export_status_returns_completed_formats_and_qa_report(client, test_
     assert payload["formats"]["m4b"]["download_url"] == f"/api/book/{book.id}/export/download/m4b"
     assert payload["qa_report"]["chapters_flagged"] == 1
     assert payload["qa_report"]["chapter_summary"][0]["chapter_title"] == "Chapter One"
+
+
+def test_batch_export_queues_ready_books_and_exposes_progress(client, test_db: Session, monkeypatch) -> None:
+    """Batch export should queue eligible books and surface in-memory progress."""
+
+    ready_book = _create_book(test_db, title="Ready For Batch Export")
+    skipped_book = _create_book(test_db, title="Already Exported")
+    not_ready_book = _create_book(test_db, title="Still Waiting")
+
+    _create_ready_chapter(test_db, book_id=ready_book.id)
+    _create_ready_chapter(test_db, book_id=skipped_book.id)
+    test_db.add(
+        Chapter(
+            book_id=not_ready_book.id,
+            number=1,
+            title="Draft Chapter",
+            type=ChapterType.CHAPTER,
+            text_content="Pending QA.",
+            word_count=2,
+            status=ChapterStatus.PENDING,
+            qa_status=QAStatus.NOT_REVIEWED,
+        )
+    )
+    skipped_book.export_status = BookExportStatus.COMPLETED
+    test_db.commit()
+
+    launched_jobs: list[int] = []
+    monkeypatch.setattr(export_routes, "estimate_export_seconds", lambda *args, **kwargs: 60)
+    monkeypatch.setattr(
+        export_routes,
+        "_launch_export_job",
+        lambda export_job_id, session_factory=None: launched_jobs.append(export_job_id),
+    )
+
+    response = client.post(
+        "/api/export/batch",
+        json={
+            "formats": ["mp3"],
+            "include_only_approved": True,
+            "skip_already_exported": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["queued"] == 1
+    assert response.json()["skipped"] == 1
+    assert response.json()["not_ready"] == 1
+    assert len(launched_jobs) == 1
+
+    progress_response = client.get("/api/export/batch/progress")
+    assert progress_response.status_code == 200
+    progress = progress_response.json()
+    assert progress["queued"] == 1
+    assert progress["skipped"] == 1
+    assert progress["not_ready"] == 1
+    assert progress["books"][0]["title"] == "Ready For Batch Export"
 
 
 def test_download_export_serves_audio_file(client, test_db: Session) -> None:

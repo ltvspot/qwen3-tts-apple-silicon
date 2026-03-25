@@ -8,7 +8,16 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
-from src.database import Book, Chapter, ChapterQARecord, QAAutomaticStatus, QAManualStatus, get_db, utc_now
+from src.database import (
+    Book,
+    Chapter,
+    ChapterQARecord,
+    QAAutomaticStatus,
+    QAManualStatus,
+    QAStatus,
+    get_db,
+    utc_now,
+)
 from src.pipeline.qa_checker import apply_manual_review, build_qa_record_response
 
 router = APIRouter(prefix="/api", tags=["qa"])
@@ -107,6 +116,27 @@ class QADashboardResponse(BaseModel):
 
     books_needing_review: list[DashboardBookResponse]
     summary: DashboardSummaryResponse
+
+
+class BatchApproveResponse(BaseModel):
+    """Batch QA approval response."""
+
+    approved: int
+    skipped: int
+    flagged: int
+
+
+class CatalogQASummaryResponse(BaseModel):
+    """Catalog-wide QA summary."""
+
+    total_books: int
+    books_all_approved: int
+    books_with_flags: int
+    books_pending_qa: int
+    total_chapters: int
+    chapters_approved: int
+    chapters_flagged: int
+    chapters_pending: int
 
 
 def _load_chapter_or_404(book_id: int, chapter_n: int, db: Session) -> Chapter:
@@ -347,4 +377,135 @@ async def get_qa_dashboard(
             chapters_fail=sum(record.overall_status == QAAutomaticStatus.FAIL for record in summary_records),
             chapters_pending_manual=sum(_chapter_needs_manual_review(record) for record in summary_records),
         ),
+    )
+
+
+def _batch_approve_records(
+    records: list[ChapterQARecord],
+    chapter_lookup: dict[tuple[int, int], Chapter],
+    *,
+    approve_warnings: bool,
+    db: Session,
+) -> BatchApproveResponse:
+    """Approve all eligible QA records and return aggregate counts."""
+
+    approved = 0
+    skipped = 0
+    flagged = 0
+    allowed_statuses = {QAAutomaticStatus.PASS}
+    if approve_warnings:
+        allowed_statuses.add(QAAutomaticStatus.WARNING)
+
+    for record in records:
+        chapter = chapter_lookup.get((record.book_id, record.chapter_n))
+        if chapter is None:
+            skipped += 1
+            continue
+
+        if record.manual_status == QAManualStatus.APPROVED or chapter.qa_status == QAStatus.APPROVED:
+            skipped += 1
+            continue
+
+        if record.manual_status == QAManualStatus.FLAGGED or record.overall_status == QAAutomaticStatus.FAIL:
+            flagged += 1
+            continue
+
+        if record.overall_status not in allowed_statuses:
+            skipped += 1
+            continue
+
+        apply_manual_review(
+            db,
+            chapter,
+            QAManualStatus.APPROVED,
+            reviewed_by="Batch QA",
+            notes=record.manual_notes,
+        )
+        approved += 1
+
+    db.commit()
+    return BatchApproveResponse(approved=approved, skipped=skipped, flagged=flagged)
+
+
+@router.post("/qa/batch-approve/{book_id}", response_model=BatchApproveResponse)
+async def batch_approve_book(
+    book_id: int,
+    approve_warnings: bool = Query(default=False),
+    db: Session = Depends(get_db),
+) -> BatchApproveResponse:
+    """Approve all eligible QA results for one book."""
+
+    book = db.query(Book).filter(Book.id == book_id).first()
+    if book is None:
+        raise HTTPException(status_code=404, detail=f"Book {book_id} not found")
+
+    records = (
+        db.query(ChapterQARecord)
+        .filter(ChapterQARecord.book_id == book_id)
+        .order_by(ChapterQARecord.chapter_n.asc())
+        .all()
+    )
+    chapter_lookup = {
+        (chapter.book_id, chapter.number): chapter
+        for chapter in db.query(Chapter).filter(Chapter.book_id == book_id).all()
+    }
+    return _batch_approve_records(records, chapter_lookup, approve_warnings=approve_warnings, db=db)
+
+
+@router.post("/qa/batch-approve-all", response_model=BatchApproveResponse)
+async def batch_approve_all(
+    approve_warnings: bool = Query(default=False),
+    db: Session = Depends(get_db),
+) -> BatchApproveResponse:
+    """Approve all eligible QA results across the full catalog."""
+
+    records = db.query(ChapterQARecord).order_by(ChapterQARecord.book_id.asc(), ChapterQARecord.chapter_n.asc()).all()
+    chapter_lookup = {
+        (chapter.book_id, chapter.number): chapter
+        for chapter in db.query(Chapter).all()
+    }
+    return _batch_approve_records(records, chapter_lookup, approve_warnings=approve_warnings, db=db)
+
+
+@router.get("/qa/catalog-summary", response_model=CatalogQASummaryResponse)
+async def get_catalog_qa_summary(db: Session = Depends(get_db)) -> CatalogQASummaryResponse:
+    """Return catalog-wide QA summary counts."""
+
+    books = db.query(Book).all()
+    chapters = db.query(Chapter).all()
+
+    chapters_by_book: dict[int, list[Chapter]] = {}
+    for chapter in chapters:
+        chapters_by_book.setdefault(chapter.book_id, []).append(chapter)
+
+    books_all_approved = 0
+    books_with_flags = 0
+    books_pending_qa = 0
+
+    for book in books:
+        book_chapters = chapters_by_book.get(book.id, [])
+        if not book_chapters:
+            books_pending_qa += 1
+            continue
+
+        if all(chapter.qa_status == QAStatus.APPROVED for chapter in book_chapters):
+            books_all_approved += 1
+        elif any(chapter.qa_status == QAStatus.NEEDS_REVIEW for chapter in book_chapters):
+            books_with_flags += 1
+        else:
+            books_pending_qa += 1
+
+    chapters_approved = sum(chapter.qa_status == QAStatus.APPROVED for chapter in chapters)
+    chapters_flagged = sum(chapter.qa_status == QAStatus.NEEDS_REVIEW for chapter in chapters)
+    chapters_pending = len(chapters) - chapters_approved - chapters_flagged
+
+    return CatalogQASummaryResponse(
+        total_books=len(books),
+        books_all_approved=books_all_approved,
+        books_with_flags=books_with_flags,
+        books_pending_qa=books_pending_qa,
+        total_chapters=len(chapters),
+        chapters_approved=chapters_approved,
+        chapters_flagged=chapters_flagged,
+        chapters_pending=chapters_pending,
     )

@@ -165,10 +165,24 @@ def _build_library_stats(db: Session) -> LibraryStats:
     return LibraryStats(**counts)
 
 
-def _library_cache_key(*, status_filter: BookStatus | None, limit: int, offset: int) -> str:
+def _library_cache_key(*, status_filter: BookStatus | None, limit: int, offset: int, sort: str) -> str:
     """Build the cache key for a library listing query."""
 
-    return f"library:{status_filter.value if status_filter is not None else 'all'}:{limit}:{offset}"
+    return f"library:{status_filter.value if status_filter is not None else 'all'}:{sort}:{limit}:{offset}"
+
+
+def _apply_library_sort(query, sort: str):
+    """Apply a stable ordering for library list queries."""
+
+    if sort == "updated_at":
+        return query.order_by(Book.updated_at.desc(), Book.id.desc())
+    if sort == "title":
+        return query.order_by(Book.title.asc(), Book.id.asc())
+    if sort == "author":
+        return query.order_by(Book.author.asc(), Book.id.asc())
+    if sort != "created_at":
+        raise HTTPException(status_code=400, detail="Unsupported library sort.")
+    return query.order_by(Book.created_at.asc(), Book.id.asc())
 
 
 @router.post("/library/scan", response_model=LibraryScanResponse)
@@ -192,20 +206,22 @@ async def scan_library(db: Session = Depends(get_db)) -> LibraryScanResponse:
 @router.get("/library", response_model=LibraryResponse)
 async def get_library(
     status_filter: BookStatus | None = None,
+    sort: str = Query(default="created_at"),
     limit: int = Query(default=100, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
 ) -> LibraryResponse:
     """Return paginated library books plus lifecycle statistics."""
 
-    cache_key = _library_cache_key(status_filter=status_filter, limit=limit, offset=offset)
+    cache_key = _library_cache_key(status_filter=status_filter, limit=limit, offset=offset, sort=sort)
     cached_payload = library_cache.get(cache_key)
     if cached_payload is not None:
         return LibraryResponse(**cached_payload)
 
-    query = db.query(Book).options(selectinload(Book.chapters)).order_by(Book.created_at, Book.id)
+    query = db.query(Book).options(selectinload(Book.chapters))
     if status_filter is not None:
         query = query.filter(Book.status == status_filter)
+    query = _apply_library_sort(query, sort)
 
     total = query.count()
     books = query.offset(offset).limit(limit).all()

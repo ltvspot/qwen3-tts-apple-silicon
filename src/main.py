@@ -17,11 +17,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from src import __version__
+from src.api.batch_routes import router as batch_router
 from src.api.error_handlers import register_error_handlers
 from src.api.export_routes import router as export_router
 from src.api.generation import router as generation_router
 from src.api.generation_runtime import shutdown_generation_runtime
 from src.api.middleware import request_context_middleware
+from src.api.monitoring_routes import router as monitoring_router
 from src.api.qa_routes import router as qa_router
 from src.api.queue_routes import router as queue_router
 from src.api.settings_routes import router as settings_router
@@ -80,8 +82,10 @@ app.add_middleware(
 app.middleware("http")(request_context_middleware)
 register_error_handlers(app)
 app.include_router(api_router)
+app.include_router(batch_router)
 app.include_router(export_router)
 app.include_router(generation_router)
+app.include_router(monitoring_router)
 app.include_router(qa_router)
 app.include_router(queue_router)
 app.include_router(settings_router)

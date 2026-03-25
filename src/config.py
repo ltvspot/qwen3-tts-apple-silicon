@@ -65,6 +65,36 @@ class EngineSettings(BaseModel):
         le=600,
         description="Max seconds allowed for generating a single text chunk.",
     )
+    consecutive_failure_threshold: int = Field(
+        default=5,
+        ge=1,
+        le=20,
+        description="Number of consecutive chapter failures allowed before stopping a job.",
+    )
+    cooldown_chapter_threshold: int = Field(
+        default=50,
+        ge=1,
+        le=500,
+        description="Reload the TTS engine after this many completed chapters.",
+    )
+    cooldown_chunk_threshold: int = Field(
+        default=2000,
+        ge=10,
+        le=10000,
+        description="Reload the TTS engine after this many generated chunks.",
+    )
+    cooldown_time_threshold_seconds: int = Field(
+        default=7200,
+        ge=60,
+        le=86400,
+        description="Reload the TTS engine after this many seconds since the last reload.",
+    )
+    memory_pressure_threshold_mb: float = Field(
+        default=12000.0,
+        ge=512.0,
+        le=262144.0,
+        description="Force a TTS engine reload when process memory rises above this threshold.",
+    )
 
 
 class OutputSettings(BaseModel):

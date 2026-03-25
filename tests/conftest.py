@@ -10,6 +10,8 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from src.api import export_routes
+from src.api import generation_runtime
 from src.config import reset_settings_manager
 from src.database import Base, get_db
 from src.main import app
@@ -24,6 +26,35 @@ def isolated_settings_manager() -> Generator[None, None, None]:
         yield
     finally:
         reset_settings_manager()
+
+
+@pytest.fixture(autouse=True)
+def isolated_generation_runtime() -> Generator[None, None, None]:
+    """Reset process-local generation singletons around each test."""
+
+    export_routes._export_tasks.clear()
+    export_routes._batch_export_monitor_task = None
+    export_routes._batch_export_progress = None
+    generation_runtime.release_model_manager()
+    generation_runtime._generator = None
+    generation_runtime._queue = None
+    generation_runtime._resource_monitor = None
+    generation_runtime._batch_orchestrator = None
+    try:
+        yield
+    finally:
+        for task in list(export_routes._export_tasks):
+            task.cancel()
+        export_routes._export_tasks.clear()
+        if export_routes._batch_export_monitor_task is not None:
+            export_routes._batch_export_monitor_task.cancel()
+        export_routes._batch_export_monitor_task = None
+        export_routes._batch_export_progress = None
+        generation_runtime.release_model_manager()
+        generation_runtime._generator = None
+        generation_runtime._queue = None
+        generation_runtime._resource_monitor = None
+        generation_runtime._batch_orchestrator = None
 
 
 @pytest.fixture(scope="function")

@@ -25,6 +25,8 @@ def test_database_schema_and_basic_crud(test_db: Session) -> None:
 
     inspector = inspect(test_db.get_bind())
     assert set(inspector.get_table_names()) == {
+        "batch_book_status",
+        "batch_runs",
         "books",
         "chapters",
         "cloned_voices",

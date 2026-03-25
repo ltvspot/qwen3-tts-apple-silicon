@@ -12,6 +12,11 @@ jest.mock("./pages/BookDetail", () => ({
   default: () => <div>Book Detail</div>,
 }));
 
+jest.mock("./pages/CatalogDashboard", () => ({
+  __esModule: true,
+  default: () => <div>Catalog Dashboard</div>,
+}));
+
 jest.mock("./pages/Library", () => ({
   __esModule: true,
   default: () => <div>Library</div>,
@@ -91,6 +96,14 @@ describe("App routes", () => {
 
     await waitFor(() => {
       expect(container.textContent).toContain("Page not found");
+    });
+  });
+
+  test("renders_catalog_route", async () => {
+    await renderAppAt("/catalog");
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("Catalog Dashboard");
     });
   });
 

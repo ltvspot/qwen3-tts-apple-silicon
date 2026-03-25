@@ -1,0 +1,525 @@
+"""Catalog-scale batch generation orchestration."""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta, timezone
+from enum import Enum
+from typing import Any, Callable
+
+from sqlalchemy.orm import Session
+
+from src.database import (
+    BatchBookStatus,
+    BatchRun,
+    Book,
+    BookExportStatus,
+    GenerationJob,
+    GenerationJobStatus,
+    GenerationJobType,
+    utc_now,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class BatchStatus(str, Enum):
+    """Lifecycle state for a batch generation run."""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    PAUSED = "paused"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+@dataclass(slots=True)
+class BatchBookResult:
+    """Execution result for one book inside a batch."""
+
+    book_id: int
+    title: str
+    status: str
+    chapters_total: int = 0
+    chapters_completed: int = 0
+    chapters_failed: int = 0
+    error_message: str | None = None
+    started_at: str | None = None
+    completed_at: str | None = None
+    duration_seconds: float = 0.0
+
+
+@dataclass(slots=True)
+class BatchProgress:
+    """Aggregated progress state for an active or completed batch."""
+
+    batch_id: str
+    status: BatchStatus = BatchStatus.PENDING
+    total_books: int = 0
+    books_completed: int = 0
+    books_failed: int = 0
+    books_skipped: int = 0
+    books_in_progress: int = 0
+    current_book_id: int | None = None
+    current_book_title: str | None = None
+    started_at: str | None = None
+    estimated_completion: str | None = None
+    elapsed_seconds: float = 0.0
+    avg_seconds_per_book: float = 0.0
+    book_results: list[BatchBookResult] = field(default_factory=list)
+    resource_warnings: list[str] = field(default_factory=list)
+    model_reloads: int = 0
+    pause_reason: str | None = None
+
+
+class BatchOrchestrator:
+    """Coordinate multi-book generation with resource and runtime visibility."""
+
+    PRIORITY_MAP = {
+        "urgent": 90,
+        "normal": 50,
+        "backlog": 10,
+    }
+
+    def __init__(
+        self,
+        queue_manager: Any,
+        model_manager: Any,
+        resource_monitor: Any,
+        db_session_factory: Callable[[], Session],
+    ) -> None:
+        """Initialize orchestrator state."""
+
+        self.queue_manager = queue_manager
+        self.model_manager = model_manager
+        self.resource_monitor = resource_monitor
+        self.db_session_factory = db_session_factory
+        self.resource_poll_interval_seconds = 30.0
+        self._progress: BatchProgress | None = None
+        self._cancel_event = asyncio.Event()
+        self._pause_event = asyncio.Event()
+        self._pause_event.set()
+        self._task: asyncio.Task[None] | None = None
+        self._priority_value = self.PRIORITY_MAP["normal"]
+
+    @property
+    def progress(self) -> BatchProgress | None:
+        """Return the current in-memory batch progress payload."""
+
+        return self._progress
+
+    async def start_batch(
+        self,
+        book_ids: list[int],
+        batch_id: str | None = None,
+        priority: str = "normal",
+        skip_already_exported: bool = True,
+    ) -> BatchProgress:
+        """Start a batch generation run for the supplied books."""
+
+        if self._task is not None and not self._task.done():
+            raise RuntimeError("A batch is already running. Cancel it first.")
+
+        batch_identifier = batch_id or f"batch_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+        self._priority_value = self.PRIORITY_MAP.get(priority, self.PRIORITY_MAP["normal"])
+        self._progress = BatchProgress(
+            batch_id=batch_identifier,
+            total_books=len(book_ids),
+            started_at=datetime.now(timezone.utc).isoformat(),
+        )
+        self._cancel_event.clear()
+        self._pause_event.set()
+        self._persist_run()
+
+        if not book_ids:
+            self._progress.status = BatchStatus.COMPLETED
+            self._persist_run()
+            return self._progress
+
+        self._task = asyncio.create_task(
+            self._run_batch(book_ids, skip_already_exported),
+            name=f"batch-orchestrator-{batch_identifier}",
+        )
+        return self._progress
+
+    async def _run_batch(self, book_ids: list[int], skip_exported: bool) -> None:
+        """Execute the batch run sequentially across the requested books."""
+
+        if self._progress is None:
+            return
+
+        self._progress.status = BatchStatus.RUNNING
+        self._persist_run()
+        batch_started_at = datetime.now(timezone.utc)
+        completed_durations: list[float] = []
+
+        for index, book_id in enumerate(book_ids):
+            if self._cancel_event.is_set():
+                self._progress.status = BatchStatus.CANCELLED
+                self._persist_run()
+                return
+
+            await self._pause_event.wait()
+            await self._wait_for_resources()
+
+            if self._cancel_event.is_set():
+                self._progress.status = BatchStatus.CANCELLED
+                self._persist_run()
+                return
+
+            with self.db_session_factory() as db_session:
+                book = db_session.query(Book).filter(Book.id == book_id).first()
+                if book is None:
+                    self._record_result(
+                        BatchBookResult(
+                            book_id=book_id,
+                            title=f"Book {book_id}",
+                            status="skipped",
+                            error_message="Book not found.",
+                        )
+                    )
+                    continue
+
+                if skip_exported and book.export_status == BookExportStatus.COMPLETED:
+                    self._record_result(
+                        BatchBookResult(
+                            book_id=book_id,
+                            title=book.title,
+                            status="skipped",
+                        )
+                    )
+                    continue
+
+                self._progress.current_book_id = book.id
+                self._progress.current_book_title = book.title
+                self._progress.books_in_progress = 1
+                self._progress.model_reloads = self.model_manager.stats.reload_count
+                self._persist_run()
+
+                book_started_at = datetime.now(timezone.utc)
+                result = BatchBookResult(
+                    book_id=book.id,
+                    title=book.title,
+                    status="running",
+                    started_at=book_started_at.isoformat(),
+                )
+                self._persist_book_result(result)
+
+                try:
+                    job_id = await self.queue_manager.enqueue_book(
+                        book.id,
+                        db_session,
+                        priority=self._priority_value,
+                        job_type=GenerationJobType.BATCH_ALL,
+                    )
+                except Exception as exc:
+                    logger.exception("Failed to enqueue batch book %s", book.id)
+                    result.status = "failed"
+                    result.error_message = str(exc)
+                    result.completed_at = datetime.now(timezone.utc).isoformat()
+                    self._record_result(result)
+                    continue
+
+            result = await self._wait_for_job(result, job_id)
+            self._record_result(result)
+
+            if result.status == "completed":
+                completed_durations.append(result.duration_seconds)
+            self._update_eta(index, len(book_ids), batch_started_at, completed_durations)
+
+        if self._progress.status == BatchStatus.RUNNING:
+            self._progress.status = BatchStatus.COMPLETED
+        self._progress.current_book_id = None
+        self._progress.current_book_title = None
+        self._progress.books_in_progress = 0
+        self._progress.model_reloads = self.model_manager.stats.reload_count
+        self._persist_run()
+
+    async def _wait_for_resources(self) -> None:
+        """Block until monitored resources are healthy enough to continue."""
+
+        if self._progress is None:
+            return
+
+        while True:
+            await self._pause_event.wait()
+            can_proceed, warnings = self.resource_monitor.check_can_proceed()
+            self._progress.resource_warnings = warnings
+            if can_proceed:
+                if self._progress.status == BatchStatus.PAUSED and self._progress.pause_reason:
+                    self._progress.status = BatchStatus.RUNNING
+                    self._progress.pause_reason = None
+                self._persist_run()
+                return
+
+            self._progress.status = BatchStatus.PAUSED
+            self._progress.pause_reason = "; ".join(warnings) or "Resources unavailable."
+            self._persist_run()
+            logger.warning("Batch paused due to resource constraints: %s", self._progress.pause_reason)
+
+            if self._cancel_event.is_set():
+                return
+
+            await asyncio.sleep(self.resource_poll_interval_seconds)
+
+    async def _wait_for_job(self, result: BatchBookResult, job_id: int) -> BatchBookResult:
+        """Poll a queued job until it reaches a terminal state."""
+
+        while True:
+            if self._cancel_event.is_set():
+                with self.db_session_factory() as db_session:
+                    await self.queue_manager.cancel_job(job_id, db_session, reason="Batch cancelled.")
+                result.status = "cancelled"
+                result.completed_at = datetime.now(timezone.utc).isoformat()
+                return result
+
+            with self.db_session_factory() as db_session:
+                db_job = db_session.query(GenerationJob).filter(GenerationJob.id == job_id).first()
+                if db_job is None:
+                    result.status = "failed"
+                    result.error_message = "Queued generation job disappeared."
+                    result.completed_at = datetime.now(timezone.utc).isoformat()
+                    return result
+
+                if db_job.status == GenerationJobStatus.COMPLETED:
+                    result.status = "completed"
+                elif db_job.status == GenerationJobStatus.FAILED:
+                    result.status = "failed"
+                elif db_job.status == GenerationJobStatus.CANCELLED:
+                    result.status = "cancelled"
+                else:
+                    await asyncio.sleep(2.0)
+                    continue
+
+                result.chapters_total = db_job.chapters_total
+                result.chapters_completed = db_job.chapters_completed
+                result.chapters_failed = db_job.chapters_failed
+                result.error_message = db_job.error_message
+                completed_at = db_job.completed_at or utc_now()
+                result.completed_at = completed_at.isoformat()
+                started_at = db_job.started_at or utc_now()
+                result.duration_seconds = max((completed_at - started_at).total_seconds(), 0.0)
+                return result
+
+    def _update_eta(
+        self,
+        completed_index: int,
+        total_books: int,
+        batch_started_at: datetime,
+        completed_durations: list[float],
+    ) -> None:
+        """Refresh elapsed-time and ETA estimates after one book completes."""
+
+        if self._progress is None:
+            return
+
+        elapsed = (datetime.now(timezone.utc) - batch_started_at).total_seconds()
+        self._progress.elapsed_seconds = elapsed
+        self._progress.model_reloads = self.model_manager.stats.reload_count
+
+        if completed_durations:
+            average = sum(completed_durations) / len(completed_durations)
+            self._progress.avg_seconds_per_book = average
+            remaining = max(total_books - (completed_index + 1), 0)
+            eta = datetime.now(timezone.utc) + timedelta(seconds=remaining * average)
+            self._progress.estimated_completion = eta.isoformat()
+
+        self._persist_run()
+
+    def _record_result(self, result: BatchBookResult) -> None:
+        """Fold one terminal book result into the aggregated batch progress."""
+
+        if self._progress is None:
+            return
+
+        if result.status == "completed":
+            self._progress.books_completed += 1
+        elif result.status == "failed":
+            self._progress.books_failed += 1
+        else:
+            self._progress.books_skipped += 1
+
+        self._progress.books_in_progress = 0
+        self._progress.current_book_id = None
+        self._progress.current_book_title = None
+        self._progress.book_results.append(result)
+        self._persist_book_result(result)
+        self._persist_run()
+
+    def _persist_run(self) -> None:
+        """Persist the current batch summary into the database."""
+
+        if self._progress is None:
+            return
+
+        with self.db_session_factory() as db_session:
+            run = db_session.query(BatchRun).filter(BatchRun.batch_id == self._progress.batch_id).first()
+            if run is None:
+                run = BatchRun(batch_id=self._progress.batch_id)
+                db_session.add(run)
+
+            run.status = self._progress.status.value
+            run.total_books = self._progress.total_books
+            run.books_completed = self._progress.books_completed
+            run.books_failed = self._progress.books_failed
+            run.books_skipped = self._progress.books_skipped
+            run.current_book_id = self._progress.current_book_id
+            run.current_book_title = self._progress.current_book_title
+            run.resource_warnings = "; ".join(self._progress.resource_warnings) if self._progress.resource_warnings else None
+            run.pause_reason = self._progress.pause_reason
+            run.started_at = self._parse_iso_or_none(self._progress.started_at)
+            run.completed_at = utc_now() if self._progress.status in {BatchStatus.COMPLETED, BatchStatus.CANCELLED, BatchStatus.FAILED} else None
+            run.estimated_completion = self._parse_iso_or_none(self._progress.estimated_completion)
+            run.elapsed_seconds = self._progress.elapsed_seconds
+            run.avg_seconds_per_book = self._progress.avg_seconds_per_book
+            run.model_reloads = self._progress.model_reloads
+            db_session.commit()
+
+    def _persist_book_result(self, result: BatchBookResult) -> None:
+        """Persist the current status for one batch book result."""
+
+        if self._progress is None:
+            return
+
+        with self.db_session_factory() as db_session:
+            record = (
+                db_session.query(BatchBookStatus)
+                .filter(
+                    BatchBookStatus.batch_id == self._progress.batch_id,
+                    BatchBookStatus.book_id == result.book_id,
+                )
+                .first()
+            )
+            if record is None:
+                record = BatchBookStatus(batch_id=self._progress.batch_id, book_id=result.book_id)
+                db_session.add(record)
+
+            record.status = result.status
+            record.chapters_total = result.chapters_total
+            record.chapters_completed = result.chapters_completed
+            record.chapters_failed = result.chapters_failed
+            record.error_message = result.error_message
+            record.started_at = self._parse_iso_or_none(result.started_at)
+            record.completed_at = self._parse_iso_or_none(result.completed_at)
+            record.duration_seconds = result.duration_seconds
+            db_session.commit()
+
+    async def pause(self, reason: str = "Manual pause") -> None:
+        """Pause the batch before starting the next book."""
+
+        self._pause_event.clear()
+        if self._progress is not None:
+            self._progress.status = BatchStatus.PAUSED
+            self._progress.pause_reason = reason
+            self._persist_run()
+
+    async def resume(self) -> None:
+        """Resume a paused batch."""
+
+        self._pause_event.set()
+        if self._progress is not None:
+            self._progress.status = BatchStatus.RUNNING
+            self._progress.pause_reason = None
+            self._persist_run()
+
+    async def cancel(self) -> None:
+        """Request cancellation for the active batch."""
+
+        self._cancel_event.set()
+        self._pause_event.set()
+        if self._progress is not None:
+            self._progress.status = BatchStatus.CANCELLED
+            self._persist_run()
+
+    async def wait(self) -> None:
+        """Wait for the active batch task to finish when one exists."""
+
+        if self._task is not None:
+            await asyncio.gather(self._task, return_exceptions=True)
+
+    def history(self, *, limit: int = 20) -> list[dict[str, Any]]:
+        """Return recent batch run history with per-book results."""
+
+        with self.db_session_factory() as db_session:
+            runs = (
+                db_session.query(BatchRun)
+                .order_by(BatchRun.created_at.desc(), BatchRun.id.desc())
+                .limit(limit)
+                .all()
+            )
+            history: list[dict[str, Any]] = []
+            for run in runs:
+                history.append(
+                    {
+                        "batch_id": run.batch_id,
+                        "status": run.status,
+                        "total_books": run.total_books,
+                        "books_completed": run.books_completed,
+                        "books_failed": run.books_failed,
+                        "books_skipped": run.books_skipped,
+                        "started_at": run.started_at.isoformat() if run.started_at else None,
+                        "completed_at": run.completed_at.isoformat() if run.completed_at else None,
+                        "elapsed_seconds": round(run.elapsed_seconds, 1),
+                        "avg_seconds_per_book": round(run.avg_seconds_per_book, 1),
+                        "model_reloads": run.model_reloads,
+                        "book_results": [
+                            {
+                                "book_id": item.book_id,
+                                "status": item.status,
+                                "chapters_total": item.chapters_total,
+                                "chapters_completed": item.chapters_completed,
+                                "chapters_failed": item.chapters_failed,
+                                "error_message": item.error_message,
+                                "started_at": item.started_at.isoformat() if item.started_at else None,
+                                "completed_at": item.completed_at.isoformat() if item.completed_at else None,
+                                "duration_seconds": round(item.duration_seconds, 1),
+                            }
+                            for item in run.book_statuses
+                        ],
+                    }
+                )
+            return history
+
+    def to_dict(self) -> dict[str, Any] | None:
+        """Return the current in-memory batch progress payload."""
+
+        if self._progress is None:
+            return None
+
+        progress = self._progress
+        return {
+            "batch_id": progress.batch_id,
+            "status": progress.status.value,
+            "total_books": progress.total_books,
+            "books_completed": progress.books_completed,
+            "books_failed": progress.books_failed,
+            "books_skipped": progress.books_skipped,
+            "books_in_progress": progress.books_in_progress,
+            "current_book_id": progress.current_book_id,
+            "current_book_title": progress.current_book_title,
+            "started_at": progress.started_at,
+            "estimated_completion": progress.estimated_completion,
+            "elapsed_seconds": round(progress.elapsed_seconds, 1),
+            "avg_seconds_per_book": round(progress.avg_seconds_per_book, 1),
+            "resource_warnings": progress.resource_warnings,
+            "model_reloads": progress.model_reloads,
+            "pause_reason": progress.pause_reason,
+            "percent_complete": round(
+                (progress.books_completed + progress.books_failed + progress.books_skipped)
+                / max(progress.total_books, 1)
+                * 100,
+                1,
+            ),
+            "book_results": [asdict(result) for result in progress.book_results],
+        }
+
+    @staticmethod
+    def _parse_iso_or_none(value: str | None) -> datetime | None:
+        """Parse an ISO timestamp when one exists."""
+
+        if not value:
+            return None
+        return datetime.fromisoformat(value)

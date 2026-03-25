@@ -1,7 +1,8 @@
 import React from "react";
-import { Link } from "react-router-dom";
+import { NavLink } from "react-router-dom";
 
 const navigationItems = [
+  { label: "Catalog", to: "/catalog" },
   { label: "Library", to: "/" },
   { label: "Voice Lab", to: "/voice-lab" },
   { label: "Queue", to: "/queue" },
@@ -23,13 +24,20 @@ export default function AppShell({ title, description, children }) {
           </div>
           <nav className="flex flex-wrap gap-3">
             {navigationItems.map((item) => (
-              <Link
+              <NavLink
                 key={item.to}
-                className="rounded-full border border-slate-300 px-4 py-2 text-sm font-medium text-slate-700 transition hover:border-slate-900 hover:text-slate-900"
+                className={({ isActive }) =>
+                  [
+                    "rounded-full border px-4 py-2 text-sm font-medium transition",
+                    isActive
+                      ? "border-slate-900 bg-slate-900 text-white"
+                      : "border-slate-300 text-slate-700 hover:border-slate-900 hover:text-slate-900",
+                  ].join(" ")
+                }
                 to={item.to}
               >
                 {item.label}
-              </Link>
+              </NavLink>
             ))}
           </nav>
         </div>

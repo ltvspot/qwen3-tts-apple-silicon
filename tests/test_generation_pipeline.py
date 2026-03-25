@@ -422,7 +422,7 @@ async def test_generation_queue_processes_fifo_and_cancels_queued_jobs(test_db: 
 async def test_generation_queue_stops_after_three_consecutive_chapter_failures(test_db: Session) -> None:
     """The queue should abort a full-book job after three consecutive chapter failures."""
 
-    queue = GenerationQueue(max_workers=1)
+    queue = GenerationQueue(max_workers=1, consecutive_failure_threshold=3)
     session_factory = sessionmaker(
         bind=test_db.get_bind(),
         autoflush=False,

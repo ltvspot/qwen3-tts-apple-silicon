@@ -2,6 +2,7 @@ import React from "react";
 import { BrowserRouter as Router, Route, Routes } from "react-router-dom";
 import ErrorBoundary from "./components/ErrorBoundary";
 import BookDetail from "./pages/BookDetail";
+import CatalogDashboard from "./pages/CatalogDashboard";
 import Library from "./pages/Library";
 import NotFound from "./pages/NotFound";
 import QA from "./pages/QA";
@@ -14,6 +15,7 @@ function App() {
     <Router>
       <ErrorBoundary>
         <Routes>
+          <Route path="/catalog" element={<CatalogDashboard />} />
           <Route path="/" element={<Library />} />
           <Route path="/book/:id" element={<BookDetail />} />
           <Route path="/voice-lab" element={<VoiceLab />} />

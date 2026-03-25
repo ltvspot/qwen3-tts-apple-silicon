@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import json
 import logging
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -91,21 +92,47 @@ class JobInfo:
 class GenerationQueue:
     """Priority-driven generation queue backed by persistent DB rows."""
 
-    def __init__(self, max_workers: int = 1) -> None:
+    def __init__(
+        self,
+        max_workers: int = 1,
+        *,
+        consecutive_failure_threshold: int | None = None,
+    ) -> None:
         """Initialize queue state."""
 
         self.max_workers = max_workers
         self.jobs: dict[int, JobInfo] = {}
         self.active_jobs: set[int] = set()
+        self._jobs_lock = threading.RLock()
         self._workers: list[asyncio.Task[None]] = []
         self._db_session_maker: Any | None = None
         self._generator: AudiobookGenerator | None = None
+        self._resource_monitor: Any | None = None
+        self._resource_pause_reason: str | None = None
         self._start_lock = asyncio.Lock()
         self._jobs_available = asyncio.Event()
         self._stop_event = asyncio.Event()
         self._started = False
+        self.resource_poll_interval_seconds = 30.0
+        self.consecutive_failure_threshold = (
+            get_application_settings().engine_config.consecutive_failure_threshold
+            if consecutive_failure_threshold is None
+            else consecutive_failure_threshold
+        )
 
-    async def start(self, db_session_maker: Any, generator: AudiobookGenerator) -> None:
+    @property
+    def resource_pause_reason(self) -> str | None:
+        """Return the active resource-related queue pause reason, if any."""
+
+        return self._resource_pause_reason
+
+    async def start(
+        self,
+        db_session_maker: Any,
+        generator: AudiobookGenerator,
+        *,
+        resource_monitor: Any | None = None,
+    ) -> None:
         """Start worker tasks if they are not already running."""
 
         async with self._start_lock:
@@ -114,6 +141,7 @@ class GenerationQueue:
 
             self._db_session_maker = db_session_maker
             self._generator = generator
+            self._resource_monitor = resource_monitor
             self._jobs_available.clear()
             self._stop_event.clear()
             self._workers = [
@@ -134,10 +162,13 @@ class GenerationQueue:
             self._jobs_available.set()
             await asyncio.gather(*self._workers, return_exceptions=True)
             self._workers.clear()
-            self.active_jobs.clear()
-            self.jobs.clear()
+            with self._jobs_lock:
+                self.active_jobs.clear()
+                self.jobs.clear()
             self._db_session_maker = None
             self._generator = None
+            self._resource_monitor = None
+            self._resource_pause_reason = None
             self._started = False
             logger.info("Stopped generation queue")
 
@@ -413,7 +444,7 @@ class GenerationQueue:
     async def get_job_status(self, job_id: int, db_session: Session | None = None) -> JobInfo | None:
         """Return the current job status from memory or the database."""
 
-        job_info = self.jobs.get(job_id)
+        job_info = self.get_job(job_id)
         if job_info is not None and db_session is None:
             return job_info
 
@@ -429,7 +460,14 @@ class GenerationQueue:
     async def get_all_jobs(self) -> list[JobInfo]:
         """Return all known in-memory jobs."""
 
-        return list(self.jobs.values())
+        with self._jobs_lock:
+            return list(self.jobs.values())
+
+    def get_job(self, job_id: int) -> JobInfo | None:
+        """Return one cached in-memory job snapshot."""
+
+        with self._jobs_lock:
+            return self.jobs.get(job_id)
 
     async def wait_until_idle(self) -> None:
         """Block until all queued or running jobs have been processed."""
@@ -438,7 +476,10 @@ class GenerationQueue:
             return
 
         while True:
-            if not self.active_jobs:
+            with self._jobs_lock:
+                active_jobs = bool(self.active_jobs)
+
+            if not active_jobs:
                 db_session: Session = self._db_session_maker()
                 try:
                     pending_count = (
@@ -559,6 +600,9 @@ class GenerationQueue:
         """Execute a single queued generation job."""
 
         self._ensure_started()
+        await self._wait_for_resources()
+        if self._stop_event.is_set():
+            return
         db_session: Session = self._db_session_maker()
 
         try:
@@ -589,7 +633,8 @@ class GenerationQueue:
             invalidate_library_cache()
 
             job_info = self._store_job_snapshot(db_job)
-            self.active_jobs.add(job_id)
+            with self._jobs_lock:
+                self.active_jobs.add(job_id)
             logger.info("Processing generation job %s", job_id)
 
             if db_job.job_type == GenerationJobType.SINGLE_CHAPTER:
@@ -597,7 +642,8 @@ class GenerationQueue:
             else:
                 await self._process_full_book_job(db_job, db_session, job_info)
         finally:
-            self.active_jobs.discard(job_id)
+            with self._jobs_lock:
+                self.active_jobs.discard(job_id)
             db_session.close()
             if self._has_pending_jobs():
                 self._notify_workers()
@@ -702,12 +748,12 @@ class GenerationQueue:
                 db_job.progress = self._overall_progress(db_job.chapters_completed, db_job.chapters_total, 0.0)
                 db_session.commit()
                 self._store_job_snapshot(db_job)
-                if consecutive_failures >= 3:
+                if consecutive_failures >= self.consecutive_failure_threshold:
                     self._mark_failed(
                         db_job,
                         job_info,
                         db_session,
-                        "Generation stopped after 3 consecutive chapter failures.",
+                        f"Generation stopped after {self.consecutive_failure_threshold} consecutive chapter failures.",
                     )
                     return
             else:
@@ -994,8 +1040,27 @@ class GenerationQueue:
         """Cache a light-weight view of the current job state."""
 
         snapshot = JobInfo.from_generation_job(db_job)
-        self.jobs[db_job.id] = snapshot
+        with self._jobs_lock:
+            self.jobs[db_job.id] = snapshot
         return snapshot
+
+    async def _wait_for_resources(self) -> None:
+        """Pause queue processing while monitored resources are unhealthy."""
+
+        if self._resource_monitor is None:
+            return
+
+        while not self._stop_event.is_set():
+            can_proceed, warnings = self._resource_monitor.check_can_proceed()
+            if can_proceed:
+                if self._resource_pause_reason is not None:
+                    logger.info("Queue resource pause cleared: %s", self._resource_pause_reason)
+                self._resource_pause_reason = None
+                return
+
+            self._resource_pause_reason = "; ".join(warnings) or "Resources unavailable."
+            logger.warning("Queue waiting for resources: %s", self._resource_pause_reason)
+            await asyncio.sleep(self.resource_poll_interval_seconds)
 
     def _record_history(self, db_session: Session, job: GenerationJob, action: str, details: str | dict[str, Any]) -> None:
         """Append a job history entry."""

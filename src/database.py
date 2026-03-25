@@ -17,6 +17,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
+    func,
     inspect,
     text,
 )
@@ -177,6 +178,10 @@ class Book(Base):
         cascade="all, delete-orphan",
         foreign_keys="GenerationJob.book_id",
     )
+    batch_book_statuses: Mapped[list["BatchBookStatus"]] = relationship(
+        back_populates="book",
+        cascade="all, delete-orphan",
+    )
     current_job: Mapped["GenerationJob | None"] = relationship(
         foreign_keys=[current_job_id],
         post_update=True,
@@ -202,6 +207,7 @@ class Chapter(Base):
         SqlEnum(ChapterStatus, native_enum=False, validate_strings=True),
         nullable=False,
         default=ChapterStatus.PENDING,
+        index=True,
     )
     audio_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
     duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -343,6 +349,7 @@ class GenerationJob(Base):
     status: Mapped[GenerationJobStatus] = mapped_column(
         SqlEnum(GenerationJobStatus, native_enum=False, validate_strings=True),
         nullable=False,
+        index=True,
     )
     progress: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     current_chapter_progress: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
@@ -388,6 +395,59 @@ class JobHistory(Base):
 
     job: Mapped["GenerationJob"] = relationship(back_populates="history_entries")
     book: Mapped["Book"] = relationship()
+
+
+class BatchRun(Base):
+    """Persistent record of one catalog batch operation."""
+
+    __tablename__ = "batch_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    batch_id: Mapped[str] = mapped_column(String(100), nullable=False, unique=True, index=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    total_books: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    books_completed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    books_failed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    books_skipped: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    current_book_id: Mapped[int | None] = mapped_column(ForeignKey("books.id"), nullable=True)
+    current_book_title: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    resource_warnings: Mapped[str | None] = mapped_column(Text, nullable=True)
+    pause_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    estimated_completion: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    elapsed_seconds: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    avg_seconds_per_book: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    model_reloads: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+
+    book_statuses: Mapped[list["BatchBookStatus"]] = relationship(
+        back_populates="batch_run",
+        cascade="all, delete-orphan",
+        order_by="BatchBookStatus.id",
+    )
+
+
+class BatchBookStatus(Base):
+    """Per-book state within a batch run."""
+
+    __tablename__ = "batch_book_status"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    batch_id: Mapped[str] = mapped_column(ForeignKey("batch_runs.batch_id"), nullable=False, index=True)
+    book_id: Mapped[int] = mapped_column(ForeignKey("books.id"), nullable=False, index=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    chapters_total: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    chapters_completed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    chapters_failed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    duration_seconds: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+
+    batch_run: Mapped["BatchRun"] = relationship(back_populates="book_statuses")
+    book: Mapped["Book"] = relationship(back_populates="batch_book_statuses")
 
 
 def _sqlite_connect_args(database_url: str) -> dict[str, bool]:
@@ -460,6 +520,15 @@ def _migrate_sqlite_schema() -> None:
                     continue
                 logger.info("Applying SQLite schema migration: %s.%s", table_name, column_name)
                 connection.execute(text(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl}"))
+
+        for ddl in (
+            "CREATE INDEX IF NOT EXISTS ix_chapters_status ON chapters (status)",
+            "CREATE INDEX IF NOT EXISTS ix_generation_jobs_status ON generation_jobs (status)",
+            "CREATE INDEX IF NOT EXISTS ix_batch_book_status_batch_id ON batch_book_status (batch_id)",
+            "CREATE INDEX IF NOT EXISTS ix_batch_book_status_book_id ON batch_book_status (book_id)",
+            "CREATE INDEX IF NOT EXISTS ix_batch_runs_batch_id ON batch_runs (batch_id)",
+        ):
+            connection.execute(text(ddl))
 
 
 def get_db() -> Generator[Session, None, None]:

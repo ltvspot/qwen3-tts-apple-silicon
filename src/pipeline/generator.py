@@ -23,7 +23,7 @@ from src.database import (
     QAStatus,
     utc_now,
 )
-from src.engines import AudioStitcher, TTSEngine, TextChunker
+from src.engines import AudioStitcher, ModelManager, TTSEngine, TextChunker
 from src.pipeline.qa_checker import persist_qa_result, run_qa_checks_for_chapter
 
 logger = logging.getLogger(__name__)
@@ -52,17 +52,23 @@ def _slugify(value: str, *, fallback: str, max_length: int) -> str:
 class AudiobookGenerator:
     """Generate chapter WAV files and persist progress to the database."""
 
-    def __init__(self, engine: TTSEngine) -> None:
+    def __init__(self, engine: TTSEngine | None = None, *, model_manager: ModelManager | None = None) -> None:
         """Initialize the generator with a configured TTS engine instance."""
 
+        if engine is None and model_manager is None:
+            raise ValueError("AudiobookGenerator requires either an engine or a model manager.")
+
         self.engine = engine
+        self.model_manager = model_manager
         self.output_path = Path(settings.OUTPUTS_PATH)
         self.retry_backoff_seconds: tuple[float, ...] = (0.5, 1.0)
 
     def close(self) -> None:
         """Release the underlying engine if it has been loaded."""
 
-        if getattr(self.engine, "loaded", False):
+        if self.model_manager is not None:
+            return
+        if self.engine is not None and getattr(self.engine, "loaded", False):
             self.engine.unload()
 
     async def generate_book(
@@ -82,7 +88,7 @@ class AudiobookGenerator:
         Returns a summary dictionary with status, counts, duration, and errors.
         """
 
-        self._ensure_engine_loaded()
+        await self._get_engine()
 
         book = (
             db_session.query(Book)
@@ -194,7 +200,7 @@ class AudiobookGenerator:
     ) -> float:
         """Generate and persist audio for a single chapter."""
 
-        self._ensure_engine_loaded()
+        engine = await self._get_engine()
 
         text_content = (chapter.text_content or "").strip()
         if not text_content:
@@ -216,7 +222,7 @@ class AudiobookGenerator:
         db_session.commit()
 
         try:
-            chunks = TextChunker.chunk_text(text_content, self.engine.max_chunk_chars)
+            chunks = TextChunker.chunk_text(text_content, engine.max_chunk_chars)
             audio_chunks = []
             chapter_speed = speed * self._chapter_speed(chapter)
             manual_review_notes: list[str] = []
@@ -295,6 +301,8 @@ class AudiobookGenerator:
                 chapter.audio_path,
                 duration,
             )
+            if self.model_manager is not None:
+                self.model_manager.record_chapter()
 
             return duration
         except GenerationCancelled:
@@ -399,17 +407,23 @@ class AudiobookGenerator:
     ) -> AudioSegment:
         """Generate a single audio chunk, using engine-level timeouts when available."""
 
-        timeout_generate = getattr(self.engine, "generate_chunk_with_timeout", None)
+        engine = await self._get_engine()
+        started_at = asyncio.get_running_loop().time()
+        timeout_generate = getattr(engine, "generate_chunk_with_timeout", None)
         if callable(timeout_generate):
-            return await timeout_generate(text, voice_name, emotion=emotion, speed=speed)
+            audio = await timeout_generate(text, voice_name, emotion=emotion, speed=speed)
+        else:
+            audio = await asyncio.to_thread(
+                engine.generate,
+                text,
+                voice_name,
+                emotion,
+                speed,
+            )
 
-        return await asyncio.to_thread(
-            self.engine.generate,
-            text,
-            voice_name,
-            emotion,
-            speed,
-        )
+        if self.model_manager is not None:
+            self.model_manager.record_chunk(asyncio.get_running_loop().time() - started_at)
+        return audio
 
     def _validate_chunk(self, chunk: AudioSegment, chunk_index: int, expected_text: str) -> None:
         """Validate one generated chunk before it is stitched into a chapter."""
@@ -441,11 +455,19 @@ class AudiobookGenerator:
         chapter.qa_status = QAStatus.NEEDS_REVIEW
         chapter.qa_notes = "\n".join(notes)
 
-    def _ensure_engine_loaded(self) -> None:
-        """Load the engine on first generation request."""
+    async def _get_engine(self) -> TTSEngine:
+        """Return the active engine, loading it lazily when needed."""
 
+        if self.model_manager is not None:
+            engine = await self.model_manager.get_engine()
+            self.engine = engine
+            return engine
+
+        if self.engine is None:
+            raise RuntimeError("No TTS engine is configured.")
         if not getattr(self.engine, "loaded", False):
             self.engine.load()
+        return self.engine
 
     def _raise_if_cancelled(self, should_cancel: Callable[[], bool] | None) -> None:
         """Raise a cancellation signal if the active job was cancelled."""
