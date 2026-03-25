@@ -6,6 +6,7 @@ from sqlalchemy import inspect
 from sqlalchemy.orm import Session
 
 from src.database import (
+    AppSetting,
     Book,
     Chapter,
     ChapterStatus,
@@ -29,6 +30,7 @@ def test_database_schema_and_basic_crud(test_db: Session) -> None:
         "generation_jobs",
         "job_history",
         "qa_status",
+        "settings",
         "voice_presets",
     }
 
@@ -84,6 +86,7 @@ def test_database_schema_and_basic_crud(test_db: Session) -> None:
     stored_book = test_db.query(Book).one()
     stored_chapter = test_db.query(Chapter).one()
     stored_export_jobs = test_db.query(ExportJob).count()
+    stored_app_settings = test_db.query(AppSetting).count()
     stored_voice_preset = test_db.query(VoicePreset).one()
     stored_generation_job = test_db.query(GenerationJob).one()
     stored_history_entry = test_db.query(JobHistory).one()
@@ -92,6 +95,7 @@ def test_database_schema_and_basic_crud(test_db: Session) -> None:
     assert stored_book.status == "not_started"
     assert stored_book.export_status == "idle"
     assert stored_export_jobs == 0
+    assert stored_app_settings == 0
     assert stored_chapter.book_id == stored_book.id
     assert stored_chapter.status == ChapterStatus.PENDING
     assert stored_voice_preset.is_default is True

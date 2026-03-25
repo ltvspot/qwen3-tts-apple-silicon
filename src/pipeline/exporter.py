@@ -38,7 +38,6 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_EXPORT_FORMATS = ("mp3", "m4b")
 VALID_EXPORT_FORMATS = frozenset(DEFAULT_EXPORT_FORMATS)
-EXPORT_SAMPLE_RATE = 44100
 
 
 class ExportFormatResult(BaseModel):
@@ -162,6 +161,12 @@ def _outputs_root() -> Path:
     return Path(settings.OUTPUTS_PATH).resolve()
 
 
+def _sample_rate() -> int:
+    """Return the configured export sample rate."""
+
+    return int(settings.EXPORT_SAMPLE_RATE)
+
+
 def _book_root(book: Book) -> Path:
     """Return the output folder for one book."""
 
@@ -205,10 +210,11 @@ def _ensure_placeholder_cover(exports_root: Path) -> Path:
     return cover_path
 
 
-def create_silence(duration_seconds: float, sample_rate: int = EXPORT_SAMPLE_RATE) -> AudioSegment:
+def create_silence(duration_seconds: float, sample_rate: int | None = None) -> AudioSegment:
     """Generate a mono silence segment at the requested sample rate."""
 
-    return AudioSegment.silent(duration=int(duration_seconds * 1000), frame_rate=sample_rate).set_channels(1)
+    resolved_sample_rate = _sample_rate() if sample_rate is None else sample_rate
+    return AudioSegment.silent(duration=int(duration_seconds * 1000), frame_rate=resolved_sample_rate).set_channels(1)
 
 
 def _require_ffmpeg() -> str:
@@ -354,7 +360,7 @@ def _load_selected_chapters(
         try:
             audio_segment = (
                 AudioSegment.from_wav(audio_path)
-                .set_frame_rate(EXPORT_SAMPLE_RATE)
+                .set_frame_rate(_sample_rate())
                 .set_channels(1)
             )
         except Exception as exc:
@@ -408,7 +414,7 @@ def concatenate_chapters_sync(
         exports_root.mkdir(parents=True, exist_ok=True)
         master_wav_path = exports_root / "master.wav"
 
-        combined_audio = AudioSegment.silent(duration=0, frame_rate=EXPORT_SAMPLE_RATE).set_channels(1)
+        combined_audio = AudioSegment.silent(duration=0, frame_rate=_sample_rate()).set_channels(1)
         chapter_markers: list[ChapterMarker] = []
         current_ms = 0
 
@@ -530,7 +536,13 @@ def _write_ffmetadata(
     metadata_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def export_mp3(normalized_wav_path: Path, output_path: Path, *, book: Book, cover_art_path: Path) -> None:
+def export_mp3(
+    normalized_wav_path: Path,
+    output_path: Path,
+    *,
+    book: Book,
+    cover_art_path: Path | None,
+) -> None:
     """Encode a normalized master WAV into audiobook MP3 format."""
 
     ffmpeg_path = _require_ffmpeg()
@@ -539,24 +551,16 @@ def export_mp3(normalized_wav_path: Path, output_path: Path, *, book: Book, cove
         "-y",
         "-i",
         str(normalized_wav_path),
-        "-i",
-        str(cover_art_path),
         "-map",
         "0:a",
-        "-map",
-        "1:v",
         "-codec:a",
         "libmp3lame",
         "-b:a",
         settings.EXPORT_MP3_BITRATE,
         "-ar",
-        str(EXPORT_SAMPLE_RATE),
+        str(_sample_rate()),
         "-ac",
         "1",
-        "-codec:v",
-        "mjpeg",
-        "-disposition:v",
-        "attached_pic",
         "-id3v2_version",
         "3",
         "-metadata",
@@ -567,12 +571,25 @@ def export_mp3(normalized_wav_path: Path, output_path: Path, *, book: Book, cove
         f"album={book.title}",
         "-metadata",
         f"comment=Narrated by {book.narrator}",
-        "-metadata:s:v",
-        "title=Cover Art",
-        "-metadata:s:v",
-        "comment=Cover (front)",
         str(output_path),
     ]
+    if cover_art_path is not None:
+        command[4:4] = [
+            "-i",
+            str(cover_art_path),
+            "-map",
+            "1:v",
+            "-codec:v",
+            "mjpeg",
+            "-disposition:v",
+            "attached_pic",
+        ]
+        command[-1:-1] = [
+            "-metadata:s:v",
+            "title=Cover Art",
+            "-metadata:s:v",
+            "comment=Cover (front)",
+        ]
     subprocess.run(command, check=True, capture_output=True, text=True)
 
 
@@ -604,7 +621,7 @@ def export_m4b(
         "-b:a",
         settings.EXPORT_M4B_BITRATE,
         "-ar",
-        str(EXPORT_SAMPLE_RATE),
+        str(_sample_rate()),
         "-ac",
         "1",
         "-movflags",
@@ -720,7 +737,11 @@ def export_book_sync(
 
         export_paths = _build_export_paths(book)
         export_paths["exports_root"].mkdir(parents=True, exist_ok=True)
-        cover_art_path = _ensure_placeholder_cover(export_paths["exports_root"])
+        cover_art_path = (
+            _ensure_placeholder_cover(export_paths["exports_root"])
+            if settings.EXPORT_INCLUDE_ALBUM_ART
+            else None
+        )
 
         concatenation = concatenate_chapters_sync(
             book_id,

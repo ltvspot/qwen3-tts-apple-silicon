@@ -11,7 +11,7 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session, selectinload
 
 from src.api.library import LibraryScanner
-from src.config import settings
+from src.config import get_application_settings, settings
 from src.database import (
     Book,
     BookGenerationStatus,
@@ -279,6 +279,7 @@ async def parse_book(
     book.title = metadata.title
     book.subtitle = metadata.subtitle
     book.author = metadata.author
+    book.narrator = get_application_settings().narrator_name
     book.status = BookStatus.PARSED
 
     opening_text = CreditsGenerator.generate_opening_credits(book.title, book.subtitle, book.author)

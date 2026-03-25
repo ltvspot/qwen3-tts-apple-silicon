@@ -13,6 +13,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session, selectinload
 
+from src.config import get_application_settings
 from src.database import (
     Book,
     BookGenerationStatus,
@@ -28,6 +29,22 @@ from src.database import (
 from src.pipeline.generator import AudiobookGenerator, GenerationCancelled
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_voice_defaults(
+    *,
+    voice_name: str | None,
+    emotion: str | None,
+    speed: float | None,
+) -> tuple[str, str | None, float]:
+    """Resolve generation defaults from persisted settings when parameters are omitted."""
+
+    defaults = get_application_settings().default_voice
+    return (
+        (voice_name or defaults.name).strip(),
+        defaults.emotion if emotion is None else emotion,
+        float(defaults.speed if speed is None else speed),
+    )
 
 
 class JobStatus(str, Enum):
@@ -130,14 +147,19 @@ class GenerationQueue:
         *,
         force: bool = False,
         priority: int = 0,
-        voice_name: str = "Ethan",
+        voice_name: str | None = None,
         emotion: str | None = None,
-        speed: float = 1.0,
+        speed: float | None = None,
         job_type: GenerationJobType = GenerationJobType.FULL_BOOK,
     ) -> int:
         """Create and enqueue a full-book generation job."""
 
         self._ensure_started()
+        resolved_voice_name, resolved_emotion, resolved_speed = _resolve_voice_defaults(
+            voice_name=voice_name,
+            emotion=emotion,
+            speed=speed,
+        )
 
         book = (
             db_session.query(Book)
@@ -174,9 +196,9 @@ class GenerationQueue:
             ),
             avg_seconds_per_chapter=avg_seconds,
             force=force,
-            voice_name=voice_name,
-            emotion=emotion,
-            speed=speed,
+            voice_name=resolved_voice_name,
+            emotion=resolved_emotion,
+            speed=resolved_speed,
         )
         db_session.add(job)
         db_session.flush()
@@ -200,13 +222,18 @@ class GenerationQueue:
         *,
         force: bool = False,
         priority: int = 0,
-        voice_name: str = "Ethan",
+        voice_name: str | None = None,
         emotion: str | None = None,
-        speed: float = 1.0,
+        speed: float | None = None,
     ) -> int:
         """Create and enqueue a single-chapter generation job."""
 
         self._ensure_started()
+        resolved_voice_name, resolved_emotion, resolved_speed = _resolve_voice_defaults(
+            voice_name=voice_name,
+            emotion=emotion,
+            speed=speed,
+        )
 
         chapter = (
             db_session.query(Chapter)
@@ -242,9 +269,9 @@ class GenerationQueue:
             ),
             avg_seconds_per_chapter=avg_seconds,
             force=force,
-            voice_name=voice_name,
-            emotion=emotion,
-            speed=speed,
+            voice_name=resolved_voice_name,
+            emotion=resolved_emotion,
+            speed=resolved_speed,
         )
         db_session.add(job)
         db_session.flush()

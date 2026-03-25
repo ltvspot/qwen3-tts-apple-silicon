@@ -12,7 +12,7 @@ import numpy as np
 from pydub.audio_segment import AudioSegment
 from pydub.generators import Sine
 
-from src.config import settings
+from src.config import get_application_settings, settings
 from src.engines.base import AudioGenerationConfig, TTSEngine, Voice
 
 logger = logging.getLogger(__name__)
@@ -65,7 +65,7 @@ class Qwen3TTS(TTSEngine):
         the synthetic backend under pytest and the MLX backend otherwise.
         """
 
-        configured_path = Path(model_path or settings.MODELS_PATH)
+        configured_path = Path(model_path or get_application_settings().engine_config.model_path)
         self.model_path = configured_path if (configured_path / "config.json").exists() else configured_path / MODEL_DIR_NAME
         self.base_model_path = self.model_path.parent / BASE_MODEL_DIR_NAME
         self.backend = (backend or settings.TTS_BACKEND).strip().lower()
@@ -172,8 +172,8 @@ class Qwen3TTS(TTSEngine):
         cleaned_text = text.strip()
         if not cleaned_text:
             raise ValueError("Text cannot be empty.")
-        if not 0.8 <= speed <= 1.3:
-            raise ValueError("Speed must be between 0.8 and 1.3.")
+        if not 0.5 <= speed <= 2.0:
+            raise ValueError("Speed must be between 0.5 and 2.0.")
 
         config = AudioGenerationConfig(
             text=cleaned_text,

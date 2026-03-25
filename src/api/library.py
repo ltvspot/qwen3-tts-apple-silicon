@@ -9,7 +9,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from src.config import settings
+from src.config import get_application_settings, settings
 from src.database import Book, BookStatus
 
 logger = logging.getLogger(__name__)
@@ -71,6 +71,7 @@ class LibraryScanner:
                 title=title,
                 subtitle=None,
                 author=author,
+                narrator=get_application_settings().narrator_name,
                 folder_path=folder.name,
                 status=BookStatus.NOT_STARTED,
                 page_count=metadata.get("page_count"),

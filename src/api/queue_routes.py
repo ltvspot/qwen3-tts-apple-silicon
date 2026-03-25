@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session, selectinload
 
 from src.api.generation_runtime import ensure_queue_started, get_queue
+from src.config import get_application_settings
 from src.database import (
     Book,
     BookStatus,
@@ -172,9 +173,9 @@ class BatchAllRequest(BaseModel):
     """Batch queue payload."""
 
     priority: int = Field(default=0, ge=0, le=100)
-    voice: str = "Ethan"
-    emotion: str | None = "neutral"
-    speed: float = Field(default=1.0, ge=0.5, le=2.0)
+    voice: str | None = None
+    emotion: str | None = None
+    speed: float | None = Field(default=None, ge=0.5, le=2.0)
 
 
 class BatchAllResponse(BaseModel):
@@ -515,6 +516,7 @@ async def batch_queue_all_books(
     """Queue all parsed books that do not already have active jobs."""
 
     queue = await ensure_queue_started(db)
+    default_voice = get_application_settings().default_voice
     parsed_books = (
         db.query(Book)
         .options(selectinload(Book.chapters))
@@ -546,9 +548,9 @@ async def batch_queue_all_books(
             book.id,
             db,
             priority=request.priority,
-            voice_name=request.voice,
-            emotion=request.emotion,
-            speed=request.speed,
+            voice_name=request.voice or default_voice.name,
+            emotion=default_voice.emotion if request.emotion is None else request.emotion,
+            speed=default_voice.speed if request.speed is None else request.speed,
             job_type=GenerationJobType.BATCH_ALL,
         )
         job = db.query(GenerationJob).filter(GenerationJob.id == job_id).first()

@@ -10,8 +10,20 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
+from src.config import reset_settings_manager
 from src.database import Base, get_db
 from src.main import app
+
+
+@pytest.fixture(autouse=True)
+def isolated_settings_manager() -> Generator[None, None, None]:
+    """Reset the global settings manager before and after each test."""
+
+    reset_settings_manager()
+    try:
+        yield
+    finally:
+        reset_settings_manager()
 
 
 @pytest.fixture(scope="function")

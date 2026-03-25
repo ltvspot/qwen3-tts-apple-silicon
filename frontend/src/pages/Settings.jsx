@@ -1,15 +1,14 @@
 import React from "react";
 import AppShell from "../components/AppShell";
+import SettingsForm from "../components/SettingsForm";
 
 export default function Settings() {
   return (
     <AppShell
       title="Settings"
-      description="Global engine, narrator, export, and path configuration will be managed here."
+      description="Manage the global narrator, manuscript path, default voice, engine visibility, and export preferences that drive the production pipeline."
     >
-      <div className="rounded-2xl border border-dashed border-slate-300 bg-white p-8 text-sm text-slate-600">
-        Page stub
-      </div>
+      <SettingsForm />
     </AppShell>
   );
 }

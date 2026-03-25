@@ -23,7 +23,7 @@ from sqlalchemy import (
 from sqlalchemy import Enum as SqlEnum
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
-from src.config import settings
+from src.config import DEFAULT_NARRATOR_NAME, settings
 
 logger = logging.getLogger(__name__)
 
@@ -136,7 +136,7 @@ class Book(Base):
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     subtitle: Mapped[str | None] = mapped_column(String(255), nullable=True)
     author: Mapped[str] = mapped_column(String(255), nullable=False)
-    narrator: Mapped[str] = mapped_column(String(255), nullable=False, default=settings.NARRATOR_NAME)
+    narrator: Mapped[str] = mapped_column(String(255), nullable=False, default=DEFAULT_NARRATOR_NAME)
     folder_path: Mapped[str] = mapped_column(String(500), nullable=False, unique=True)
     status: Mapped[BookStatus | None] = mapped_column(
         SqlEnum(BookStatus, native_enum=False, validate_strings=True),
@@ -278,6 +278,16 @@ class ExportJob(Base):
     qa_report: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     book: Mapped["Book"] = relationship()
+
+
+class AppSetting(Base):
+    """Persisted application settings payloads."""
+
+    __tablename__ = "settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    key: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    value: Mapped[str] = mapped_column(Text, nullable=False)
 
 
 class VoicePreset(Base):

@@ -23,10 +23,11 @@ from src.api.generation import router as generation_router
 from src.api.generation_runtime import shutdown_generation_runtime
 from src.api.qa_routes import router as qa_router
 from src.api.queue_routes import router as queue_router
+from src.api.settings_routes import router as settings_router
 from src.api.voice_lab import release_engine, router as voice_lab_router
 from src.api.routes import router as api_router
 from src.api.schemas import HealthCheckResponse
-from src.config import settings
+from src.config import get_application_settings, reset_settings_manager, settings
 from src.database import init_db
 
 
@@ -54,6 +55,24 @@ def ensure_runtime_directories() -> None:
             logger.warning("Configured path does not exist yet: %s", path)
 
 
+def validate_startup_settings() -> None:
+    """Validate persisted settings and log any critical startup gaps."""
+
+    reset_settings_manager()
+    application_settings = get_application_settings()
+
+    manuscript_folder = Path(application_settings.manuscript_source_folder)
+    if not manuscript_folder.exists():
+        logger.warning("Manuscript folder not found: %s", manuscript_folder)
+        logger.warning("Configure the manuscript source folder in Settings.")
+
+    model_path = Path(application_settings.engine_config.model_path)
+    if not model_path.exists():
+        raise RuntimeError(f"TTS model not found: {model_path}")
+
+    logger.info("Loaded application settings for narrator: %s", application_settings.narrator_name)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     """Initialize runtime dependencies when the application starts."""
@@ -61,6 +80,7 @@ async def lifespan(_: FastAPI):
     logger.info("Starting Alexandria Audiobook Narrator %s", __version__)
     ensure_runtime_directories()
     init_db()
+    validate_startup_settings()
     yield
     await shutdown_generation_runtime()
     release_engine()
@@ -79,6 +99,7 @@ app.include_router(export_router)
 app.include_router(generation_router)
 app.include_router(qa_router)
 app.include_router(queue_router)
+app.include_router(settings_router)
 app.include_router(voice_lab_router)
 
 
