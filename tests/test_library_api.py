@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 from src.api.library import LibraryScanner
 from src.config import settings
 from src.database import Book, Chapter
+from tests.parser_fixture_utils import create_sample_epub, create_sample_pdf, default_book_sections
 
 
 def _create_sample_docx(docx_path: Path) -> None:
@@ -39,6 +40,36 @@ def _create_library_folder(root: Path, folder_name: str, *, with_docx: bool = Tr
     folder.mkdir(parents=True, exist_ok=True)
     if with_docx:
         _create_sample_docx(folder / f"{folder_name}-Word-6x9-Clean.docx")
+    return folder
+
+
+def _create_epub_library_folder(root: Path, folder_name: str) -> Path:
+    """Create an EPUB-only manuscript folder for parser fallback tests."""
+
+    folder = root / folder_name
+    folder.mkdir(parents=True, exist_ok=True)
+    create_sample_epub(
+        folder / f"{folder_name}.epub",
+        title="The EPUB Chronicle",
+        subtitle="A Digital Mystery",
+        author="Jane Doe",
+        sections=default_book_sections(),
+    )
+    return folder
+
+
+def _create_pdf_library_folder(root: Path, folder_name: str) -> Path:
+    """Create a PDF-only manuscript folder for parser fallback tests."""
+
+    folder = root / folder_name
+    folder.mkdir(parents=True, exist_ok=True)
+    create_sample_pdf(
+        folder / f"{folder_name}.pdf",
+        title="The PDF Chronicle",
+        subtitle="A Portable Mystery",
+        author="Jane Doe",
+        sections=default_book_sections(),
+    )
     return folder
 
 
@@ -233,16 +264,68 @@ def test_parse_book_flow_and_chapter_updates(
     assert test_db.query(Chapter).filter(Chapter.book_id == book.id).count() == 4
 
 
-def test_parse_book_requires_docx(
+def test_parse_book_uses_epub_fallback(
+    client: TestClient,
+    test_db: Session,
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    """Parsing should succeed with EPUB when a DOCX manuscript is unavailable."""
+
+    folder_name = "1004-EPub-Only-Book-EPub"
+    _create_epub_library_folder(tmp_path, folder_name)
+    monkeypatch.setattr(settings, "FORMATTED_MANUSCRIPTS_PATH", str(tmp_path))
+
+    scan_response = client.post("/api/library/scan")
+    assert scan_response.status_code == 200
+    book = test_db.query(Book).filter(Book.folder_path == folder_name).one()
+
+    parse_response = client.post(f"/api/book/{book.id}/parse", json={})
+    assert parse_response.status_code == 200
+    assert parse_response.json()["chapters_detected"] == 5
+
+    test_db.refresh(book)
+    assert book.title == "The EPUB Chronicle"
+    assert book.subtitle == "A Digital Mystery"
+    assert book.author == "Jane Doe"
+
+
+def test_parse_book_uses_pdf_fallback(
+    client: TestClient,
+    test_db: Session,
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    """Parsing should succeed with PDF when DOCX and EPUB manuscripts are unavailable."""
+
+    folder_name = "1005-PDF-Only-Book-PDF"
+    _create_pdf_library_folder(tmp_path, folder_name)
+    monkeypatch.setattr(settings, "FORMATTED_MANUSCRIPTS_PATH", str(tmp_path))
+
+    scan_response = client.post("/api/library/scan")
+    assert scan_response.status_code == 200
+    book = test_db.query(Book).filter(Book.folder_path == folder_name).one()
+
+    parse_response = client.post(f"/api/book/{book.id}/parse", json={})
+    assert parse_response.status_code == 200
+    assert parse_response.json()["chapters_detected"] == 5
+
+    test_db.refresh(book)
+    assert book.title == "The PDF Chronicle"
+    assert book.subtitle == "A Portable Mystery"
+    assert book.author == "Jane Doe"
+
+
+def test_parse_book_requires_supported_format(
     client: TestClient,
     tmp_path: Path,
     monkeypatch: object,
 ) -> None:
-    """Parsing should fail cleanly for indexed folders that do not contain a DOCX manuscript."""
+    """Parsing should fail cleanly when a folder has no supported manuscript format."""
 
-    folder = tmp_path / "1004-EPub-Only-Book-EPub"
+    folder = tmp_path / "1006-Unsupported-Book-6x9-101"
     folder.mkdir()
-    (folder / "1004-EPub-Only-Book.epub").write_text("stub", encoding="utf-8")
+    (folder / "notes.txt").write_text("unsupported", encoding="utf-8")
     monkeypatch.setattr(settings, "FORMATTED_MANUSCRIPTS_PATH", str(tmp_path))
 
     scan_response = client.post("/api/library/scan")
@@ -251,4 +334,4 @@ def test_parse_book_requires_docx(
 
     parse_response = client.post(f"/api/book/{book_id}/parse", json={})
     assert parse_response.status_code == 400
-    assert parse_response.json() == {"detail": "No DOCX file found in 1004-EPub-Only-Book-EPub"}
+    assert parse_response.json() == {"detail": "No supported manuscript format in 1006-Unsupported-Book-6x9-101"}

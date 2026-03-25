@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from src.config import get_application_settings, settings
 from src.database import Book, BookStatus
+from src.parser import ManuscriptParserFactory
 
 logger = logging.getLogger(__name__)
 
@@ -81,8 +82,8 @@ class LibraryScanner:
             result["total_indexed"] += 1
             result["new_books"] += 1
 
-            if self._find_docx_file(folder) is None:
-                logger.info("Indexed folder without DOCX support yet: %s", folder.name)
+            if self._find_supported_manuscript_file(folder) is None:
+                logger.info("Indexed folder without a supported manuscript file: %s", folder.name)
 
         return result
 
@@ -123,23 +124,13 @@ class LibraryScanner:
     def _find_docx_file(self, folder_path: Path) -> Path | None:
         """Return the preferred DOCX manuscript inside a folder, if any."""
 
-        docx_files = [path for path in folder_path.glob("*.docx") if not path.name.startswith("~$")]
-        if not docx_files:
-            return None
+        return ManuscriptParserFactory._find_docx_file(folder_path)
 
-        def sort_key(path: Path) -> tuple[int, int, str]:
-            lower_name = path.name.lower()
-            if "clean" in lower_name:
-                priority = 0
-            elif "nopgbrfont" in lower_name:
-                priority = 1
-            elif "nobreaks" in lower_name:
-                priority = 2
-            else:
-                priority = 3
-            return (priority, len(lower_name), lower_name)
+    def _find_supported_manuscript_file(self, folder_path: Path) -> Path | None:
+        """Return the preferred supported manuscript file inside a folder, if any."""
 
-        return sorted(docx_files, key=sort_key)[0]
+        _parser, path = ManuscriptParserFactory.get_parser(folder_path)
+        return path
 
     def _normalize_folder_name(self, folder_name: str) -> str:
         """Normalize punctuation quirks before parsing folder metadata."""

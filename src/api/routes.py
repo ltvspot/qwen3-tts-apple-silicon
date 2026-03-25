@@ -22,7 +22,7 @@ from src.database import (
     QAStatus,
     get_db,
 )
-from src.parser import CreditsGenerator, DocxParser
+from src.parser import CreditsGenerator, ManuscriptParserFactory
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +84,7 @@ class LibraryScanResponse(BaseModel):
 
 
 class ParseBookRequest(BaseModel):
-    """Request payload for parsing a book's DOCX manuscript."""
+    """Request payload for parsing a book's manuscript."""
 
     overwrite: bool = False
 
@@ -237,7 +237,7 @@ async def parse_book(
     request: ParseBookRequest,
     db: Session = Depends(get_db),
 ) -> ParseBookResponse:
-    """Parse a book's preferred DOCX manuscript and persist chapter text."""
+    """Parse a book's preferred manuscript format and persist chapter text."""
 
     book = (
         db.query(Book)
@@ -256,18 +256,12 @@ async def parse_book(
             message="Book already parsed. Set overwrite=True to re-parse.",
         )
 
-    scanner = LibraryScanner()
     folder_path = Path(settings.FORMATTED_MANUSCRIPTS_PATH) / book.folder_path
     if not folder_path.exists():
         raise HTTPException(status_code=400, detail=f"Book folder not found: {book.folder_path}")
 
-    docx_path = scanner._find_docx_file(folder_path)
-    if docx_path is None:
-        raise HTTPException(status_code=400, detail=f"No DOCX file found in {book.folder_path}")
-
-    parser = DocxParser()
     try:
-        metadata, chapters_data = parser.parse(docx_path)
+        metadata, chapters_data, manuscript_path = ManuscriptParserFactory.parse_manuscript(folder_path)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -324,7 +318,7 @@ async def parse_book(
     )
 
     db.commit()
-    logger.info("Parsed book %s from %s into %s segments", book_id, docx_path.name, closing_number + 1)
+    logger.info("Parsed book %s from %s into %s segments", book_id, manuscript_path.name, closing_number + 1)
 
     return ParseBookResponse(
         status="parsing",
