@@ -2,6 +2,9 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import AudioPlayerPanel from "../components/AudioPlayerPanel";
 import ChapterList from "../components/ChapterList";
+import DownloadCard from "../components/DownloadCard";
+import ExportDialog from "../components/ExportDialog";
+import ExportProgressBar from "../components/ExportProgressBar";
 import GenerationProgress from "../components/GenerationProgress";
 import NarrationSettings from "../components/NarrationSettings";
 import TextPreview from "../components/TextPreview";
@@ -44,6 +47,40 @@ function mergeChaptersWithGeneration(chapters, generationSnapshot) {
   });
 }
 
+function createIdleExportSnapshot(bookId) {
+  return {
+    book_id: Number(bookId),
+    completed_at: null,
+    error_message: null,
+    export_status: "idle",
+    formats: {},
+    job_id: null,
+    qa_report: null,
+    started_at: null,
+  };
+}
+
+function getExportFormatLabel(format) {
+  if (format === "m4b") {
+    return "M4B (with chapter markers)";
+  }
+
+  return "MP3";
+}
+
+function formatTimestamp(value) {
+  if (!value) {
+    return null;
+  }
+
+  const timestamp = new Date(value);
+  if (Number.isNaN(timestamp.getTime())) {
+    return null;
+  }
+
+  return timestamp.toLocaleString();
+}
+
 export default function BookDetail() {
   const navigate = useNavigate();
   const requestRef = useRef(0);
@@ -54,6 +91,10 @@ export default function BookDetail() {
   const [draftText, setDraftText] = useState("");
   const [editMode, setEditMode] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
+  const [exportDialogOpen, setExportDialogOpen] = useState(false);
+  const [exportErrorMessage, setExportErrorMessage] = useState("");
+  const [exportSnapshot, setExportSnapshot] = useState(createIdleExportSnapshot(id));
+  const [exportSubmitting, setExportSubmitting] = useState(false);
   const [generationAction, setGenerationAction] = useState(null);
   const [generationErrorMessage, setGenerationErrorMessage] = useState("");
   const [generationSnapshot, setGenerationSnapshot] = useState(null);
@@ -76,6 +117,13 @@ export default function BookDetail() {
   const hasRemainingChapters = mergedChapters.some((chapter) => chapter.generation_status !== "completed");
   const generationActive = generationAction !== null || generationSnapshot?.status === "generating";
   const generationDisabled = generationActive;
+  const exportCompletedFormats = Object.entries(exportSnapshot?.formats ?? {}).filter(
+    ([, format]) => format?.status === "completed",
+  );
+  const exportFailedFormats = Object.entries(exportSnapshot?.formats ?? {}).filter(
+    ([, format]) => format?.status === "error",
+  );
+  const exportInProgress = exportSubmitting || exportSnapshot?.export_status === "processing";
 
   useEffect(() => {
     if (!editMode) {
@@ -94,6 +142,20 @@ export default function BookDetail() {
 
     setGenerationAction(null);
   }, [generationSnapshot]);
+
+  useEffect(() => {
+    if (exportSnapshot?.export_status !== "processing") {
+      return undefined;
+    }
+
+    const timeoutId = window.setTimeout(() => {
+      void fetchExportStatus(requestRef.current);
+    }, 2000);
+
+    return () => {
+      window.clearTimeout(timeoutId);
+    };
+  }, [exportSnapshot?.export_status, id]);
 
   async function fetchGenerationStatus(currentRequestId) {
     try {
@@ -119,6 +181,34 @@ export default function BookDetail() {
     }
   }
 
+  async function fetchExportStatus(currentRequestId) {
+    try {
+      const response = await fetch(`/api/book/${id}/export/status`);
+      if (!response.ok) {
+        throw new Error("Failed to fetch export status.");
+      }
+
+      const payload = await response.json();
+      if (requestRef.current !== currentRequestId) {
+        return null;
+      }
+
+      setExportErrorMessage("");
+      setExportSnapshot(payload);
+      return payload;
+    } catch (error) {
+      if (requestRef.current !== currentRequestId) {
+        return null;
+      }
+
+      setExportSnapshot(createIdleExportSnapshot(id));
+      setExportErrorMessage(
+        error instanceof Error ? error.message : "Failed to fetch export status.",
+      );
+      return null;
+    }
+  }
+
   async function fetchBookData() {
     const requestId = requestRef.current + 1;
     requestRef.current = requestId;
@@ -126,6 +216,10 @@ export default function BookDetail() {
     setLoading(true);
     setNotFound(false);
     setErrorMessage("");
+    setExportDialogOpen(false);
+    setExportErrorMessage("");
+    setExportSnapshot(createIdleExportSnapshot(id));
+    setExportSubmitting(false);
     setGenerationErrorMessage("");
     setBook(null);
     setChapters([]);
@@ -174,6 +268,7 @@ export default function BookDetail() {
       });
 
       await fetchGenerationStatus(requestId);
+      await fetchExportStatus(requestId);
     } catch (error) {
       if (requestRef.current !== requestId) {
         return;
@@ -340,6 +435,52 @@ export default function BookDetail() {
     setNarrationSettings(nextSettings);
   }
 
+  async function handleExportSubmit(payload) {
+    setExportSubmitting(true);
+    setExportErrorMessage("");
+
+    try {
+      const response = await fetch(`/api/book/${id}/export`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+      });
+
+      if (!response.ok) {
+        const errorPayload = await response.json().catch(() => null);
+        const detail = typeof errorPayload?.detail === "string"
+          ? errorPayload.detail
+          : "Failed to start export.";
+        throw new Error(detail);
+      }
+
+      const queuedExport = await response.json();
+      setExportSnapshot((currentSnapshot) => ({
+        ...currentSnapshot,
+        book_id: queuedExport.book_id,
+        completed_at: null,
+        error_message: null,
+        export_status: queuedExport.export_status,
+        formats: Object.fromEntries(
+          queuedExport.formats_requested.map((format) => [format, { status: "pending" }]),
+        ),
+        job_id: queuedExport.job_id,
+        qa_report: null,
+        started_at: queuedExport.started_at,
+      }));
+      setExportDialogOpen(false);
+      await fetchExportStatus(requestRef.current);
+    } catch (error) {
+      setExportErrorMessage(
+        error instanceof Error ? error.message : "Failed to start export.",
+      );
+    } finally {
+      setExportSubmitting(false);
+    }
+  }
+
   if (loading) {
     return (
       <div className="flex min-h-screen items-center justify-center bg-[radial-gradient(circle_at_top,_rgba(245,158,11,0.16),_transparent_34%),linear-gradient(135deg,#020617_0%,#0f172a_44%,#111827_100%)] px-6 text-white">
@@ -489,6 +630,12 @@ export default function BookDetail() {
           </div>
         ) : null}
 
+        {exportErrorMessage ? (
+          <div className="mb-6 rounded-[1.75rem] border border-rose-400/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">
+            {exportErrorMessage}
+          </div>
+        ) : null}
+
         {generationActive ? (
           <div className="mb-6">
             <GenerationProgress
@@ -537,11 +684,143 @@ export default function BookDetail() {
             saving={saving}
           />
 
-          <NarrationSettings
-            onChange={handleNarrationSettingsChange}
-            selectedChapter={selectedChapter}
-            settings={narrationSettings}
-          />
+          <div className="flex flex-col gap-6">
+            <NarrationSettings
+              onChange={handleNarrationSettingsChange}
+              selectedChapter={selectedChapter}
+              settings={narrationSettings}
+            />
+
+            <section className="rounded-[2rem] border border-white/10 bg-white/[0.05] p-5 text-white shadow-xl shadow-slate-950/20">
+              <div className="flex flex-col gap-4">
+                <div className="flex flex-wrap items-start justify-between gap-3">
+                  <div>
+                    <div className="text-xs font-semibold uppercase tracking-[0.28em] text-amber-200/75">
+                      Export Pipeline
+                    </div>
+                    <h2 className="mt-3 text-xl font-semibold">Audiobook Exports</h2>
+                    <p className="mt-3 text-sm leading-7 text-slate-300">
+                      Concatenate the generated narration, normalize levels, and package download-ready audiobook files.
+                    </p>
+                  </div>
+                  <div className="inline-flex items-center rounded-full border border-white/10 bg-slate-950/45 px-4 py-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-300">
+                    {exportSnapshot?.export_status === "completed"
+                      ? "Ready to download"
+                      : exportSnapshot?.export_status === "processing"
+                        ? "Export running"
+                        : exportSnapshot?.export_status === "error"
+                          ? "Export error"
+                          : "Not exported"}
+                  </div>
+                </div>
+
+                {exportSnapshot?.completed_at ? (
+                  <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
+                    Last export: {formatTimestamp(exportSnapshot.completed_at) ?? "Unknown"}
+                  </div>
+                ) : null}
+
+                {completedChapters.length === 0 ? (
+                  <div className="rounded-3xl border border-white/10 bg-slate-950/45 px-4 py-4 text-sm leading-7 text-slate-300">
+                    Generate at least one chapter before starting an export.
+                  </div>
+                ) : null}
+
+                {exportInProgress ? (
+                  <ExportProgressBar label="Building the audiobook package and validating output files." />
+                ) : null}
+
+                {exportSnapshot?.qa_report ? (
+                  <div className="grid gap-3 sm:grid-cols-2">
+                    <div className="rounded-3xl border border-white/10 bg-slate-950/45 px-4 py-4">
+                      <div className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">
+                        Included Chapters
+                      </div>
+                      <div className="mt-2 text-2xl font-semibold text-white">
+                        {exportSnapshot.qa_report.chapters_included}
+                      </div>
+                    </div>
+                    <div className="rounded-3xl border border-white/10 bg-slate-950/45 px-4 py-4">
+                      <div className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">
+                        QA Approved
+                      </div>
+                      <div className="mt-2 text-2xl font-semibold text-white">
+                        {exportSnapshot.qa_report.chapters_approved}
+                      </div>
+                    </div>
+                    <div className="rounded-3xl border border-white/10 bg-slate-950/45 px-4 py-4">
+                      <div className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">
+                        Flagged
+                      </div>
+                      <div className="mt-2 text-2xl font-semibold text-white">
+                        {exportSnapshot.qa_report.chapters_flagged}
+                      </div>
+                    </div>
+                    <div className="rounded-3xl border border-white/10 bg-slate-950/45 px-4 py-4">
+                      <div className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">
+                        Warnings
+                      </div>
+                      <div className="mt-2 text-2xl font-semibold text-white">
+                        {exportSnapshot.qa_report.chapters_warnings}
+                      </div>
+                    </div>
+                  </div>
+                ) : null}
+
+                {exportCompletedFormats.length > 0 ? (
+                  <div className="space-y-3">
+                    {exportCompletedFormats.map(([format, details]) => (
+                      <DownloadCard
+                        fileName={details.file_name ?? `${book?.title}.${format}`}
+                        fileSizeBytes={details.file_size_bytes}
+                        formatLabel={getExportFormatLabel(format)}
+                        key={format}
+                        url={details.download_url}
+                      />
+                    ))}
+                  </div>
+                ) : null}
+
+                {exportFailedFormats.length > 0 ? (
+                  <div className="space-y-3">
+                    {exportFailedFormats.map(([format, details]) => (
+                      <div
+                        className="rounded-3xl border border-rose-400/30 bg-rose-500/10 px-4 py-4 text-sm text-rose-100"
+                        key={format}
+                      >
+                        <div className="text-xs font-semibold uppercase tracking-[0.22em] text-rose-200/80">
+                          {getExportFormatLabel(format)}
+                        </div>
+                        <div className="mt-2">
+                          {details.error_message ?? "Export failed for this format."}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+
+                {exportSnapshot?.qa_report?.notes ? (
+                  <div className="rounded-3xl border border-white/10 bg-slate-950/45 px-4 py-4 text-sm leading-7 text-slate-300">
+                    {exportSnapshot.qa_report.notes}
+                  </div>
+                ) : null}
+
+                <div className="flex flex-wrap gap-3">
+                  <button
+                    className="inline-flex items-center justify-center rounded-full border border-amber-300/25 bg-amber-400/10 px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-amber-100 transition hover:bg-amber-400/20 disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/[0.04] disabled:text-slate-500"
+                    disabled={completedChapters.length === 0 || exportInProgress}
+                    onClick={() => {
+                      setExportDialogOpen(true);
+                      setExportErrorMessage("");
+                    }}
+                    type="button"
+                  >
+                    {exportCompletedFormats.length > 0 ? "Re-export Audiobook" : "Export Audiobook"}
+                  </button>
+                </div>
+              </div>
+            </section>
+          </div>
         </div>
       </main>
 
@@ -559,6 +838,19 @@ export default function BookDetail() {
           setPlayerVisible(true);
         }}
         visible={playerVisible && completedChapters.length > 0}
+      />
+
+      <ExportDialog
+        onClose={() => {
+          if (!exportSubmitting) {
+            setExportDialogOpen(false);
+          }
+        }}
+        onSubmit={(payload) => {
+          void handleExportSubmit(payload);
+        }}
+        open={exportDialogOpen}
+        pending={exportSubmitting}
       />
     </div>
   );

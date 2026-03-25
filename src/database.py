@@ -118,6 +118,15 @@ class GenerationJobType(str, Enum):
     BATCH_ALL = "batch_all"
 
 
+class BookExportStatus(str, Enum):
+    """Export lifecycle states for a book."""
+
+    IDLE = "idle"
+    PROCESSING = "processing"
+    COMPLETED = "completed"
+    ERROR = "error"
+
+
 class Book(Base):
     """Audiobook project metadata."""
 
@@ -151,6 +160,12 @@ class Book(Base):
     generation_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     generation_eta_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
     current_job_id: Mapped[int | None] = mapped_column(ForeignKey("generation_jobs.id"), nullable=True)
+    last_export_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    export_status: Mapped[BookExportStatus] = mapped_column(
+        SqlEnum(BookExportStatus, native_enum=False, validate_strings=True),
+        nullable=False,
+        default=BookExportStatus.IDLE,
+    )
 
     chapters: Mapped[list["Chapter"]] = relationship(
         back_populates="book",
@@ -236,6 +251,31 @@ class ChapterQARecord(Base):
     manual_reviewed_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
     manual_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+
+    book: Mapped["Book"] = relationship()
+
+
+class ExportJob(Base):
+    """Persistent export status for the most recent book export."""
+
+    __tablename__ = "export_jobs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    book_id: Mapped[int] = mapped_column(ForeignKey("books.id"), nullable=False, unique=True, index=True)
+    job_token: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    export_status: Mapped[BookExportStatus] = mapped_column(
+        SqlEnum(BookExportStatus, native_enum=False, validate_strings=True),
+        nullable=False,
+        default=BookExportStatus.PROCESSING,
+    )
+    formats_requested: Mapped[str] = mapped_column(Text, nullable=False)
+    format_details: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    include_only_approved: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    qa_report: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     book: Mapped["Book"] = relationship()
 
@@ -356,6 +396,8 @@ def _migrate_sqlite_schema() -> None:
             "generation_started_at": "DATETIME",
             "generation_eta_seconds": "INTEGER",
             "current_job_id": "INTEGER",
+            "last_export_date": "DATETIME",
+            "export_status": "VARCHAR(32) NOT NULL DEFAULT 'idle'",
         },
         "chapters": {
             "started_at": "DATETIME",

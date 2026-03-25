@@ -79,6 +79,20 @@ function createStatusSnapshot(overrides = {}) {
   };
 }
 
+function createExportSnapshot(overrides = {}) {
+  return {
+    book_id: 7,
+    completed_at: null,
+    error_message: null,
+    export_status: "idle",
+    formats: {},
+    job_id: null,
+    qa_report: null,
+    started_at: null,
+    ...overrides,
+  };
+}
+
 async function waitFor(assertion, timeout = 2000) {
   const startTime = Date.now();
 
@@ -182,7 +196,8 @@ describe("BookDetail page", () => {
     fetchMock
       .mockResolvedValueOnce(createJsonResponse(book))
       .mockResolvedValueOnce(createJsonResponse(chapters))
-      .mockResolvedValueOnce(createJsonResponse(createStatusSnapshot()));
+      .mockResolvedValueOnce(createJsonResponse(createStatusSnapshot()))
+      .mockResolvedValueOnce(createJsonResponse(createExportSnapshot()));
 
     await renderBookDetail();
 
@@ -194,6 +209,7 @@ describe("BookDetail page", () => {
     expect(fetchMock.mock.calls[0][0]).toBe("/api/book/7");
     expect(fetchMock.mock.calls[1][0]).toBe("/api/book/7/chapters");
     expect(fetchMock.mock.calls[2][0]).toBe("/api/book/7/status");
+    expect(fetchMock.mock.calls[3][0]).toBe("/api/book/7/export/status");
     expect(container.textContent).toContain("A Test Story");
     expect(container.textContent).toContain("Jane Doe");
     expect(container.textContent).toContain("Narrated by Kent Zimering");
@@ -231,6 +247,7 @@ describe("BookDetail page", () => {
       .mockResolvedValueOnce(createJsonResponse(book))
       .mockResolvedValueOnce(createJsonResponse(chapters))
       .mockResolvedValueOnce(createJsonResponse(createStatusSnapshot()))
+      .mockResolvedValueOnce(createJsonResponse(createExportSnapshot()))
       .mockResolvedValueOnce(createJsonResponse(updatedChapter));
 
     await renderBookDetail();
@@ -263,19 +280,19 @@ describe("BookDetail page", () => {
     });
 
     await waitFor(() => {
-      expect(fetchMock).toHaveBeenCalledTimes(4);
+      expect(fetchMock).toHaveBeenCalledTimes(5);
       expect(container.textContent).toContain(updatedChapter.text_content);
       expect(container.textContent).toContain("6 words");
     });
 
-    expect(fetchMock.mock.calls[3][0]).toBe("/api/book/7/chapter/2/text");
-    expect(fetchMock.mock.calls[3][1]).toMatchObject({
+    expect(fetchMock.mock.calls[4][0]).toBe("/api/book/7/chapter/2/text");
+    expect(fetchMock.mock.calls[4][1]).toMatchObject({
       method: "PUT",
       headers: {
         "Content-Type": "application/json",
       },
     });
-    expect(fetchMock.mock.calls[3][1].body).toBe(
+    expect(fetchMock.mock.calls[4][1].body).toBe(
       JSON.stringify({ text_content: updatedChapter.text_content }),
     );
   });
@@ -297,7 +314,8 @@ describe("BookDetail page", () => {
     fetchMock
       .mockResolvedValueOnce(createJsonResponse(book))
       .mockResolvedValueOnce(createJsonResponse(chapters))
-      .mockResolvedValueOnce(createJsonResponse(createStatusSnapshot()));
+      .mockResolvedValueOnce(createJsonResponse(createStatusSnapshot()))
+      .mockResolvedValueOnce(createJsonResponse(createExportSnapshot()));
 
     await renderBookDetail();
 
@@ -384,6 +402,7 @@ describe("BookDetail page", () => {
       .mockResolvedValueOnce(createJsonResponse(book))
       .mockResolvedValueOnce(createJsonResponse(chapters))
       .mockResolvedValueOnce(createJsonResponse(createStatusSnapshot()))
+      .mockResolvedValueOnce(createJsonResponse(createExportSnapshot()))
       .mockResolvedValueOnce(createJsonResponse({
         book_id: 7,
         job_id: 91,
@@ -412,6 +431,140 @@ describe("BookDetail page", () => {
     expect(window.confirm).toHaveBeenCalledWith(
       "This will generate all remaining chapters. Continue?",
     );
+  });
+
+  test("starts an export and renders completed download cards", async () => {
+    const clipboardWriteMock = jest.fn().mockResolvedValue(undefined);
+    Object.defineProperty(window.navigator, "clipboard", {
+      configurable: true,
+      value: {
+        writeText: clipboardWriteMock,
+      },
+    });
+
+    const book = createBook({});
+    const chapters = [
+      createChapter({
+        audio_path: "7-the-test-chronicle/chapters/00-opening-credits.wav",
+        audio_file_size_bytes: 19000000,
+        completed_at: "2026-03-24T00:00:47+00:00",
+        duration_seconds: 252,
+        id: 701,
+        status: "generated",
+        title: "Opening Credits",
+      }),
+    ];
+    const statusSnapshot = createStatusSnapshot({
+      chapters: [
+        {
+          audio_duration_seconds: 252,
+          audio_file_size_bytes: 19000000,
+          chapter_n: 0,
+          error_message: null,
+          generated_at: "2026-03-24T00:00:47+00:00",
+          generation_seconds: 47.2,
+          expected_total_seconds: 23.4,
+          progress_seconds: null,
+          started_at: "2026-03-24T00:00:00+00:00",
+          status: "completed",
+        },
+      ],
+    });
+    const completedExportSnapshot = createExportSnapshot({
+      completed_at: "2026-03-24T00:10:00+00:00",
+      export_status: "completed",
+      formats: {
+        mp3: {
+          completed_at: "2026-03-24T00:10:00+00:00",
+          download_url: "/api/book/7/export/download/mp3",
+          error_message: null,
+          file_name: "The Test Chronicle.mp3",
+          file_size_bytes: 487923048,
+          status: "completed",
+        },
+        m4b: {
+          completed_at: "2026-03-24T00:10:00+00:00",
+          download_url: "/api/book/7/export/download/m4b",
+          error_message: null,
+          file_name: "The Test Chronicle.m4b",
+          file_size_bytes: 341234056,
+          status: "completed",
+        },
+      },
+      job_id: "export_7_20260324_001000",
+      qa_report: {
+        book_id: 7,
+        book_title: "The Test Chronicle",
+        chapter_summary: [],
+        chapters_approved: 1,
+        chapters_flagged: 0,
+        chapters_included: 1,
+        chapters_warnings: 0,
+        export_approved: true,
+        export_date: "2026-03-24T00:10:00+00:00",
+        notes: "All selected chapters exported without QA exclusions.",
+      },
+    });
+
+    fetchMock
+      .mockResolvedValueOnce(createJsonResponse(book))
+      .mockResolvedValueOnce(createJsonResponse(chapters))
+      .mockResolvedValueOnce(createJsonResponse(statusSnapshot))
+      .mockResolvedValueOnce(createJsonResponse(createExportSnapshot()))
+      .mockResolvedValueOnce(createJsonResponse({
+        book_id: 7,
+        export_status: "processing",
+        expected_completion_seconds: 30,
+        formats_requested: ["mp3", "m4b"],
+        job_id: "export_7_20260324_001000",
+        started_at: "2026-03-24T00:09:00+00:00",
+      }))
+      .mockResolvedValueOnce(createJsonResponse(completedExportSnapshot));
+
+    await renderBookDetail();
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("Export Audiobook");
+    });
+
+    await act(async () => {
+      getButtonByText("Export Audiobook").dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("Include M4B");
+    });
+
+    await act(async () => {
+      Array.from(container.querySelectorAll("button"))
+        .find((button) => button.textContent.trim() === "Export")
+        .dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/book/7/export",
+        expect.objectContaining({
+          body: JSON.stringify({
+            formats: ["mp3", "m4b"],
+            include_only_approved: true,
+          }),
+          method: "POST",
+        }),
+      );
+      expect(container.textContent).toContain("M4B (with chapter markers)");
+      expect(container.textContent).toContain("The Test Chronicle.mp3");
+    });
+
+    await act(async () => {
+      Array.from(container.querySelectorAll("button"))
+        .find((button) => button.textContent.includes("Copy Link"))
+        .dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    await waitFor(() => {
+      expect(clipboardWriteMock).toHaveBeenCalledWith("http://localhost/api/book/7/export/download/mp3");
+    });
   });
 
   test("renders completed chapter controls and opens the bottom audio player", async () => {
@@ -447,7 +600,8 @@ describe("BookDetail page", () => {
     fetchMock
       .mockResolvedValueOnce(createJsonResponse(book))
       .mockResolvedValueOnce(createJsonResponse(chapters))
-      .mockResolvedValueOnce(createJsonResponse(statusSnapshot));
+      .mockResolvedValueOnce(createJsonResponse(statusSnapshot))
+      .mockResolvedValueOnce(createJsonResponse(createExportSnapshot()));
 
     await renderBookDetail();
 

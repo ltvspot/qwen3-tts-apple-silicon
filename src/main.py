@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import RequestResponseEndpoint
 
 from src import __version__
+from src.api.export_routes import router as export_router
 from src.api.generation import router as generation_router
 from src.api.generation_runtime import shutdown_generation_runtime
 from src.api.qa_routes import router as qa_router
@@ -74,6 +75,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 app.include_router(api_router)
+app.include_router(export_router)
 app.include_router(generation_router)
 app.include_router(qa_router)
 app.include_router(queue_router)
