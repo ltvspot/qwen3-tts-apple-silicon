@@ -18,6 +18,9 @@ from src.pipeline.qa_checker import persist_qa_result, run_qa_checks_for_chapter
 
 logger = logging.getLogger(__name__)
 
+TRANSIENT_GENERATION_ERRORS = (TimeoutError, MemoryError, OSError)
+PERMANENT_GENERATION_ERRORS = (FileNotFoundError, ValueError)
+
 
 class GenerationCancelled(Exception):
     """Raised when an in-flight generation job has been cancelled."""
@@ -40,6 +43,7 @@ class AudiobookGenerator:
 
         self.engine = engine
         self.output_path = Path(settings.OUTPUTS_PATH)
+        self.retry_backoff_seconds: tuple[float, ...] = (0.25, 0.75)
 
     def close(self) -> None:
         """Release the underlying engine if it has been loaded."""
@@ -205,12 +209,14 @@ class AudiobookGenerator:
             for chunk_index, chunk in enumerate(chunks):
                 self._raise_if_cancelled(should_cancel)
 
-                audio = await asyncio.to_thread(
-                    self.engine.generate,
+                audio = await self._generate_chunk_with_retry(
                     chunk,
-                    voice_name,
-                    emotion,
-                    chapter_speed,
+                    voice_name=voice_name,
+                    emotion=emotion,
+                    speed=chapter_speed,
+                    chapter_number=chapter.number,
+                    book_id=book_id,
+                    should_cancel=should_cancel,
                 )
                 audio_chunks.append(audio)
 
@@ -266,6 +272,55 @@ class AudiobookGenerator:
             chapter.error_message = str(exc)
             db_session.commit()
             raise
+
+    async def _generate_chunk_with_retry(
+        self,
+        text: str,
+        *,
+        voice_name: str,
+        emotion: str | None,
+        speed: float,
+        chapter_number: int,
+        book_id: int,
+        should_cancel: Callable[[], bool] | None,
+    ) -> Any:
+        """Generate one chunk with retries for transient engine failures."""
+
+        max_attempts = len(self.retry_backoff_seconds) + 1
+        for attempt in range(1, max_attempts + 1):
+            self._raise_if_cancelled(should_cancel)
+            try:
+                return await asyncio.to_thread(
+                    self.engine.generate,
+                    text,
+                    voice_name,
+                    emotion,
+                    speed,
+                )
+            except PERMANENT_GENERATION_ERRORS:
+                raise
+            except TRANSIENT_GENERATION_ERRORS as exc:
+                if attempt >= max_attempts:
+                    logger.error(
+                        "Transient generation error exhausted retries for book %s chapter %s: %s",
+                        book_id,
+                        chapter_number,
+                        exc,
+                    )
+                    raise
+
+                backoff = self.retry_backoff_seconds[attempt - 1]
+                logger.warning(
+                    "Retrying generation for book %s chapter %s after transient error (%s/%s): %s",
+                    book_id,
+                    chapter_number,
+                    attempt,
+                    max_attempts,
+                    exc,
+                )
+                await asyncio.sleep(backoff)
+
+        raise RuntimeError("Chunk generation retry loop exited unexpectedly.")
 
     def _ensure_engine_loaded(self) -> None:
         """Load the engine on first generation request."""

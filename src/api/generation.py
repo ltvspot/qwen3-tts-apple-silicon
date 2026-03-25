@@ -11,6 +11,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from src.api.cache import invalidate_library_cache
 from src.config import settings
 from src.api.generation_runtime import ensure_queue_started, get_queue
 from src.database import (
@@ -153,6 +154,16 @@ def _load_chapter_or_404(book_id: int, chapter_number: int, db: Session) -> Chap
     if chapter is None:
         raise HTTPException(status_code=404, detail=f"Chapter {chapter_number} not found in book {book_id}")
     return chapter
+
+
+def _first_incomplete_chapter_number(chapters: list[Chapter]) -> int | None:
+    """Return the first chapter number that still needs generation."""
+
+    first_incomplete = next(
+        (chapter.number for chapter in chapters if chapter.status != ChapterStatus.GENERATED),
+        None,
+    )
+    return first_incomplete
 
 
 def _has_active_job(book_id: int, db: Session, *, chapter_id: int | None = None) -> bool:
@@ -426,8 +437,9 @@ async def _enqueue_book_generation(book_id: int, db: Session, *, force: bool) ->
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("Failed to enqueue book %s for generation", book_id)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail="Failed to queue generation job.") from exc
 
+    invalidate_library_cache()
     return QueueJobResponse(
         job_id=job_id,
         status="queued",
@@ -456,6 +468,39 @@ async def generate_book_remaining(
     """Queue generation for the remaining chapters in a parsed book."""
 
     return await _enqueue_book_generation(book_id, db, force=force)
+
+
+@router.post("/book/{book_id}/resume", response_model=QueueJobResponse)
+async def resume_book_generation(book_id: int, db: Session = Depends(get_db)) -> QueueJobResponse:
+    """Resume generation for the first chapter that still needs audio."""
+
+    book = _load_book_or_404(book_id, db)
+    chapters = _get_book_chapters(book_id, db)
+    _validate_book_ready_for_generation(book, chapters, book_id, force=False)
+
+    resume_from = _first_incomplete_chapter_number(chapters)
+    if resume_from is None:
+        raise HTTPException(status_code=400, detail="All chapters are already generated.")
+    if _has_active_job(book_id, db):
+        raise HTTPException(status_code=400, detail="Generation is already active for this book.")
+
+    try:
+        queue = await ensure_queue_started(db)
+        job_id = await queue.enqueue_book(book_id, db, force=False)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Failed to resume generation for book %s", book_id)
+        raise HTTPException(status_code=500, detail="Failed to resume generation.") from exc
+
+    invalidate_library_cache()
+    return QueueJobResponse(
+        job_id=job_id,
+        status="queued",
+        book_id=book_id,
+        chapter_number=resume_from,
+        message=f"Generation resumed from chapter {resume_from}",
+    )
 
 
 @router.post("/book/{book_id}/chapter/{chapter_number}/generate", response_model=QueueJobResponse)
@@ -492,8 +537,9 @@ async def generate_chapter(
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("Failed to enqueue book %s chapter %s", book_id, chapter_number)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail="Failed to queue chapter generation.") from exc
 
+    invalidate_library_cache()
     return QueueJobResponse(
         job_id=job_id,
         status="queued",
@@ -521,6 +567,7 @@ async def cancel_job(job_id: int, db: Session = Depends(get_db)) -> CancelJobRes
     if not cancelled:
         raise HTTPException(status_code=400, detail="Job cannot be cancelled")
 
+    invalidate_library_cache()
     return CancelJobResponse(
         cancelled=True,
         job_id=job_id,

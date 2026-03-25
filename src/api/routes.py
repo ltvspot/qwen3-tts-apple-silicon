@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session, selectinload
 
+from src.api.cache import invalidate_library_cache, library_cache
 from src.api.library import LibraryScanner
 from src.config import get_application_settings, settings
 from src.database import (
@@ -164,6 +165,12 @@ def _build_library_stats(db: Session) -> LibraryStats:
     return LibraryStats(**counts)
 
 
+def _library_cache_key(*, status_filter: BookStatus | None, limit: int, offset: int) -> str:
+    """Build the cache key for a library listing query."""
+
+    return f"library:{status_filter.value if status_filter is not None else 'all'}:{limit}:{offset}"
+
+
 @router.post("/library/scan", response_model=LibraryScanResponse)
 async def scan_library(db: Session = Depends(get_db)) -> LibraryScanResponse:
     """Scan the manuscript root and index any newly discovered book folders."""
@@ -178,6 +185,7 @@ async def scan_library(db: Session = Depends(get_db)) -> LibraryScanResponse:
         result["new_books"],
         len(result["errors"]),
     )
+    invalidate_library_cache()
     return LibraryScanResponse(**result)
 
 
@@ -190,6 +198,11 @@ async def get_library(
 ) -> LibraryResponse:
     """Return paginated library books plus lifecycle statistics."""
 
+    cache_key = _library_cache_key(status_filter=status_filter, limit=limit, offset=offset)
+    cached_payload = library_cache.get(cache_key)
+    if cached_payload is not None:
+        return LibraryResponse(**cached_payload)
+
     query = db.query(Book).options(selectinload(Book.chapters)).order_by(Book.created_at, Book.id)
     if status_filter is not None:
         query = query.filter(Book.status == status_filter)
@@ -197,11 +210,13 @@ async def get_library(
     total = query.count()
     books = query.offset(offset).limit(limit).all()
 
-    return LibraryResponse(
+    response = LibraryResponse(
         total=total,
         books=[_serialize_book(book) for book in books],
         stats=_build_library_stats(db),
     )
+    library_cache.set(cache_key, response.model_dump(mode="json"))
+    return response
 
 
 @router.get("/book/{book_id}", response_model=BookResponse)
@@ -318,6 +333,7 @@ async def parse_book(
     )
 
     db.commit()
+    invalidate_library_cache()
     logger.info("Parsed book %s from %s into %s segments", book_id, manuscript_path.name, closing_number + 1)
 
     return ParseBookResponse(

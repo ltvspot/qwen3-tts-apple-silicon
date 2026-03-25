@@ -12,35 +12,28 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Request, Response
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from starlette.middleware.base import RequestResponseEndpoint
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from src import __version__
+from src.api.error_handlers import register_error_handlers
 from src.api.export_routes import router as export_router
 from src.api.generation import router as generation_router
 from src.api.generation_runtime import shutdown_generation_runtime
+from src.api.middleware import request_context_middleware
 from src.api.qa_routes import router as qa_router
 from src.api.queue_routes import router as queue_router
 from src.api.settings_routes import router as settings_router
 from src.api.voice_lab import release_engine, router as voice_lab_router
 from src.api.routes import router as api_router
-from src.api.schemas import HealthCheckResponse
+from src.api.schemas import HealthCheckResponse, StartupHealthSummary
 from src.config import get_application_settings, reset_settings_manager, settings
-from src.database import init_db
+from src.database import init_db, utc_now
+from src.health_checks import run_all_health_checks
+from src.logging_config import configure_logging
 
-
-def configure_logging() -> None:
-    """Configure application logging once for the process."""
-
-    logging.basicConfig(
-        level=getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO),
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    )
-
-
-configure_logging()
+configure_logging(level=settings.LOG_LEVEL)
 logger = logging.getLogger(__name__)
 
 def ensure_runtime_directories() -> None:
@@ -55,32 +48,18 @@ def ensure_runtime_directories() -> None:
             logger.warning("Configured path does not exist yet: %s", path)
 
 
-def validate_startup_settings() -> None:
-    """Validate persisted settings and log any critical startup gaps."""
-
-    reset_settings_manager()
-    application_settings = get_application_settings()
-
-    manuscript_folder = Path(application_settings.manuscript_source_folder)
-    if not manuscript_folder.exists():
-        logger.warning("Manuscript folder not found: %s", manuscript_folder)
-        logger.warning("Configure the manuscript source folder in Settings.")
-
-    model_path = Path(application_settings.engine_config.model_path)
-    if not model_path.exists():
-        raise RuntimeError(f"TTS model not found: {model_path}")
-
-    logger.info("Loaded application settings for narrator: %s", application_settings.narrator_name)
-
-
 @asynccontextmanager
-async def lifespan(_: FastAPI):
+async def lifespan(app: FastAPI):
     """Initialize runtime dependencies when the application starts."""
 
     logger.info("Starting Alexandria Audiobook Narrator %s", __version__)
     ensure_runtime_directories()
     init_db()
-    validate_startup_settings()
+    reset_settings_manager()
+    application_settings = get_application_settings()
+    logger.info("Loaded application settings for narrator: %s", application_settings.narrator_name)
+    startup_summary = await run_all_health_checks()
+    app.state.startup_health = startup_summary
     yield
     await shutdown_generation_runtime()
     release_engine()
@@ -88,12 +67,18 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="Alexandria Audiobook Narrator", version=__version__, lifespan=lifespan)
 app.add_middleware(
+    TrustedHostMiddleware,
+    allowed_hosts=["localhost", "127.0.0.1", "*.local", "testserver"],
+)
+app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allowed_origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["*"],
 )
+app.middleware("http")(request_context_middleware)
+register_error_handlers(app)
 app.include_router(api_router)
 app.include_router(export_router)
 app.include_router(generation_router)
@@ -103,25 +88,21 @@ app.include_router(settings_router)
 app.include_router(voice_lab_router)
 
 
-@app.middleware("http")
-async def unhandled_exception_middleware(
-    request: Request,
-    call_next: RequestResponseEndpoint,
-) -> Response:
-    """Return JSON for unexpected server errors."""
-
-    try:
-        return await call_next(request)
-    except Exception:
-        logger.exception("Unhandled application error for %s %s", request.method, request.url.path)
-        return JSONResponse(status_code=500, content={"detail": "Internal server error"})
-
-
 @app.get("/api/health", response_model=HealthCheckResponse)
 async def health_check() -> HealthCheckResponse:
     """Return a basic health response."""
 
-    return HealthCheckResponse(status="ok", version=__version__)
+    startup_summary = getattr(app.state, "startup_health", None)
+    if startup_summary is None:
+        startup_summary = StartupHealthSummary(checked_at=utc_now(), checks=[], warnings=[], errors=[])
+
+    if startup_summary.errors:
+        status = "error"
+    elif startup_summary.warnings:
+        status = "degraded"
+    else:
+        status = "ok"
+    return HealthCheckResponse(status=status, version=__version__, startup=startup_summary)
 
 
 if __name__ == "__main__":

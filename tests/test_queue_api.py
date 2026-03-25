@@ -291,6 +291,48 @@ def test_pause_resume_and_cancel_endpoints_persist_history(client, test_db: Sess
     assert history_actions == ["paused", "resumed", "cancelled"]
 
 
+def test_resume_book_generation_queues_the_first_incomplete_chapter(client, test_db: Session) -> None:
+    """Resuming a book should target the first chapter without generated audio."""
+
+    book = create_book(test_db, title="Resume API Book")
+    finished = create_chapter(
+        test_db,
+        book_id=book.id,
+        number=1,
+        title="Finished Chapter",
+        status=ChapterStatus.GENERATED,
+    )
+    finished.audio_path = "resume-api-book/01-finished.wav"
+    finished.duration_seconds = 12.5
+    create_chapter(
+        test_db,
+        book_id=book.id,
+        number=2,
+        title="Needs Retry",
+        status=ChapterStatus.FAILED,
+    )
+    create_chapter(
+        test_db,
+        book_id=book.id,
+        number=3,
+        title="Still Pending",
+    )
+    test_db.commit()
+
+    response = client.post(f"/api/book/{book.id}/resume")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "queued"
+    assert payload["book_id"] == book.id
+    assert payload["chapter_number"] == 2
+    assert payload["message"] == "Generation resumed from chapter 2"
+
+    job = test_db.query(GenerationJob).filter(GenerationJob.id == payload["job_id"]).one()
+    assert job.status == GenerationJobStatus.QUEUED
+    assert job.current_chapter_n == 2
+
+
 def test_pause_running_job_sets_pause_request(client, test_db: Session) -> None:
     """Pausing an active job should record a deferred pause request."""
 

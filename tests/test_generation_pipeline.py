@@ -8,6 +8,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
+from pydub import AudioSegment
 from pydub.generators import Sine
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -128,6 +129,51 @@ class SlowGenerator:
                 await progress_callback((index + 1) / 4)
         chapter.status = ChapterStatus.GENERATED
         return 1.0
+
+
+class FlakyEngine:
+    """Test TTS engine that fails transiently before succeeding."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.loaded = False
+        self.max_chunk_chars = 10_000
+
+    def load(self) -> None:
+        self.loaded = True
+
+    def unload(self) -> None:
+        self.loaded = False
+
+    def generate(self, text: str, voice: str, emotion: str | None = None, speed: float = 1.0) -> AudioSegment:
+        del text, voice, emotion, speed
+        self.calls += 1
+        if self.calls < 3:
+            raise TimeoutError("temporary timeout")
+        return AudioSegment.silent(duration=250)
+
+
+class ConsecutiveFailureGenerator:
+    """Queue generator stub that marks chapters failed and keeps failing."""
+
+    async def generate_chapter(
+        self,
+        book_id,
+        chapter,
+        db_session,
+        progress_callback=None,
+        should_cancel=None,
+        force=False,
+        voice_name=None,
+        emotion=None,
+        speed=None,
+    ):
+        del book_id, progress_callback, should_cancel, force, voice_name, emotion, speed
+        chapter.status = ChapterStatus.FAILED
+        chapter.completed_at = utc_now()
+        chapter.error_message = f"Chapter {chapter.number} failed"
+        db_session.commit()
+        raise RuntimeError(chapter.error_message)
 
 
 @pytest.fixture(autouse=True)
@@ -265,6 +311,29 @@ async def test_generate_book_accepts_persisted_cloned_voice(test_db: Session, tm
 
 
 @pytest.mark.asyncio
+async def test_generate_chapter_retries_transient_failures_before_succeeding(test_db: Session) -> None:
+    """Transient engine failures should be retried before surfacing an error."""
+
+    generator = AudiobookGenerator(FlakyEngine())
+    book = create_book(test_db, title="Retry Book")
+    chapter = create_chapter(
+        test_db,
+        book_id=book.id,
+        number=1,
+        title="Retry Chapter",
+        chapter_type=ChapterType.CHAPTER,
+        text="A short chapter that should succeed after transient failures.",
+    )
+
+    duration = await generator.generate_chapter(book.id, chapter, test_db)
+
+    test_db.refresh(chapter)
+    assert duration == 0.25
+    assert generator.engine.calls == 3
+    assert chapter.status == ChapterStatus.GENERATED
+
+
+@pytest.mark.asyncio
 async def test_generation_queue_processes_fifo_and_cancels_queued_jobs(test_db: Session) -> None:
     """The queue should process jobs in order and allow queued cancellation."""
 
@@ -297,6 +366,52 @@ async def test_generation_queue_processes_fifo_and_cancels_queued_jobs(test_db: 
     assert second_status is not None
     assert first_status.status == JobStatus.COMPLETED
     assert second_status.status == JobStatus.CANCELLED
+
+    await queue.stop()
+
+
+@pytest.mark.asyncio
+async def test_generation_queue_stops_after_three_consecutive_chapter_failures(test_db: Session) -> None:
+    """The queue should abort a full-book job after three consecutive chapter failures."""
+
+    queue = GenerationQueue(max_workers=1)
+    session_factory = sessionmaker(
+        bind=test_db.get_bind(),
+        autoflush=False,
+        autocommit=False,
+        expire_on_commit=False,
+    )
+
+    book = create_book(test_db, title="Failure Cascade Book")
+    for chapter_number in range(1, 5):
+        create_chapter(
+            test_db,
+            book_id=book.id,
+            number=chapter_number,
+            title=f"Chapter {chapter_number}",
+            chapter_type=ChapterType.CHAPTER,
+            text="A failing chapter body.",
+        )
+
+    await queue.start(session_factory, ConsecutiveFailureGenerator())
+
+    job_id = await queue.enqueue_book(book.id, test_db)
+    await queue.wait_until_idle()
+
+    test_db.expire_all()
+    job_status = await queue.get_job_status(job_id, test_db)
+    db_job = test_db.query(GenerationJob).filter(GenerationJob.id == job_id).one()
+    chapters = test_db.query(Chapter).filter(Chapter.book_id == book.id).order_by(Chapter.number).all()
+
+    assert job_status is not None
+    assert job_status.status == JobStatus.FAILED
+    assert db_job.error_message == "Generation stopped after 3 consecutive chapter failures."
+    assert [chapter.status for chapter in chapters] == [
+        ChapterStatus.FAILED,
+        ChapterStatus.FAILED,
+        ChapterStatus.FAILED,
+        ChapterStatus.PENDING,
+    ]
 
     await queue.stop()
 

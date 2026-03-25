@@ -326,7 +326,18 @@ export default function Library() {
               className="mt-6 rounded-2xl border border-rose-400/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-100"
               role="alert"
             >
-              {errorMessage}
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                <span>{errorMessage}</span>
+                <button
+                  className="rounded-full border border-rose-300/40 px-4 py-2 text-xs font-semibold uppercase tracking-[0.24em] text-rose-50 transition hover:border-rose-200/60 hover:bg-rose-400/10"
+                  onClick={() => {
+                    void fetchLibrary(statusFilter);
+                  }}
+                  type="button"
+                >
+                  Retry Load
+                </button>
+              </div>
             </div>
           )}
 

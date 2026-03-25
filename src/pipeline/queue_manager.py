@@ -13,6 +13,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session, selectinload
 
+from src.api.cache import invalidate_library_cache
 from src.config import get_application_settings
 from src.database import (
     Book,
@@ -585,6 +586,7 @@ class GenerationQueue:
                 book.generation_started_at = started_at
                 book.generation_eta_seconds = db_job.eta_seconds
             db_session.commit()
+            invalidate_library_cache()
 
             job_info = self._store_job_snapshot(db_job)
             self.active_jobs.add(job_id)
@@ -630,6 +632,7 @@ class GenerationQueue:
         self._sync_full_book_metrics(db_job, chapters, force=db_job.force)
         db_session.commit()
         self._store_job_snapshot(db_job)
+        consecutive_failures = 0
 
         for chapter in chapters:
             if not db_job.force and chapter.status == ChapterStatus.GENERATED:
@@ -692,13 +695,23 @@ class GenerationQueue:
                 )
             except Exception as exc:
                 logger.error("Job %s chapter %s failed: %s", db_job.id, chapter.number, exc)
+                consecutive_failures += 1
                 self._sync_full_book_metrics(db_job, chapters, force=db_job.force)
                 db_job.error_message = str(exc)
                 db_job.current_chapter_progress = 0.0
                 db_job.progress = self._overall_progress(db_job.chapters_completed, db_job.chapters_total, 0.0)
                 db_session.commit()
                 self._store_job_snapshot(db_job)
+                if consecutive_failures >= 3:
+                    self._mark_failed(
+                        db_job,
+                        job_info,
+                        db_session,
+                        "Generation stopped after 3 consecutive chapter failures.",
+                    )
+                    return
             else:
+                consecutive_failures = 0
                 self._sync_full_book_metrics(db_job, chapters, force=db_job.force)
                 observed_seconds = self._observed_generation_seconds(chapter)
                 db_job.avg_seconds_per_chapter = self._updated_average(
@@ -911,6 +924,7 @@ class GenerationQueue:
             db_job.error_message if failed else "Job completed successfully.",
         )
         db_session.commit()
+        invalidate_library_cache()
         self._store_job_snapshot(db_job)
 
     def _mark_failed(self, db_job: GenerationJob, job_info: JobInfo, db_session: Session, error_message: str) -> None:
@@ -937,6 +951,7 @@ class GenerationQueue:
             book.current_job_id = db_job.id
 
         db_session.commit()
+        invalidate_library_cache()
         self._store_job_snapshot(db_job)
         logger.info("Generation job %s paused", db_job.id)
 
@@ -971,6 +986,7 @@ class GenerationQueue:
                 chapter.error_message = None
 
         db_session.commit()
+        invalidate_library_cache()
         self._store_job_snapshot(db_job)
         logger.info("Generation job %s marked as cancelled", db_job.id)
 

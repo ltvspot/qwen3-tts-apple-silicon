@@ -348,4 +348,53 @@ describe("Library page", () => {
     expect(scanButton.disabled).toBe(false);
     expect(scanButton.textContent).toBe("Scan Library");
   });
+
+  test("shows a retry action when the library request fails and recovers on retry", async () => {
+    const retryStats = {
+      not_started: 1,
+      parsed: 0,
+      generating: 0,
+      generated: 0,
+      qa: 0,
+      qa_approved: 0,
+      exported: 0,
+    };
+
+    fetchMock
+      .mockResolvedValueOnce({
+        json: async () => ({}),
+        ok: false,
+      })
+      .mockResolvedValueOnce(
+        createJsonResponse({
+          books: [
+            createBook({
+              author: "Retry Author",
+              folder_path: "0201-retried-book",
+              id: 201,
+              title: "Retried Book",
+            }),
+          ],
+          stats: retryStats,
+          total: 1,
+        }),
+      );
+
+    await renderLibrary();
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("Failed to fetch library");
+      expect(getButtonByText("Retry Load")).toBeTruthy();
+    });
+
+    await act(async () => {
+      getButtonByText("Retry Load").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+    });
+
+    await waitFor(() => {
+      expect(getBookIds()).toEqual([201]);
+    });
+  });
 });

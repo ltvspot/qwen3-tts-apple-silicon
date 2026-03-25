@@ -204,7 +204,7 @@ async def test_voice(request: VoiceTestRequest) -> VoiceTestResponse:
         raise
     except Exception as exc:
         logger.exception("Voice test generation failed")
-        raise HTTPException(status_code=500, detail=f"Generation failed: {exc}") from exc
+        raise HTTPException(status_code=500, detail="Generation failed.") from exc
 
 
 @router.get("/api/voice-lab/voices", response_model=VoiceListResponse)
@@ -236,7 +236,7 @@ async def get_voices(db: Session = Depends(get_db)) -> VoiceListResponse:
         return VoiceListResponse(engine=engine.name, voices=voices)
     except Exception as exc:
         logger.exception("Failed to list voices")
-        raise HTTPException(status_code=500, detail=f"Failed to list voices: {exc}") from exc
+        raise HTTPException(status_code=500, detail="Failed to list voices.") from exc
 
 
 @router.post("/api/voice-lab/clone", response_model=CloneVoiceResponse)
@@ -306,7 +306,7 @@ async def clone_voice(
     except Exception as exc:
         db.rollback()
         logger.exception("Voice cloning failed")
-        raise HTTPException(status_code=500, detail=f"Voice cloning failed: {exc}") from exc
+        raise HTTPException(status_code=500, detail="Voice cloning failed.") from exc
     finally:
         if temporary_path is not None:
             temporary_path.unlink(missing_ok=True)

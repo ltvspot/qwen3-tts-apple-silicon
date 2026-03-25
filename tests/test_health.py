@@ -9,4 +9,10 @@ def test_health_check(client: TestClient) -> None:
     response = client.get("/api/health")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok", "version": "0.1.0"}
+    payload = response.json()
+    assert payload["status"] in {"ok", "degraded"}
+    assert payload["version"] == "0.1.0"
+    assert isinstance(payload["startup"]["warnings"], list)
+    assert isinstance(payload["startup"]["errors"], list)
+    assert len(payload["startup"]["checks"]) == 5
+    assert {"name", "status", "detail", "critical"} <= set(payload["startup"]["checks"][0])

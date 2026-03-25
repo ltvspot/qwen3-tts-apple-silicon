@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session, selectinload
 
+from src.api.cache import invalidate_library_cache
 from src.api.generation_runtime import ensure_queue_started, get_queue
 from src.config import get_application_settings
 from src.database import (
@@ -452,6 +453,7 @@ async def pause_queue_job(
     if job is None:
         raise HTTPException(status_code=400, detail="Job cannot be paused")
 
+    invalidate_library_cache()
     return PauseJobResponse(job_id=job.id, status="paused", paused_at=job.paused_at)
 
 
@@ -464,6 +466,7 @@ async def resume_queue_job(job_id: int, db: Session = Depends(get_db)) -> Resume
     if job is None:
         raise HTTPException(status_code=400, detail="Job cannot be resumed")
 
+    invalidate_library_cache()
     return ResumeJobResponse(job_id=job.id, status="queued", paused_at=job.paused_at)
 
 
@@ -484,6 +487,7 @@ async def cancel_queue_job(
     if job is None:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
 
+    invalidate_library_cache()
     return CancelJobResponse(
         job_id=job.id,
         status="error",

@@ -2,6 +2,7 @@
   "name": "alexandria-audiobook-narrator",
   "version": "0.1.0",
   "private": true,
+  "proxy": "http://127.0.0.1:8080",
   "dependencies": {
     "prop-types": "^15.8.1",
     "react": "^18.2.0",

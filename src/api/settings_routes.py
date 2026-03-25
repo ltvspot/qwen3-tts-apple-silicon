@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,7 @@ from src.engines.voice_cloner import VoiceCloner
 from src.engines.qwen3_tts import VOICE_PRESETS
 
 router = APIRouter(prefix="/api", tags=["settings"])
+logger = logging.getLogger(__name__)
 
 
 class UpdateSettingsResponse(BaseModel):
@@ -66,7 +68,8 @@ async def update_settings(updates: dict[str, Any]) -> UpdateSettingsResponse:
     except ValidationError as exc:
         raise HTTPException(status_code=400, detail=exc.errors()) from exc
     except RuntimeError as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        logger.exception("Failed to persist settings")
+        raise HTTPException(status_code=500, detail="Failed to persist settings.") from exc
 
     return UpdateSettingsResponse(
         success=True,

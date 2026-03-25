@@ -349,4 +349,32 @@ describe("Settings page", () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
+
+  test("shows a retry action when the initial settings load fails and recovers on retry", async () => {
+    fetchMock
+      .mockResolvedValueOnce(createJsonResponse({}, { ok: false, status: 500 }))
+      .mockResolvedValueOnce(createJsonResponse(createSettingsSchema()))
+      .mockResolvedValueOnce(createJsonResponse(createSettingsPayload()))
+      .mockResolvedValueOnce(createJsonResponse(createSettingsSchema()));
+
+    await renderSettingsPage();
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("Failed to load settings.");
+      expect(getButtonByText(container, "Retry Load")).toBeTruthy();
+    });
+
+    await act(async () => {
+      getButtonByText(container, "Retry Load").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+    });
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("Manage the global narrator");
+      expect(container.querySelector("#narrator-name").value).toBe("Kent Zimering");
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
 });

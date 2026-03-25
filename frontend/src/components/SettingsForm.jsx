@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
+import useAsyncData from "../hooks/useAsyncData";
 
 function cloneSettings(payload) {
   return JSON.parse(JSON.stringify(payload));
@@ -111,59 +112,48 @@ export default function SettingsForm() {
   const [errorMessage, setErrorMessage] = useState("");
   const [formSettings, setFormSettings] = useState(null);
   const [initialSettings, setInitialSettings] = useState(null);
-  const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [schema, setSchema] = useState(null);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [successMessage, setSuccessMessage] = useState("");
   const [validationMessage, setValidationMessage] = useState("");
 
-  useEffect(() => {
-    let cancelled = false;
+  const {
+    data: loadedSettings,
+    error: loadError,
+    loading: isLoading,
+    retry: retryLoad,
+  } = useAsyncData(async () => {
+    const [settingsResponse, schemaResponse] = await Promise.all([
+      fetch("/api/settings"),
+      fetch("/api/settings/schema"),
+    ]);
 
-    async function load() {
-      setIsLoading(true);
-      setErrorMessage("");
-
-      try {
-        const [settingsResponse, schemaResponse] = await Promise.all([
-          fetch("/api/settings"),
-          fetch("/api/settings/schema"),
-        ]);
-
-        if (!settingsResponse.ok || !schemaResponse.ok) {
-          throw new Error("Failed to load settings.");
-        }
-
-        const [settingsPayload, schemaPayload] = await Promise.all([
-          settingsResponse.json(),
-          schemaResponse.json(),
-        ]);
-
-        if (cancelled) {
-          return;
-        }
-
-        setSchema(schemaPayload);
-        setFormSettings(cloneSettings(settingsPayload));
-        setInitialSettings(cloneSettings(settingsPayload));
-      } catch (error) {
-        if (!cancelled) {
-          setErrorMessage(error instanceof Error ? error.message : "Failed to load settings.");
-        }
-      } finally {
-        if (!cancelled) {
-          setIsLoading(false);
-        }
-      }
+    if (!settingsResponse.ok || !schemaResponse.ok) {
+      throw new Error("Failed to load settings.");
     }
 
-    void load();
+    const [settingsPayload, schemaPayload] = await Promise.all([
+      settingsResponse.json(),
+      schemaResponse.json(),
+    ]);
 
-    return () => {
-      cancelled = true;
+    return {
+      schemaPayload,
+      settingsPayload,
     };
-  }, []);
+  });
+
+  useEffect(() => {
+    if (!loadedSettings) {
+      return;
+    }
+
+    setSchema(loadedSettings.schemaPayload);
+    setFormSettings(cloneSettings(loadedSettings.settingsPayload));
+    setInitialSettings(cloneSettings(loadedSettings.settingsPayload));
+    setErrorMessage("");
+  }, [loadedSettings]);
 
   const hasChanges = useMemo(() => {
     if (!formSettings || !initialSettings) {
@@ -193,7 +183,14 @@ export default function SettingsForm() {
   if (!formSettings || !schema) {
     return (
       <div className="rounded-[2rem] border border-rose-200 bg-rose-50 p-8 text-sm text-rose-700">
-        {errorMessage || "Settings are unavailable right now."}
+        <p>{loadError || errorMessage || "Settings are unavailable right now."}</p>
+        <button
+          className="mt-4 rounded-full bg-rose-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-rose-500"
+          onClick={retryLoad}
+          type="button"
+        >
+          Retry Load
+        </button>
       </div>
     );
   }

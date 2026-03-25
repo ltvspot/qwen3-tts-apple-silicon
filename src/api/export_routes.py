@@ -11,6 +11,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session, sessionmaker
 
+from src.api.cache import invalidate_library_cache
 from src.database import Book, BookExportStatus, ExportJob, get_db, utc_now
 from src.pipeline.exporter import (
     ExportFormatResult,
@@ -204,6 +205,7 @@ async def export_book_endpoint(
     db.refresh(export_job)
 
     _launch_export_job(export_job.id, session_factory=session_factory)
+    invalidate_library_cache()
 
     return ExportQueuedResponse(
         book_id=book_id,
