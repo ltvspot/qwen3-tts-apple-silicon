@@ -35,6 +35,16 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def ensure_aware(dt: datetime | None) -> datetime | None:
+    """Return a UTC-aware datetime, assuming naive database values are stored in UTC."""
+
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 class Base(DeclarativeBase):
     """Base class for all ORM models."""
 

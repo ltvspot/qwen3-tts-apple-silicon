@@ -310,9 +310,16 @@ export default function BookDetail() {
         return chaptersPayload[0]?.id ?? null;
       });
 
-      await fetchGenerationStatus(requestId);
-      await fetchExportStatus(requestId);
-      await fetchVoiceOptions(requestId);
+      await Promise.all([
+        fetchGenerationStatus(requestId),
+        fetchExportStatus(requestId),
+      ]);
+      if (requestRef.current !== requestId) {
+        return;
+      }
+
+      setLoading(false);
+      void fetchVoiceOptions(requestId);
     } catch (error) {
       if (requestRef.current !== requestId) {
         return;

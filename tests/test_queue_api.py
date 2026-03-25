@@ -171,6 +171,38 @@ def test_get_queue_returns_ordered_jobs_and_stats(client, test_db: Session) -> N
     assert payload["jobs"][0]["current_chapter_title"] == "Chapter One"
 
 
+def test_queue_list_with_completed_jobs_no_crash(client, test_db: Session) -> None:
+    """Completed jobs with naive SQLite timestamps should not crash queue listing."""
+
+    book = create_book(test_db, title="Naive Timestamp Book")
+    create_chapter(test_db, book_id=book.id, number=1, title="Completed Chapter", status=ChapterStatus.GENERATED)
+
+    test_db.add(
+        GenerationJob(
+            book_id=book.id,
+            job_type=GenerationJobType.FULL_BOOK,
+            status=GenerationJobStatus.COMPLETED,
+            progress=100.0,
+            current_chapter_progress=0.0,
+            chapters_total=1,
+            chapters_completed=1,
+            chapters_failed=0,
+            priority=0,
+            created_at=utc_now().replace(tzinfo=None),
+            completed_at=utc_now().replace(tzinfo=None),
+            force=False,
+        )
+    )
+    test_db.commit()
+
+    response = client.get("/api/queue")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total_count"] == 1
+    assert payload["jobs"][0]["status"] == "completed"
+
+
 def test_get_queue_job_returns_breakdown_and_history(client, test_db: Session) -> None:
     """Detailed job view should include chapter breakdown and history log."""
 

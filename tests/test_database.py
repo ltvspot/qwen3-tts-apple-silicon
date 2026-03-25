@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from sqlalchemy import inspect
 from sqlalchemy.orm import Session
 
@@ -17,6 +19,7 @@ from src.database import (
     GenerationJobStatus,
     JobHistory,
     VoicePreset,
+    ensure_aware,
 )
 
 
@@ -108,3 +111,25 @@ def test_database_schema_and_basic_crud(test_db: Session) -> None:
     assert stored_generation_job.book_id == stored_book.id
     assert stored_generation_job.chapter_id == stored_chapter.id
     assert stored_history_entry.job_id == stored_generation_job.id
+
+
+def test_ensure_aware_naive_datetime() -> None:
+    """Naive database timestamps should be normalized to UTC-aware datetimes."""
+
+    naive = datetime(2026, 3, 25, 12, 0, 0)
+
+    normalized = ensure_aware(naive)
+
+    assert normalized is not None
+    assert normalized.tzinfo == timezone.utc
+    assert normalized.hour == 12
+
+
+def test_ensure_aware_already_aware() -> None:
+    """Already-aware datetimes should be returned unchanged."""
+
+    aware = datetime(2026, 3, 25, 12, 0, 0, tzinfo=timezone.utc)
+
+    normalized = ensure_aware(aware)
+
+    assert normalized is aware

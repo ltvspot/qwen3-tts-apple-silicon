@@ -20,6 +20,7 @@ from src.database import (
     GenerationJobStatus,
     GenerationJobType,
     JobHistory,
+    ensure_aware,
     get_db,
     utc_now,
 )
@@ -269,7 +270,9 @@ def _include_recent_job(job: GenerationJob) -> bool:
     if job.status not in TERMINAL_STATUSES:
         return True
     recent_cutoff = utc_now() - timedelta(days=7)
-    completed_at = job.completed_at or job.created_at
+    completed_at = ensure_aware(job.completed_at or job.created_at)
+    if completed_at is None:
+        return False
     return completed_at >= recent_cutoff
 
 

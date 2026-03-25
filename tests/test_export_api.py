@@ -58,7 +58,34 @@ def _create_ready_chapter(test_db: Session, *, book_id: int, number: int = 1) ->
     return chapter
 
 
-def test_post_export_creates_processing_job_and_returns_queue_payload(
+def _create_generated_chapter(
+    test_db: Session,
+    *,
+    book_id: int,
+    number: int,
+    qa_status: QAStatus = QAStatus.APPROVED,
+) -> Chapter:
+    """Create one generated chapter with configurable QA status."""
+
+    chapter = Chapter(
+        book_id=book_id,
+        number=number,
+        title=f"Chapter {number}",
+        type=ChapterType.CHAPTER,
+        text_content="Generated chapter text.",
+        word_count=3,
+        status=ChapterStatus.GENERATED,
+        qa_status=qa_status,
+        audio_path=f"exports/{book_id}/chapter-{number}.wav",
+        duration_seconds=10.0,
+    )
+    test_db.add(chapter)
+    test_db.commit()
+    test_db.refresh(chapter)
+    return chapter
+
+
+def test_export_accepts_fully_generated_book(
     client,
     test_db: Session,
     monkeypatch,
@@ -66,6 +93,7 @@ def test_post_export_creates_processing_job_and_returns_queue_payload(
     """Starting an export should persist one processing job row for the book."""
 
     book = _create_book(test_db)
+    _create_ready_chapter(test_db, book_id=book.id)
     launched_jobs: list[int] = []
 
     monkeypatch.setattr(export_routes, "estimate_export_seconds", lambda *args, **kwargs: 120)
@@ -97,6 +125,56 @@ def test_post_export_creates_processing_job_and_returns_queue_payload(
     assert export_job.export_status == BookExportStatus.PROCESSING
     assert json.loads(export_job.formats_requested) == ["mp3", "m4b"]
     assert book.export_status == BookExportStatus.PROCESSING
+
+
+def test_export_rejects_partial_book(client, test_db: Session) -> None:
+    """Exporting should fail when any chapter is still missing generated audio."""
+
+    book = _create_book(test_db, title="Partial Export Book")
+    _create_generated_chapter(test_db, book_id=book.id, number=1)
+    test_db.add(
+        Chapter(
+            book_id=book.id,
+            number=2,
+            title="Chapter 2",
+            type=ChapterType.CHAPTER,
+            text_content="Still pending.",
+            word_count=2,
+            status=ChapterStatus.PENDING,
+            qa_status=QAStatus.NOT_REVIEWED,
+        )
+    )
+    test_db.commit()
+
+    response = client.post(
+        f"/api/book/{book.id}/export",
+        json={
+            "formats": ["mp3"],
+            "include_only_approved": False,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Only 1/2 chapters generated. Generate all chapters before exporting."
+
+
+def test_export_rejects_unapproved_book(client, test_db: Session) -> None:
+    """Exporting with approval required should fail until every chapter is approved."""
+
+    book = _create_book(test_db, title="Unapproved Export Book")
+    _create_generated_chapter(test_db, book_id=book.id, number=1, qa_status=QAStatus.APPROVED)
+    _create_generated_chapter(test_db, book_id=book.id, number=2, qa_status=QAStatus.NOT_REVIEWED)
+
+    response = client.post(
+        f"/api/book/{book.id}/export",
+        json={
+            "formats": ["mp3"],
+            "include_only_approved": True,
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Only 1/2 chapters approved. Approve all chapters before exporting."
 
 
 def test_get_export_status_returns_completed_formats_and_qa_report(client, test_db: Session) -> None:

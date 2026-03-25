@@ -2,15 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 from pydub.audio_segment import AudioSegment
 
-from src.api import voice_lab
+from src.api import generation_runtime, voice_lab
+from src.database import get_db
+from src.engines.model_manager import ModelManager
 from src.config import settings
 from src.engines import AudioStitcher, Qwen3TTS, TextChunker
+from src.main import app
 
 
 @pytest.fixture(autouse=True)
@@ -174,3 +181,89 @@ def test_voice_list_api(client: TestClient) -> None:
     payload = response.json()
     assert payload["engine"] == "qwen3_tts"
     assert {voice["name"] for voice in payload["voices"]} >= {"Ethan", "Nova", "Aria", "Leo"}
+
+
+def test_voice_list_returns_loading_when_engine_not_ready(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Voice listing should degrade quickly while the shared engine is still cold-loading."""
+
+    async def slow_get_engine():
+        await asyncio.sleep(2.5)
+        return SimpleNamespace(name="qwen3_tts", list_voices=lambda: [])
+
+    monkeypatch.setattr(voice_lab, "get_engine", slow_get_engine)
+
+    started = time.perf_counter()
+    response = client.get("/api/voice-lab/voices")
+    elapsed = time.perf_counter() - started
+
+    assert response.status_code == 200
+    assert elapsed < 2.4
+    assert response.json() == {
+        "engine": "qwen3_tts",
+        "voices": [],
+        "loading": True,
+        "message": "TTS engine is loading. Voices will be available shortly.",
+    }
+
+
+@pytest.mark.asyncio
+async def test_health_check_not_blocked_by_engine_load(
+    test_db,
+) -> None:
+    """Health checks should remain responsive while the engine is loading in the background."""
+
+    class SlowLoadEngine:
+        def __init__(self) -> None:
+            self.loaded = False
+            self.name = "qwen3_tts"
+
+        def load(self) -> None:
+            time.sleep(0.4)
+            self.loaded = True
+
+        def unload(self) -> None:
+            self.loaded = False
+
+        def list_voices(self):
+            return [
+                SimpleNamespace(
+                    name="Ethan",
+                    display_name="Ethan",
+                    description=None,
+                    language="en-US",
+                    is_cloned=False,
+                )
+            ]
+
+    def override_get_db():
+        yield test_db
+
+    generation_runtime.release_model_manager()
+    generation_runtime._model_manager = ModelManager(  # type: ignore[attr-defined]
+        lambda: SlowLoadEngine(),
+        cooldown_chapter_threshold=99,
+        cooldown_chunk_threshold=999,
+        cooldown_time_threshold_seconds=9999,
+        memory_pressure_threshold_mb=999999,
+    )
+    app.dependency_overrides[get_db] = override_get_db
+
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://testserver",
+        ) as async_client:
+            started = time.perf_counter()
+            voices_task = asyncio.create_task(async_client.get("/api/voice-lab/voices"))
+            await asyncio.sleep(0.01)
+            health_response = await async_client.get("/api/health")
+            elapsed = time.perf_counter() - started
+            voices_response = await voices_task
+    finally:
+        app.dependency_overrides.clear()
+        generation_runtime.release_model_manager()
+
+    assert health_response.status_code == 200
+    assert elapsed < 0.25
+    assert voices_response.status_code == 200
+    assert voices_response.json()["voices"][0]["name"] == "Ethan"

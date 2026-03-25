@@ -950,7 +950,21 @@ class GenerationQueue:
             db_job.progress = 100.0
             db_job.eta_seconds = 0
             if book is not None:
-                book.status = BookStatus.GENERATED
+                total_chapters = (
+                    db_session.query(Chapter)
+                    .filter(Chapter.book_id == book.id)
+                    .count()
+                )
+                generated_chapters = (
+                    db_session.query(Chapter)
+                    .filter(
+                        Chapter.book_id == book.id,
+                        Chapter.status == ChapterStatus.GENERATED,
+                    )
+                    .count()
+                )
+                if total_chapters > 0 and generated_chapters >= total_chapters:
+                    book.status = BookStatus.GENERATED
                 book.generation_status = BookGenerationStatus.IDLE
                 book.generation_eta_seconds = 0
 

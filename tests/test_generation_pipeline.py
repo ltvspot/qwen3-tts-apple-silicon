@@ -198,6 +198,29 @@ class ConsecutiveFailureGenerator:
         raise RuntimeError(chapter.error_message)
 
 
+class SingleChapterFailureGenerator:
+    """Queue generator stub that fails a targeted single-chapter job."""
+
+    async def generate_chapter(
+        self,
+        book_id,
+        chapter,
+        db_session,
+        progress_callback=None,
+        should_cancel=None,
+        force=False,
+        voice_name=None,
+        emotion=None,
+        speed=None,
+    ):
+        del book_id, progress_callback, should_cancel, force, voice_name, emotion, speed
+        chapter.status = ChapterStatus.FAILED
+        chapter.completed_at = utc_now()
+        chapter.error_message = f"Chapter {chapter.number} failed"
+        db_session.commit()
+        raise RuntimeError(chapter.error_message)
+
+
 @pytest.fixture(autouse=True)
 def generation_settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Route generated audio into a test-only output directory and use synthetic TTS."""
@@ -414,6 +437,135 @@ async def test_generation_queue_processes_fifo_and_cancels_queued_jobs(test_db: 
     assert second_status is not None
     assert first_status.status == JobStatus.COMPLETED
     assert second_status.status == JobStatus.CANCELLED
+
+    await queue.stop()
+
+
+@pytest.mark.asyncio
+async def test_single_chapter_generation_does_not_promote_book(test_db: Session) -> None:
+    """Completing one chapter should not mark the full book as generated."""
+
+    queue = GenerationQueue(max_workers=1)
+    session_factory = sessionmaker(
+        bind=test_db.get_bind(),
+        autoflush=False,
+        autocommit=False,
+        expire_on_commit=False,
+    )
+
+    book = create_book(test_db, title="Partial Queue Book")
+    for chapter_number in range(1, 6):
+        create_chapter(
+            test_db,
+            book_id=book.id,
+            number=chapter_number,
+            title=f"Chapter {chapter_number}",
+            chapter_type=ChapterType.CHAPTER,
+            text="A queue test chapter.",
+        )
+
+    await queue.start(session_factory, SlowGenerator())
+
+    job_id = await queue.enqueue_chapter(book.id, 1, test_db)
+    await queue.wait_until_idle()
+
+    test_db.expire_all()
+    job_status = await queue.get_job_status(job_id, test_db)
+    persisted_book = test_db.query(Book).filter(Book.id == book.id).one()
+    chapters = test_db.query(Chapter).filter(Chapter.book_id == book.id).order_by(Chapter.number).all()
+
+    assert job_status is not None
+    assert job_status.status == JobStatus.COMPLETED
+    assert persisted_book.status == BookStatus.PARSED
+    assert persisted_book.generation_status == "idle"
+    assert [chapter.status for chapter in chapters] == [
+        ChapterStatus.GENERATED,
+        ChapterStatus.PENDING,
+        ChapterStatus.PENDING,
+        ChapterStatus.PENDING,
+        ChapterStatus.PENDING,
+    ]
+
+    await queue.stop()
+
+
+@pytest.mark.asyncio
+async def test_all_chapters_generated_promotes_book(test_db: Session) -> None:
+    """Completing every chapter through the queue should mark the book generated."""
+
+    queue = GenerationQueue(max_workers=1)
+    session_factory = sessionmaker(
+        bind=test_db.get_bind(),
+        autoflush=False,
+        autocommit=False,
+        expire_on_commit=False,
+    )
+
+    book = create_book(test_db, title="Complete Queue Book")
+    for chapter_number in range(1, 4):
+        create_chapter(
+            test_db,
+            book_id=book.id,
+            number=chapter_number,
+            title=f"Chapter {chapter_number}",
+            chapter_type=ChapterType.CHAPTER,
+            text="A queue completion chapter.",
+        )
+
+    await queue.start(session_factory, SlowGenerator())
+
+    job_id = await queue.enqueue_book(book.id, test_db)
+    await queue.wait_until_idle()
+
+    test_db.expire_all()
+    job_status = await queue.get_job_status(job_id, test_db)
+    persisted_book = test_db.query(Book).filter(Book.id == book.id).one()
+    chapters = test_db.query(Chapter).filter(Chapter.book_id == book.id).all()
+
+    assert job_status is not None
+    assert job_status.status == JobStatus.COMPLETED
+    assert persisted_book.status == BookStatus.GENERATED
+    assert all(chapter.status == ChapterStatus.GENERATED for chapter in chapters)
+
+    await queue.stop()
+
+
+@pytest.mark.asyncio
+async def test_failed_generation_does_not_promote_book(test_db: Session) -> None:
+    """A failed single-chapter job should never promote the parent book to generated."""
+
+    queue = GenerationQueue(max_workers=1)
+    session_factory = sessionmaker(
+        bind=test_db.get_bind(),
+        autoflush=False,
+        autocommit=False,
+        expire_on_commit=False,
+    )
+
+    book = create_book(test_db, title="Failed Queue Book")
+    for chapter_number in range(1, 3):
+        create_chapter(
+            test_db,
+            book_id=book.id,
+            number=chapter_number,
+            title=f"Chapter {chapter_number}",
+            chapter_type=ChapterType.CHAPTER,
+            text="A failing queue chapter.",
+        )
+
+    await queue.start(session_factory, SingleChapterFailureGenerator())
+
+    job_id = await queue.enqueue_chapter(book.id, 1, test_db)
+    await queue.wait_until_idle()
+
+    test_db.expire_all()
+    job_status = await queue.get_job_status(job_id, test_db)
+    persisted_book = test_db.query(Book).filter(Book.id == book.id).one()
+
+    assert job_status is not None
+    assert job_status.status == JobStatus.FAILED
+    assert persisted_book.status == BookStatus.PARSED
+    assert persisted_book.generation_status == "error"
 
     await queue.stop()
 

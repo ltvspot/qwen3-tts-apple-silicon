@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import tempfile
 import uuid
@@ -38,8 +39,10 @@ class VoiceSummary(BaseModel):
 class VoiceListResponse(BaseModel):
     """Response payload for listing engine voices."""
 
-    engine: str
-    voices: list[VoiceSummary]
+    engine: str = "qwen3_tts"
+    voices: list[VoiceSummary] = Field(default_factory=list)
+    loading: bool = False
+    message: str | None = None
 
 
 class VoiceTestRequest(BaseModel):
@@ -199,7 +202,17 @@ async def get_voices(db: Session = Depends(get_db)) -> VoiceListResponse:
     """Return the currently available voices for the configured engine."""
 
     try:
-        engine = await get_engine()
+        engine = await asyncio.wait_for(asyncio.shield(get_engine()), timeout=2.0)
+    except asyncio.TimeoutError:
+        return VoiceListResponse(
+            loading=True,
+            message="TTS engine is loading. Voices will be available shortly.",
+        )
+    except Exception as exc:
+        logger.exception("Failed to list voices")
+        raise HTTPException(status_code=500, detail="Failed to list voices.") from exc
+
+    try:
         cloned_lookup = {
             record.voice_name: record
             for record in _cloned_voice_records(db)

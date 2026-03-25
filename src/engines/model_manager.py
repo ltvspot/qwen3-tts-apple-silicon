@@ -120,7 +120,7 @@ class ModelManager:
         logger.info("Loading shared TTS engine")
         engine = self._engine_factory()
         if not getattr(engine, "loaded", False):
-            engine.load()
+            await asyncio.to_thread(engine.load)
         self._engine = engine
         self._stats = ModelStats(
             last_reload_time=time.time(),

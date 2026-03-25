@@ -235,6 +235,35 @@ describe("BookDetail page", () => {
     expect(mockNavigate).toHaveBeenCalledWith("/");
   });
 
+  test("renders book data while voice options continue loading in the background", async () => {
+    const book = createBook({});
+    const chapters = [createChapter({})];
+    let resolveVoices;
+    const pendingVoices = new Promise((resolve) => {
+      resolveVoices = resolve;
+    });
+
+    fetchMock
+      .mockResolvedValueOnce(createJsonResponse(book))
+      .mockResolvedValueOnce(createJsonResponse(chapters))
+      .mockResolvedValueOnce(createJsonResponse(createStatusSnapshot()))
+      .mockResolvedValueOnce(createJsonResponse(createExportSnapshot()))
+      .mockImplementationOnce(() => pendingVoices);
+
+    await renderBookDetail();
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("The Test Chronicle");
+      expect(container.textContent).toContain("Opening credits text.");
+      expect(container.textContent).toContain("Loading voices...");
+      expect(container.textContent).not.toContain("Loading book details...");
+    });
+
+    await act(async () => {
+      resolveVoices(createJsonResponse(createVoiceListPayload()));
+    });
+  });
+
   test("edits and saves chapter text through the chapter update API", async () => {
     const book = createBook({});
     const chapters = [

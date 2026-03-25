@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from src.database import (
     Book,
+    BookStatus,
     Chapter,
     ChapterQARecord,
     QAAutomaticStatus,
@@ -130,6 +131,7 @@ class CatalogQASummaryResponse(BaseModel):
     """Catalog-wide QA summary."""
 
     total_books: int
+    unparsed_books: int = Field(serialization_alias="unparsedBooks")
     books_all_approved: int
     books_with_flags: int
     books_pending_qa: int
@@ -473,6 +475,11 @@ async def get_catalog_qa_summary(db: Session = Depends(get_db)) -> CatalogQASumm
 
     books = db.query(Book).all()
     chapters = db.query(Chapter).all()
+    qa_ready_statuses = {
+        BookStatus.PARSED,
+        BookStatus.GENERATED,
+        BookStatus.EXPORTED,
+    }
 
     chapters_by_book: dict[int, list[Chapter]] = {}
     for chapter in chapters:
@@ -481,8 +488,11 @@ async def get_catalog_qa_summary(db: Session = Depends(get_db)) -> CatalogQASumm
     books_all_approved = 0
     books_with_flags = 0
     books_pending_qa = 0
+    unparsed_count = sum(book.status not in qa_ready_statuses for book in books)
 
     for book in books:
+        if book.status not in qa_ready_statuses:
+            continue
         book_chapters = chapters_by_book.get(book.id, [])
         if not book_chapters:
             books_pending_qa += 1
@@ -501,6 +511,7 @@ async def get_catalog_qa_summary(db: Session = Depends(get_db)) -> CatalogQASumm
 
     return CatalogQASummaryResponse(
         total_books=len(books),
+        unparsed_books=unparsed_count,
         books_all_approved=books_all_approved,
         books_with_flags=books_with_flags,
         books_pending_qa=books_pending_qa,

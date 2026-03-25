@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session, selectinload, sessionmaker
 
 from src.api.cache import invalidate_library_cache
-from src.database import Book, BookExportStatus, ChapterStatus, ExportJob, QAStatus, get_db, utc_now
+from src.database import Book, BookExportStatus, Chapter, ChapterStatus, ExportJob, QAStatus, get_db, utc_now
 from src.pipeline.exporter import (
     ExportFormatResult,
     QAReport,
@@ -178,6 +178,51 @@ def _load_book_or_404(book_id: int, db: Session) -> Book:
     return book
 
 
+def _validate_export_chapters(
+    chapters: list[Chapter],
+    *,
+    include_only_approved: bool,
+) -> tuple[bool, str]:
+    """Return whether the chapter set is export-ready and why when it is not."""
+
+    if not chapters:
+        return False, "Book has no chapters. Parse it first."
+
+    total = len(chapters)
+    generated = sum(chapter.status == ChapterStatus.GENERATED for chapter in chapters)
+    if generated < total:
+        return (
+            False,
+            f"Only {generated}/{total} chapters generated. Generate all chapters before exporting.",
+        )
+
+    if include_only_approved:
+        approved = sum(chapter.qa_status == QAStatus.APPROVED for chapter in chapters)
+        if approved < total:
+            return (
+                False,
+                f"Only {approved}/{total} chapters approved. Approve all chapters before exporting.",
+            )
+
+    return True, ""
+
+
+def _validate_book_export_readiness(
+    book_id: int,
+    db: Session,
+    *,
+    include_only_approved: bool = False,
+) -> tuple[bool, str]:
+    """Return whether a persisted book is ready for export and why when it is not."""
+
+    book = db.query(Book).filter(Book.id == book_id).first()
+    if book is None:
+        return False, "Book not found"
+
+    chapters = db.query(Chapter).filter(Chapter.book_id == book_id).all()
+    return _validate_export_chapters(chapters, include_only_approved=include_only_approved)
+
+
 def _queue_export_for_book(
     book: Book,
     request: ExportRequest | BatchExportRequest,
@@ -263,16 +308,8 @@ def _launch_export_job(
 def _book_is_ready_for_batch_export(book: Book, *, include_only_approved: bool) -> bool:
     """Return whether the book is ready for batch export."""
 
-    if not book.chapters:
-        return False
-
-    if any(chapter.status != ChapterStatus.GENERATED for chapter in book.chapters):
-        return False
-
-    if include_only_approved and any(chapter.qa_status != QAStatus.APPROVED for chapter in book.chapters):
-        return False
-
-    return True
+    ready, _ = _validate_export_chapters(list(book.chapters), include_only_approved=include_only_approved)
+    return ready
 
 
 def _mark_batch_export_book(
@@ -405,6 +442,13 @@ async def export_book_endpoint(
     """Trigger an asynchronous export job for the requested book."""
 
     book = _load_book_or_404(book_id, db)
+    ready, reason = _validate_book_export_readiness(
+        book_id,
+        db,
+        include_only_approved=request.include_only_approved,
+    )
+    if not ready:
+        raise HTTPException(status_code=400, detail=reason)
     session_factory = _session_factory_for(db)
     export_job, formats, expected_completion_seconds, started_at = _queue_export_for_book(
         book,

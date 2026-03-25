@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 
 from src.database import (
     Book,
+    BookStatus,
     Chapter,
     ChapterQARecord,
     ChapterStatus,
@@ -15,11 +16,12 @@ from src.database import (
 )
 
 
-def _create_book(test_db: Session, *, title: str) -> Book:
+def _create_book(test_db: Session, *, title: str, status: BookStatus = BookStatus.PARSED) -> Book:
     book = Book(
         title=title,
         author="QA Author",
         folder_path=title.lower().replace(" ", "-"),
+        status=status,
     )
     test_db.add(book)
     test_db.commit()
@@ -76,7 +78,41 @@ def test_batch_approve_book_and_catalog_summary(client, test_db: Session) -> Non
     assert summary_response.status_code == 200
     payload = summary_response.json()
     assert payload["total_books"] == 2
+    assert payload["unparsedBooks"] == 0
     assert payload["books_all_approved"] == 1
     assert payload["books_with_flags"] == 1
     assert payload["chapters_approved"] == 1
     assert payload["chapters_flagged"] == 1
+
+
+def test_qa_metrics_excludes_unparsed_books(client, test_db: Session) -> None:
+    """Unparsed books should be tracked separately instead of inflating pending QA counts."""
+
+    for index in range(3):
+        _create_book(test_db, title=f"Unparsed Book {index}", status=BookStatus.NOT_STARTED)
+
+    for index in range(2):
+        parsed_book = _create_book(test_db, title=f"Parsed Book {index}", status=BookStatus.PARSED)
+        _create_chapter(test_db, book_id=parsed_book.id, number=1, qa_status=QAStatus.NOT_REVIEWED)
+
+    response = client.get("/api/qa/catalog-summary")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total_books"] == 5
+    assert payload["unparsedBooks"] == 3
+    assert payload["books_pending_qa"] == 2
+
+
+def test_qa_metrics_includes_parsed_books(client, test_db: Session) -> None:
+    """Parsed books with chapters should still appear in the pending QA counts."""
+
+    parsed_book = _create_book(test_db, title="Pending QA Book", status=BookStatus.PARSED)
+    _create_chapter(test_db, book_id=parsed_book.id, number=1, qa_status=QAStatus.NOT_REVIEWED)
+
+    response = client.get("/api/qa/catalog-summary")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["unparsedBooks"] == 0
+    assert payload["books_pending_qa"] == 1
