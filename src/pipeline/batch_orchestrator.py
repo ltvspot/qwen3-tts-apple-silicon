@@ -211,6 +211,7 @@ class BatchOrchestrator:
 
         batch_started_at = datetime.now(timezone.utc)
         completed_durations: list[float] = []
+        retried_books: set[int] = set()
         try:
             self._progress.status = BatchStatus.RUNNING
             self._persist_run()
@@ -228,11 +229,20 @@ class BatchOrchestrator:
                     return
 
                 result = await self._process_book(book_id, skip_exported)
+                if (
+                    result.status == "failed"
+                    and book_id not in retried_books
+                    and self._is_retryable_failure(result.error_message)
+                ):
+                    retried_books.add(book_id)
+                    logger.warning("Auto-retrying transient batch failure for book %s", book_id)
+                    result = await self._process_book(book_id, skip_exported)
                 self._record_result(result)
 
                 if result.status == "completed":
                     completed_durations.append(result.duration_seconds)
                 self._update_eta(index, len(book_ids), batch_started_at, completed_durations)
+                await self._run_book_boundary_canary()
 
             if self._progress.status == BatchStatus.RUNNING:
                 self._progress.status = BatchStatus.COMPLETED
@@ -412,13 +422,41 @@ class BatchOrchestrator:
         self._progress.model_reloads = self.model_manager.stats.reload_count
 
         if completed_durations:
-            average = sum(completed_durations) / len(completed_durations)
+            rolling = completed_durations[-5:]
+            average = sum(rolling) / len(rolling)
             self._progress.avg_seconds_per_book = average
             remaining = max(total_books - (completed_index + 1), 0)
             eta = datetime.now(timezone.utc) + timedelta(seconds=remaining * average)
             self._progress.estimated_completion = eta.isoformat()
 
         self._persist_run()
+
+    async def _run_book_boundary_canary(self) -> None:
+        """Run the model canary between books and pause the batch if it degrades."""
+
+        run_canary = getattr(self.model_manager, "run_canary", None)
+        if not callable(run_canary):
+            return
+
+        status = await run_canary()
+        if status in {"ok", "baseline"}:
+            return
+
+        if self._progress is not None:
+            self._progress.resource_warnings = [
+                *self._progress.resource_warnings,
+                f"Model canary returned '{status}' after a book boundary.",
+            ]
+        await self.pause("Model canary degraded after the previous book. Inspect the engine before resuming.")
+
+    @staticmethod
+    def _is_retryable_failure(error_message: str | None) -> bool:
+        """Return whether a book failure looks transient enough to retry once."""
+
+        if not error_message:
+            return False
+        normalized = error_message.lower()
+        return any(token in normalized for token in ("timeout", "memory", "tempor", "busy", "locked"))
 
     def _record_result(self, result: BatchBookResult) -> None:
         """Fold one terminal book result into the aggregated batch progress."""
@@ -589,6 +627,10 @@ class BatchOrchestrator:
             - progress.books_in_progress,
             0,
         )
+        avg_chapter_time = self._avg_chapter_time_seconds()
+        eta_seconds = self._estimated_time_remaining_seconds(books_remaining)
+        current_chapter = self._current_chapter_label()
+        memory_usage_mb = self._memory_usage_mb()
         return {
             "batch_id": progress.batch_id,
             "status": progress.status.value,
@@ -621,7 +663,67 @@ class BatchOrchestrator:
                 1,
             ),
             "book_results": [asdict(result) for result in progress.book_results],
+            "estimatedTimeRemainingSeconds": eta_seconds,
+            "avgChapterTimeSeconds": avg_chapter_time,
+            "avgBookTimeSeconds": round(progress.avg_seconds_per_book, 1),
+            "booksCompleted": progress.books_completed,
+            "booksTotal": progress.total_books,
+            "currentBook": progress.current_book_title,
+            "currentChapter": current_chapter,
+            "memoryUsageMB": memory_usage_mb,
         }
+
+    def _avg_chapter_time_seconds(self) -> float | None:
+        """Return the rolling average per-chapter generation time from recent completed books."""
+
+        if self._progress is None:
+            return None
+        recent = [result for result in self._progress.book_results if result.status == "completed"][-5:]
+        chapter_timings = [
+            result.duration_seconds / result.chapters_total
+            for result in recent
+            if result.chapters_total > 0 and result.duration_seconds > 0
+        ]
+        if not chapter_timings:
+            return None
+        return round(sum(chapter_timings) / len(chapter_timings), 1)
+
+    def _estimated_time_remaining_seconds(self, books_remaining: int) -> int | None:
+        """Return the rolling ETA in seconds for the remaining books."""
+
+        if self._progress is None or self._progress.avg_seconds_per_book <= 0:
+            return None
+        return int(round(books_remaining * self._progress.avg_seconds_per_book))
+
+    def _current_chapter_label(self) -> str | None:
+        """Return the current chapter label for the active book when known."""
+
+        if self._progress is None or self._progress.current_book_id is None:
+            return None
+
+        with self.db_session_factory() as db_session:
+            job = (
+                db_session.query(GenerationJob)
+                .filter(
+                    GenerationJob.book_id == self._progress.current_book_id,
+                    GenerationJob.status == GenerationJobStatus.RUNNING,
+                )
+                .order_by(GenerationJob.id.desc())
+                .first()
+            )
+            if job is None or job.current_chapter_n is None:
+                return None
+            return f"Chapter {job.current_chapter_n}"
+
+    def _memory_usage_mb(self) -> float | None:
+        """Return the current process memory usage when available."""
+
+        try:
+            import psutil
+
+            return round(psutil.Process().memory_info().rss / (1024 * 1024), 1)
+        except Exception:
+            return None
 
     @staticmethod
     def _parse_iso_or_none(value: str | None) -> datetime | None:

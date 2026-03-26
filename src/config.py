@@ -228,6 +228,24 @@ class OutputSettings(BaseModel):
         default=True,
         description="Whether MP3 exports should embed placeholder album art.",
     )
+    sentence_pause_ms: int = Field(
+        default=400,
+        ge=0,
+        le=5000,
+        description="Intentional pause inserted between sentence-safe chunk boundaries.",
+    )
+    paragraph_pause_ms: int = Field(
+        default=800,
+        ge=0,
+        le=5000,
+        description="Intentional pause inserted between paragraph boundaries.",
+    )
+    chapter_gap_ms: int = Field(
+        default=1500,
+        ge=0,
+        le=10000,
+        description="Target silence gap between fully mastered chapters.",
+    )
 
 
 class ApplicationSettings(BaseModel):
@@ -486,6 +504,9 @@ class SettingsFacade:
         "EXPORT_OPENING_SILENCE_SECONDS": lambda payload: payload.output_preferences.silence_duration_opening,
         "EXPORT_CLOSING_SILENCE_SECONDS": lambda payload: payload.output_preferences.silence_duration_closing,
         "EXPORT_INCLUDE_ALBUM_ART": lambda payload: payload.output_preferences.include_album_art,
+        "SENTENCE_PAUSE_MS": lambda payload: payload.output_preferences.sentence_pause_ms,
+        "PARAGRAPH_PAUSE_MS": lambda payload: payload.output_preferences.paragraph_pause_ms,
+        "CHAPTER_GAP_MS": lambda payload: payload.output_preferences.chapter_gap_ms,
         "TTS_MODEL_PATH": lambda payload: payload.engine_config.model_path,
     }
 

@@ -94,6 +94,14 @@ class BatchProgressPayload(BaseModel):
     summary: str = ""
     percent_complete: float
     book_results: list[BatchBookResultPayload]
+    estimatedTimeRemainingSeconds: int | None = None
+    avgChapterTimeSeconds: float | None = None
+    avgBookTimeSeconds: float | None = None
+    booksCompleted: int | None = None
+    booksTotal: int | None = None
+    currentBook: str | None = None
+    currentChapter: str | None = None
+    memoryUsageMB: float | None = None
 
 
 def _default_batch_book_ids(db: Session) -> list[int]:

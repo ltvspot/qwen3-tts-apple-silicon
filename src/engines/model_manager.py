@@ -281,6 +281,13 @@ class ModelManager:
                 return
             await self._reload_engine_locked()
 
+    async def run_canary(self) -> str:
+        """Run the quality canary on demand and return the resulting status."""
+
+        async with self._lock:
+            await self._run_quality_canary()
+            return self._stats.last_canary_status
+
     async def shutdown(self) -> None:
         """Unload the managed engine and clear its state."""
 

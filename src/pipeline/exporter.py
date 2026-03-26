@@ -7,6 +7,7 @@ import json
 import logging
 import re
 import shutil
+import subprocess
 import wave
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -35,7 +36,7 @@ from src.database import (
     utc_now,
 )
 from src.pipeline.book_mastering import BookMasteringPipeline
-from src.pipeline.book_qa import measure_integrated_lufs
+from src.pipeline.book_qa import ACX_REQUIREMENTS, measure_integrated_lufs
 from src.pipeline.qa_checker import check_lufs_compliance
 from src.utils.subprocess_utils import run_ffmpeg
 
@@ -55,6 +56,8 @@ class ExportFormatResult(BaseModel):
     download_url: str | None = None
     completed_at: datetime | None = None
     error_message: str | None = None
+    verification: dict[str, Any] | None = None
+    attempts: int = 0
 
 
 class QAChapterSummary(BaseModel):
@@ -722,6 +725,99 @@ def export_m4b(
     run_ffmpeg(command)
 
 
+def _probe_media(path: Path) -> dict[str, Any]:
+    """Return ffprobe metadata when available, falling back to pydub decode checks."""
+
+    ffprobe_path = shutil.which("ffprobe")
+    if ffprobe_path is None:
+        audio = AudioSegment.from_file(path)
+        return {
+            "format": {"duration": len(audio) / 1000.0},
+            "streams": [{"codec_type": "audio"}],
+            "chapters": [],
+        }
+
+    completed = subprocess.run(
+        [
+            ffprobe_path,
+            "-v",
+            "error",
+            "-print_format",
+            "json",
+            "-show_format",
+            "-show_streams",
+            "-show_chapters",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(completed.stdout or "{}")
+
+
+def _verify_export_output(
+    output_path: Path,
+    *,
+    expected_duration_seconds: float,
+    export_format: str,
+    expected_markers: list[ChapterMarker] | None = None,
+) -> dict[str, Any]:
+    """Validate that an exported asset is decodable and matches expected structure."""
+
+    issues: list[str] = []
+    if not output_path.exists():
+        issues.append("export file is missing")
+        return {
+            "ok": False,
+            "issues": issues,
+        }
+
+    file_size_bytes = output_path.stat().st_size
+    if file_size_bytes <= 0:
+        issues.append("file size is 0 bytes")
+    if file_size_bytes > int(ACX_REQUIREMENTS["max_file_size_mb"] * 1024 * 1024):
+        issues.append("file exceeds the ACX upload size limit")
+
+    try:
+        probe = _probe_media(output_path)
+    except Exception as exc:
+        issues.append(f"ffprobe/decode failed: {exc}")
+        return {
+            "ok": False,
+            "fileSizeBytes": file_size_bytes,
+            "issues": issues,
+        }
+
+    actual_duration = float(probe.get("format", {}).get("duration", 0.0) or 0.0)
+    if abs(actual_duration - expected_duration_seconds) > 1.0:
+        issues.append(
+            f"duration mismatch: expected {expected_duration_seconds:.2f}s, got {actual_duration:.2f}s"
+        )
+
+    marker_titles: list[str] = []
+    if export_format == "m4b":
+        chapters = probe.get("chapters", [])
+        marker_titles = [
+            str((chapter.get("tags") or {}).get("title") or chapter.get("title") or "").strip()
+            for chapter in chapters
+        ]
+        expected_titles = [marker.title for marker in expected_markers or []]
+        if len(marker_titles) != len(expected_titles):
+            issues.append(f"chapter marker count mismatch: expected {len(expected_titles)}, got {len(marker_titles)}")
+        elif marker_titles != expected_titles:
+            issues.append("chapter marker titles do not match the database ordering")
+
+    return {
+        "ok": not issues,
+        "fileSizeBytes": file_size_bytes,
+        "durationSeconds": round(actual_duration, 3),
+        "expectedDurationSeconds": round(expected_duration_seconds, 3),
+        "chapterMarkers": marker_titles,
+        "issues": issues,
+    }
+
+
 def _build_export_paths(book: Book) -> dict[str, Path]:
     """Return all stable export paths for a book."""
 
@@ -978,23 +1074,51 @@ def export_book_sync(
                 )
 
                 try:
-                    if export_format == "mp3":
-                        export_mp3(
-                            export_paths["normalized_wav"],
-                            export_paths["mp3"],
-                            book=book,
-                            cover_art_path=cover_art_path,
+                    output_path = export_paths["mp3"] if export_format == "mp3" else export_paths["m4b"]
+                    verification: dict[str, Any] | None = None
+                    attempts = 0
+                    expected_duration_seconds = (
+                        concatenation.chapter_markers[-1].end_ms / 1000.0
+                        if concatenation.chapter_markers
+                        else sum(chapter.duration_seconds for chapter in concatenation.included_chapters)
+                    )
+
+                    for attempts in range(1, 3):
+                        if export_format == "mp3":
+                            export_mp3(
+                                export_paths["normalized_wav"],
+                                export_paths["mp3"],
+                                book=book,
+                                cover_art_path=cover_art_path,
+                            )
+                        else:
+                            export_m4b(
+                                export_paths["normalized_wav"],
+                                export_paths["m4b"],
+                                book=book,
+                                chapter_markers=concatenation.chapter_markers,
+                                metadata_path=export_paths["metadata"],
+                            )
+
+                        verification = _verify_export_output(
+                            output_path,
+                            expected_duration_seconds=expected_duration_seconds,
+                            export_format=export_format,
+                            expected_markers=concatenation.chapter_markers if export_format == "m4b" else None,
                         )
-                        output_path = export_paths["mp3"]
-                    else:
-                        export_m4b(
-                            export_paths["normalized_wav"],
-                            export_paths["m4b"],
-                            book=book,
-                            chapter_markers=concatenation.chapter_markers,
-                            metadata_path=export_paths["metadata"],
+                        if verification.get("ok"):
+                            break
+                        logger.warning(
+                            "Export verification failed for %s on attempt %s: %s",
+                            output_path,
+                            attempts,
+                            "; ".join(verification.get("issues", [])),
                         )
-                        output_path = export_paths["m4b"]
+                    if verification is None or not verification.get("ok"):
+                        raise RuntimeError(
+                            "Export verification failed: "
+                            + "; ".join((verification or {}).get("issues", ["unknown verification error"]))
+                        )
 
                     format_results[export_format] = ExportFormatResult(
                         status="completed",
@@ -1002,6 +1126,8 @@ def export_book_sync(
                         file_name=output_path.name,
                         download_url=f"/api/book/{book.id}/export/download/{export_format}",
                         completed_at=utc_now(),
+                        verification=verification,
+                        attempts=attempts,
                     )
                     _emit_progress(
                         progress_callback,

@@ -170,6 +170,22 @@ def test_pronunciation_watchlist_flags_word(tmp_path: Path, monkeypatch: pytest.
     assert warnings[0]["word"] == "hyperbole"
 
 
+def test_pronunciation_watchlist_injects_custom_phonetics(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Per-book custom entries should become inline pronunciation instructions for the model."""
+
+    watchlist_path = tmp_path / "watchlist.json"
+    monkeypatch.setattr("src.pipeline.pronunciation_watchlist.WATCHLIST_PATH", watchlist_path)
+
+    watchlist = PronunciationWatchlist()
+    injected = watchlist.inject_phonetic_hints(
+        "Zarathustra opened the book.",
+        custom_entries=[{"word": "Zarathustra", "phonetic": "zar-ah-THOO-strah"}],
+    )
+
+    assert "Pronounce 'Zarathustra' as 'zar-ah-THOO-strah'." in injected
+    assert "Zarathustra opened the book." in injected
+
+
 def test_english_lang_code_enforced(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """All MLX generation paths should force lang_code='en'."""
 
@@ -192,9 +208,10 @@ def test_english_lang_code_enforced(monkeypatch: pytest.MonkeyPatch, tmp_path: P
     engine.model = StubModel()
     engine._supported_speakers = {"aiden"}
 
-    regular_audio = engine.generate("Hello world.", voice="Ethan")
+    regular_audio = engine.generate("Hello world.", voice="Ethan", speed=1.2)
     assert len(regular_audio) > 0
     assert engine.model.calls[0]["lang_code"] == "en"
+    assert engine.model.calls[0]["speed"] == 1.2
 
     clone_model = StubModel()
     engine.base_model = clone_model
@@ -234,6 +251,35 @@ def test_pronunciation_watchlist_api(client, tmp_path: Path, monkeypatch: pytest
     delete_response = client.delete("/api/pronunciation-watchlist/Cthulhu")
     assert delete_response.status_code == 200
     assert all(entry["word"] != "Cthulhu" for entry in delete_response.json()["entries"])
+
+
+def test_book_pronunciation_watchlist_api(client, test_db, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Books should accept custom pronunciation entries through the dedicated endpoint."""
+
+    watchlist_path = tmp_path / "watchlist.json"
+    monkeypatch.setattr("src.pipeline.pronunciation_watchlist.WATCHLIST_PATH", watchlist_path)
+
+    from src.database import Book, BookStatus
+
+    book = Book(
+        title="Watchlist Book",
+        author="Test Author",
+        folder_path="watchlist-book",
+        status=BookStatus.PARSED,
+    )
+    test_db.add(book)
+    test_db.commit()
+    test_db.refresh(book)
+
+    response = client.put(
+        f"/api/book/{book.id}/watchlist",
+        json={"words": [{"word": "Zarathustra", "phonetic": "zar-ah-THOO-strah"}]},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["book_id"] == book.id
+    assert payload["entries"] == [{"word": "Zarathustra", "phonetic": "zar-ah-THOO-strah"}]
 
 
 def test_memory_pressure_default_lowered() -> None:

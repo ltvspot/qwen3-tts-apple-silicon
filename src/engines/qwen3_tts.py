@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ from pydub.generators import Sine
 from src.config import get_application_settings, settings
 from src.engines.base import AudioGenerationConfig, TTSEngine, Voice
 from src.engines.voice_cloner import VoiceCloner
+from src.pipeline.pronunciation_watchlist import INSTRUCTION_PREFIX, INSTRUCTION_SUFFIX
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +58,10 @@ SYNTHETIC_VOICE_FREQUENCIES: dict[str, int] = {
     "Aria": 250,
     "Leo": 175,
 }
+INLINE_INSTRUCTION_PATTERN = re.compile(
+    rf"^\s*{re.escape(INSTRUCTION_PREFIX)}(?P<instruction>.*?){re.escape(INSTRUCTION_SUFFIX)}\s*",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def compute_adaptive_timeout(text: str, speed: float = 1.0) -> float:
@@ -194,10 +200,15 @@ class Qwen3TTS(TTSEngine):
         if not 0.5 <= speed <= 2.0:
             raise ValueError("Speed must be between 0.5 and 2.0.")
 
+        spoken_text, inline_instruction = self._extract_inline_instruction(cleaned_text)
+        if not spoken_text:
+            raise ValueError("Text cannot be empty.")
+
         config = AudioGenerationConfig(
-            text=cleaned_text,
+            text=spoken_text,
             voice=voice,
             emotion=emotion,
+            instruction=self._compose_instruction(emotion, inline_instruction),
             speed=speed,
             sample_rate=self.sample_rate,
         )
@@ -452,8 +463,8 @@ class Qwen3TTS(TTSEngine):
                 self.model.generate(
                     text=config.text,
                     voice=speaker,
-                    instruct=self._emotion_instruction(config.emotion),
-                    speed=1.0,
+                    instruct=config.instruction,
+                    speed=config.speed,
                     lang_code=ENGLISH_LANG_CODE,
                     verbose=False,
                 )
@@ -465,7 +476,7 @@ class Qwen3TTS(TTSEngine):
         if not results:
             raise RuntimeError("Qwen3-TTS generation returned no audio.")
 
-        return self._results_to_audio_segment(results, config.speed)
+        return self._results_to_audio_segment(results)
 
     def _generate_cloned_audio(self, config: AudioGenerationConfig, clone_name: str) -> AudioSegment:
         """Generate audio using the Base model and a stored voice reference."""
@@ -480,7 +491,7 @@ class Qwen3TTS(TTSEngine):
             results = list(
                 model.generate(
                     text=config.text,
-                    speed=1.0,
+                    speed=config.speed,
                     lang_code=ENGLISH_LANG_CODE,
                     ref_audio=prepared_ref_path,
                     ref_text=clone_config["transcript"],
@@ -496,7 +507,7 @@ class Qwen3TTS(TTSEngine):
         if not results:
             raise RuntimeError("Qwen3-TTS cloned voice generation returned no audio.")
 
-        return self._trim_phoneme_bleed(self._results_to_audio_segment(results, config.speed))
+        return self._trim_phoneme_bleed(self._results_to_audio_segment(results))
 
     async def generate_chunk_with_timeout(
         self,
@@ -565,16 +576,13 @@ class Qwen3TTS(TTSEngine):
             return audio[80:]
         return audio
 
-    def _results_to_audio_segment(self, results: list[Any], speed: float) -> AudioSegment:
+    def _results_to_audio_segment(self, results: list[Any]) -> AudioSegment:
         """Convert MLX generation results into a single AudioSegment."""
 
         sample_rate = int(getattr(results[0], "sample_rate", self.sample_rate))
         audio_arrays = [np.asarray(result.audio, dtype=np.float32).reshape(-1) for result in results]
         waveform = np.concatenate(audio_arrays, axis=0)
-        audio = self._float_audio_to_segment(waveform, sample_rate)
-        if speed != 1.0:
-            audio = self._apply_speed(audio, speed)
-        return audio
+        return self._float_audio_to_segment(waveform, sample_rate)
 
     def _generate_synthetic_audio(self, config: AudioGenerationConfig, resolved_voice: str) -> AudioSegment:
         """Generate a deterministic tone-backed segment for fast local tests."""
@@ -586,15 +594,13 @@ class Qwen3TTS(TTSEngine):
             int(
                 self.estimate_duration(
                     self._enhance_prompt(config.text, config.emotion),
-                    speed=1.0,
+                    speed=config.speed,
                 )
                 * 1000
             ),
         )
         audio = Sine(frequency).to_audio_segment(duration=duration_ms, volume=-14.0)
         audio = audio.fade_in(12).fade_out(20).set_frame_rate(config.sample_rate).set_channels(1)
-        if config.speed != 1.0:
-            audio = self._apply_speed(audio, config.speed)
         return audio
 
     def _canonical_voice_alias(self, requested_voice: str) -> str | None:
@@ -613,6 +619,23 @@ class Qwen3TTS(TTSEngine):
             return None
         return EMOTION_INSTRUCTIONS.get(emotion.strip().lower(), emotion.strip())
 
+    def _compose_instruction(self, emotion: str | None, inline_instruction: str | None) -> str | None:
+        """Merge style and pronunciation instructions into one model prompt."""
+
+        instructions = [instruction for instruction in (self._emotion_instruction(emotion), inline_instruction) if instruction]
+        if not instructions:
+            return None
+        return " ".join(instructions)
+
+    def _extract_inline_instruction(self, text: str) -> tuple[str, str | None]:
+        """Remove the internal instruction wrapper before speaking the text."""
+
+        match = INLINE_INSTRUCTION_PATTERN.match(text)
+        if match is None:
+            return (text, None)
+        spoken_text = text[match.end():].lstrip()
+        return (spoken_text, match.group("instruction").strip() or None)
+
     def _enhance_prompt(self, text: str, emotion: str | None) -> str:
         """Return a prompt-like representation used by the synthetic backend."""
 
@@ -621,16 +644,11 @@ class Qwen3TTS(TTSEngine):
             return text
         return f"[{instruction}] {text}"
 
-    def _apply_speed(self, audio: AudioSegment, speed: float) -> AudioSegment:
-        """Apply a simple speed adjustment by changing playback rate."""
+    def _apply_speed_preserving_pitch(self, audio: AudioSegment, speed: float) -> AudioSegment:
+        """Fallback helper that preserves pitch when a backend lacks native speed control."""
 
-        if speed == 1.0:
-            return audio
-        new_frame_rate = int(audio.frame_rate * speed)
-        adjusted = audio._spawn(audio.raw_data, overrides={"frame_rate": new_frame_rate})
-        # Resample back to the original frame rate so downstream tools see
-        # a consistent sample rate while the perceived speed has changed.
-        return adjusted.set_frame_rate(audio.frame_rate)
+        del speed
+        return audio
 
     def _normalize_audio(self, audio: AudioSegment) -> AudioSegment:
         """Normalize audio toward a consistent output level with peak limiting."""

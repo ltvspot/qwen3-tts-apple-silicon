@@ -207,9 +207,10 @@ def _pronunciation_hits(book: Book, chapters: list[Chapter]) -> list[Pronunciati
     """Return watchlist matches across a book."""
 
     watchlist = PronunciationWatchlist()
+    custom_entries = watchlist.custom_entries_from_payload(book.pronunciation_watchlist)
     hits: list[PronunciationIssueResponse] = []
     for chapter in chapters:
-        for hit in watchlist.check_text(chapter.text_content or ""):
+        for hit in watchlist.check_text(chapter.text_content or "", custom_entries=custom_entries):
             hits.append(
                 PronunciationIssueResponse(
                     chapter_n=chapter.number,

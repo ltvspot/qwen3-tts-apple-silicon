@@ -191,6 +191,26 @@ class PronunciationWatchlistAddRequest(BaseModel):
     guide: str = Field(min_length=1, max_length=255)
 
 
+class BookPronunciationWatchlistWord(BaseModel):
+    """One per-book pronunciation override."""
+
+    word: str = Field(min_length=1, max_length=255)
+    phonetic: str = Field(min_length=1, max_length=255)
+
+
+class BookPronunciationWatchlistRequest(BaseModel):
+    """Request payload for replacing one book's pronunciation overrides."""
+
+    words: list[BookPronunciationWatchlistWord] = Field(default_factory=list)
+
+
+class BookPronunciationWatchlistResponse(BaseModel):
+    """Serialized per-book pronunciation overrides."""
+
+    book_id: int
+    entries: list[BookPronunciationWatchlistWord]
+
+
 router = APIRouter(prefix="/api", tags=["library"])
 _library_scan_lock = threading.RLock()
 _library_scan_progress: dict[str, object] = {
@@ -430,6 +450,34 @@ def delete_pronunciation_watchlist_word(word: str) -> PronunciationWatchlistResp
     watchlist = _pronunciation_watchlist()
     watchlist.remove_word(word)
     return PronunciationWatchlistResponse(entries=watchlist.entries())
+
+
+@router.put("/book/{book_id}/watchlist", response_model=BookPronunciationWatchlistResponse)
+def update_book_pronunciation_watchlist(
+    book_id: int,
+    request: BookPronunciationWatchlistRequest,
+    db: Session = Depends(get_db),
+) -> BookPronunciationWatchlistResponse:
+    """Replace the per-book pronunciation override list used during generation."""
+
+    book = db.query(Book).filter(Book.id == book_id).first()
+    if book is None:
+        raise HTTPException(status_code=404, detail=f"Book {book_id} not found")
+
+    watchlist = _pronunciation_watchlist()
+    payload = [
+        {
+            "word": entry.word.strip(),
+            "phonetic": entry.phonetic.strip(),
+        }
+        for entry in request.words
+    ]
+    book.pronunciation_watchlist = watchlist.serialize_custom_entries(payload) if payload else None
+    db.commit()
+    return BookPronunciationWatchlistResponse(
+        book_id=book.id,
+        entries=[BookPronunciationWatchlistWord(**entry) for entry in watchlist.custom_entries_from_payload(book.pronunciation_watchlist)],
+    )
 
 
 @router.get("/library", response_model=LibraryResponse)

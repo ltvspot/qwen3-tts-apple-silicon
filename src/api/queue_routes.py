@@ -157,6 +157,14 @@ class CancelJobResponse(BaseModel):
     error_message: str
 
 
+class ForceCancelJobResponse(BaseModel):
+    """Force-cancel endpoint response."""
+
+    job_id: int
+    status: str
+    error_message: str
+
+
 class PriorityUpdateRequest(BaseModel):
     """Priority update payload."""
 
@@ -496,6 +504,23 @@ async def cancel_queue_job(
         job_id=job.id,
         status="error",
         error_message=job.error_message or "Job cancelled by user.",
+    )
+
+
+@router.post("/{job_id}/force-cancel", response_model=ForceCancelJobResponse)
+async def force_cancel_queue_job(job_id: int, db: Session = Depends(get_db)) -> ForceCancelJobResponse:
+    """Force a queued or running job into a failed terminal state."""
+
+    queue = await ensure_queue_started(db)
+    job = await queue.force_cancel_job(job_id, db, reason="Job force-cancelled by operator.")
+    if job is None:
+        raise HTTPException(status_code=404, detail=f"Job {job_id} not found")
+
+    invalidate_library_cache()
+    return ForceCancelJobResponse(
+        job_id=job.id,
+        status="error",
+        error_message=job.error_message or "Job force-cancelled by operator.",
     )
 
 

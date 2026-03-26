@@ -202,6 +202,19 @@ def test_text_chunker_preserves_text_and_limits_chunk_size() -> None:
     assert all(len(chunk) <= 30 for chunk in chunks)
 
 
+def test_text_chunker_marks_paragraph_boundaries() -> None:
+    """Paragraph-aware chunking should mark the chunk that ends a paragraph."""
+
+    text = "First paragraph ends here.\n\nSecond paragraph starts now."
+
+    chunk_plans = TextChunker.chunk_text_with_metadata(text, max_chars=30)
+
+    assert len(chunk_plans) == 2
+    assert chunk_plans[0].ends_sentence is True
+    assert chunk_plans[0].ends_paragraph is True
+    assert chunk_plans[1].ends_paragraph is False
+
+
 def test_audio_stitcher() -> None:
     """Audio stitching should combine clips with only a tiny overlap."""
 
@@ -211,6 +224,19 @@ def test_audio_stitcher() -> None:
     stitched = AudioStitcher.stitch([audio1, audio2])
 
     assert len(stitched) > 1900
+
+
+def test_audio_stitcher_inserts_explicit_pauses() -> None:
+    """Configured sentence and paragraph pauses should be preserved verbatim."""
+
+    audio1 = AudioSegment.silent(duration=500)
+    audio2 = AudioSegment.silent(duration=500)
+
+    sentence_pause = AudioStitcher.stitch([audio1, audio2], pause_after_ms=[400])
+    paragraph_pause = AudioStitcher.stitch([audio1, audio2], pause_after_ms=[800])
+
+    assert len(sentence_pause) == 1400
+    assert len(paragraph_pause) == 1800
 
 
 def test_voice_test_api(client: TestClient, tmp_path: Path) -> None:

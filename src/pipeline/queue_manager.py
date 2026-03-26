@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 import inspect
 import json
 import logging
@@ -26,6 +27,7 @@ from src.database import (
     GenerationJobStatus,
     GenerationJobType,
     JobHistory,
+    QAStatus,
     retry_on_locked,
     utc_now,
 )
@@ -460,6 +462,60 @@ class GenerationQueue:
         self._notify_workers()
         return True
 
+    async def force_cancel_job(
+        self,
+        job_id: int,
+        db_session: Session,
+        *,
+        reason: str | None = None,
+    ) -> GenerationJob | None:
+        """Force a job into a failed terminal state and reset its chapters."""
+
+        db_job = db_session.query(GenerationJob).filter(GenerationJob.id == job_id).first()
+        if db_job is None:
+            return None
+
+        if db_job.status in {
+            GenerationJobStatus.COMPLETED,
+            GenerationJobStatus.FAILED,
+            GenerationJobStatus.CANCELLED,
+        }:
+            return db_job
+
+        forced_message = reason or "Job force-cancelled by operator."
+        db_job.status = GenerationJobStatus.FAILED
+        db_job.cancel_requested = True
+        db_job.pause_requested = False
+        db_job.current_chapter_progress = 0.0
+        db_job.completed_at = utc_now()
+        db_job.eta_seconds = None
+        db_job.error_message = forced_message
+        self._record_history(db_session, db_job, "force_cancelled", forced_message)
+        self._reset_generating_chapters_for_job(db_session, db_job)
+
+        if db_job.chapter_id is not None:
+            chapter = db_session.query(Chapter).filter(Chapter.id == db_job.chapter_id).first()
+            if chapter is not None:
+                self._reset_chapter_for_force(chapter)
+
+        book = db_session.query(Book).filter(Book.id == db_job.book_id).first()
+        if book is not None:
+            if book.status == BookStatus.GENERATING:
+                book.status = BookStatus.PARSED
+            book.generation_status = BookGenerationStatus.ERROR
+            book.generation_eta_seconds = None
+            if book.current_job_id == db_job.id:
+                book.current_job_id = None
+
+        db_session.commit()
+        db_session.refresh(db_job)
+        with self._jobs_lock:
+            self.active_jobs.discard(job_id)
+            self.jobs.pop(job_id, None)
+        invalidate_library_cache()
+        self._notify_workers()
+        return db_job
+
     async def update_priority(
         self,
         job_id: int,
@@ -675,6 +731,49 @@ class GenerationQueue:
 
         self._jobs_available.set()
 
+    def _job_control_requested(self, job_id: int, *, include_pause: bool = True) -> bool:
+        """Read the latest cancel/pause flags from the database for an active job."""
+
+        if self._db_session_maker is None:
+            return False
+
+        db_session: Session = self._db_session_maker()
+        try:
+            db_job = db_session.query(GenerationJob).filter(GenerationJob.id == job_id).first()
+            if db_job is None:
+                return True
+            if db_job.cancel_requested or db_job.status in {GenerationJobStatus.CANCELLED, GenerationJobStatus.FAILED}:
+                return True
+            return bool(include_pause and db_job.pause_requested)
+        finally:
+            db_session.close()
+
+    async def _post_chapter_housekeeping(self, db_job: GenerationJob, *, chapter_index: int) -> None:
+        """Bound memory growth during long full-book runs."""
+
+        del db_job
+        if chapter_index % 5 == 0:
+            gc.collect()
+
+        rss_mb = self._current_rss_mb()
+        if chapter_index % 10 == 0:
+            logger.info("Memory: %.1fMB RSS, %s chunks cached", rss_mb, 0)
+
+        if rss_mb > 4096.0:
+            logger.warning("Memory pressure %.1fMB RSS exceeded 4096MB; pausing briefly for garbage collection", rss_mb)
+            await asyncio.sleep(1.0)
+            gc.collect()
+
+    def _current_rss_mb(self) -> float:
+        """Return the current process RSS in megabytes when available."""
+
+        try:
+            import psutil
+
+            return psutil.Process().memory_info().rss / (1024 * 1024)
+        except Exception:
+            return 0.0
+
     async def _worker(self, worker_index: int) -> None:
         """Process queued jobs according to priority ordering."""
 
@@ -876,13 +975,22 @@ class GenerationQueue:
                         chapter=chapter,
                         db_session=db_session,
                         progress_callback=update_chapter_progress,
-                        should_cancel=None,
+                        should_cancel=lambda job_id=db_job.id: self._job_control_requested(job_id),
                         force=db_job.force,
                         voice_name=db_job.voice_name,
                         emotion=db_job.emotion,
                         speed=db_job.speed,
                     ),
                 )
+            except GenerationCancelled:
+                db_session.refresh(db_job)
+                if db_job.status == GenerationJobStatus.FAILED:
+                    return
+                if db_job.pause_requested:
+                    self._mark_paused(db_job, db_session)
+                else:
+                    self._mark_cancelled(db_job, db_session)
+                return
             except Exception as exc:
                 logger.error("Job %s chapter %s failed: %s", db_job.id, chapter.number, exc)
                 failure_stats.record_failure(self._estimated_chunk_count(chapter))
@@ -918,6 +1026,7 @@ class GenerationQueue:
                     book.generation_eta_seconds = db_job.eta_seconds
                 db_session.commit()
                 self._store_job_snapshot(db_job)
+                await self._post_chapter_housekeeping(db_job, chapter_index=chapter.number)
 
             db_session.refresh(db_job)
             if db_job.cancel_requested:
@@ -990,7 +1099,7 @@ class GenerationQueue:
                     chapter=chapter,
                     db_session=db_session,
                     progress_callback=update_progress,
-                    should_cancel=lambda: db_job.cancel_requested or db_job.pause_requested,
+                    should_cancel=lambda job_id=db_job.id: self._job_control_requested(job_id),
                     force=db_job.force,
                     voice_name=db_job.voice_name,
                     emotion=db_job.emotion,
@@ -998,6 +1107,9 @@ class GenerationQueue:
                 ),
             )
         except GenerationCancelled:
+            db_session.refresh(db_job)
+            if db_job.status == GenerationJobStatus.FAILED:
+                return
             if db_job.pause_requested:
                 self._mark_paused(db_job, db_session)
             else:
@@ -1042,7 +1154,7 @@ class GenerationQueue:
                 book_id=db_job.book_id,
                 db_session=db_session,
                 progress_callback=update_book_progress,
-                should_cancel=lambda: db_job.cancel_requested,
+                should_cancel=lambda job_id=db_job.id: self._job_control_requested(job_id, include_pause=False),
                 force=db_job.force,
                 voice_name=db_job.voice_name,
                 emotion=db_job.emotion,
@@ -1261,6 +1373,8 @@ class GenerationQueue:
         chapter.status = ChapterStatus.PENDING
         chapter.audio_path = None
         chapter.duration_seconds = None
+        chapter.qa_status = QAStatus.NOT_REVIEWED
+        chapter.qa_notes = None
         chapter.started_at = None
         chapter.completed_at = None
         chapter.error_message = None
@@ -1268,6 +1382,8 @@ class GenerationQueue:
         chapter.current_chunk = None
         chapter.total_chunks = None
         chapter.chunk_boundaries = None
+        chapter.generation_metadata = None
+        chapter.mastered = False
 
     def _reset_generating_chapters_for_job(self, db_session: Session, db_job: GenerationJob) -> None:
         """Reset any in-progress chapter rows owned by the provided job's book."""
@@ -1282,12 +1398,17 @@ class GenerationQueue:
         )
         for chapter in generating_chapters:
             chapter.status = ChapterStatus.PENDING
+            chapter.audio_path = None
+            chapter.duration_seconds = None
             chapter.started_at = None
             chapter.completed_at = None
             chapter.error_message = None
+            chapter.audio_file_size_bytes = None
             chapter.current_chunk = None
             chapter.total_chunks = None
             chapter.chunk_boundaries = None
+            chapter.generation_metadata = None
+            chapter.mastered = False
 
     def _sync_full_book_metrics(self, db_job: GenerationJob, chapters: list[Chapter], *, force: bool) -> None:
         """Refresh persisted counters from the current chapter rows."""

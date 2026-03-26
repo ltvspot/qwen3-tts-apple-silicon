@@ -20,9 +20,11 @@ class PauseTrimmer:
         max_pause_ms: int = MAX_PAUSE_MS,
         trim_target_ms: int = TRIM_TARGET_MS,
         silence_thresh_db: int = -40,
+        preserve_ranges_ms: list[tuple[int, int]] | None = None,
     ) -> tuple[AudioSegment, int]:
         """Trim internal silences that exceed the allowed mid-chunk pause length."""
         edge_preserve_ms = min(EDGE_PRESERVE_MS, max(trim_target_ms // 2, 0))
+        protected_ranges = preserve_ranges_ms or []
 
         silences = detect_silence(
             audio,
@@ -38,6 +40,8 @@ class PauseTrimmer:
         for start_ms, end_ms in reversed(silences):
             silence_duration = end_ms - start_ms
             if silence_duration <= max_pause_ms:
+                continue
+            if any(start_ms < protected_end and end_ms > protected_start for protected_start, protected_end in protected_ranges):
                 continue
 
             keep_before = start_ms + edge_preserve_ms

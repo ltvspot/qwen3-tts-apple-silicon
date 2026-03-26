@@ -13,35 +13,35 @@ import src.engines.qwen3_tts as qwen3_module
 from src.engines.qwen3_tts import Qwen3TTS
 
 
-def test_apply_speed_2x() -> None:
-    """2x playback speed should roughly halve the clip duration."""
+def test_apply_speed_fallback_is_noop_at_2x() -> None:
+    """Pitch-preserving speed fallback should not resample audio by frame rate anymore."""
 
     engine = Qwen3TTS(backend="synthetic")
     audio = Sine(220).to_audio_segment(duration=1000)
 
-    adjusted = engine._apply_speed(audio, 2.0)
+    adjusted = engine._apply_speed_preserving_pitch(audio, 2.0)
 
-    assert len(adjusted) == pytest.approx(500, abs=5)
-
-
-def test_apply_speed_half() -> None:
-    """0.5x playback speed should roughly double the clip duration."""
-
-    engine = Qwen3TTS(backend="synthetic")
-    audio = Sine(220).to_audio_segment(duration=1000)
-
-    adjusted = engine._apply_speed(audio, 0.5)
-
-    assert len(adjusted) == pytest.approx(2000, abs=5)
+    assert adjusted is audio
 
 
-def test_apply_speed_1x() -> None:
-    """1.0x playback speed should return the original segment."""
+def test_apply_speed_fallback_is_noop_at_half_speed() -> None:
+    """The deprecated frame-rate speed hack should stay disabled at slower speeds too."""
 
     engine = Qwen3TTS(backend="synthetic")
     audio = Sine(220).to_audio_segment(duration=1000)
 
-    adjusted = engine._apply_speed(audio, 1.0)
+    adjusted = engine._apply_speed_preserving_pitch(audio, 0.5)
+
+    assert adjusted is audio
+
+
+def test_apply_speed_fallback_is_noop_at_1x() -> None:
+    """1.0x playback speed should still return the original segment."""
+
+    engine = Qwen3TTS(backend="synthetic")
+    audio = Sine(220).to_audio_segment(duration=1000)
+
+    adjusted = engine._apply_speed_preserving_pitch(audio, 1.0)
 
     assert adjusted is audio
 

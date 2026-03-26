@@ -28,7 +28,7 @@ from src.database import (
 )
 from src.engines.qwen3_tts import Qwen3TTS
 from src.engines.voice_cloner import VoiceCloner
-from src.pipeline.generator import AudiobookGenerator, GenerationCancelled
+from src.pipeline.generator import AudiobookGenerator, ChunkGenerationExhaustedError, GenerationCancelled
 from src.pipeline.queue_manager import GenerationQueue, JobStatus
 
 
@@ -174,6 +174,48 @@ class ValidationFailureEngine:
         if "Invalid chunk." in text:
             return AudioSegment.silent(duration=250)
         return Sine(220).to_audio_segment(duration=400, volume=-6.0)
+
+
+class SplitRetryEngine:
+    """Test engine that only succeeds after a failed chunk is split by sentence."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.loaded = False
+        self.max_chunk_chars = 500
+
+    def load(self) -> None:
+        self.loaded = True
+
+    def unload(self) -> None:
+        self.loaded = False
+
+    def generate(self, text: str, voice: str, emotion: str | None = None, speed: float = 1.0) -> AudioSegment:
+        del voice, emotion, speed
+        self.calls.append(text)
+        if "Alpha sentence." in text and "Beta sentence." in text:
+            return AudioSegment.silent(duration=250)
+        return Sine(220).to_audio_segment(duration=700, volume=-6.0).set_frame_rate(22050)
+
+
+class RecordingCheckpointEngine:
+    """Engine stub that records which chunks were regenerated during resume."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.loaded = False
+        self.max_chunk_chars = 20
+
+    def load(self) -> None:
+        self.loaded = True
+
+    def unload(self) -> None:
+        self.loaded = False
+
+    def generate(self, text: str, voice: str, emotion: str | None = None, speed: float = 1.0) -> AudioSegment:
+        del voice, emotion, speed
+        self.calls.append(text)
+        return Sine(220).to_audio_segment(duration=700, volume=-6.0).set_frame_rate(22050)
 
 
 class ConsecutiveFailureGenerator:
@@ -387,8 +429,8 @@ async def test_generate_chapter_retries_transient_failures_before_succeeding(tes
 
 
 @pytest.mark.asyncio
-async def test_generate_chapter_keeps_invalid_chunks_and_flags_manual_review(test_db: Session) -> None:
-    """Repeated hard validation failures should still stitch audio and force manual review."""
+async def test_generate_chapter_fails_when_chunk_exhaustion_is_unrecoverable(test_db: Session) -> None:
+    """Repeated hard validation failures should fail the chapter instead of skipping audio."""
 
     generator = AudiobookGenerator(ValidationFailureEngine())
     book = create_book(test_db, title="Manual Review Book")
@@ -401,15 +443,73 @@ async def test_generate_chapter_keeps_invalid_chunks_and_flags_manual_review(tes
         text="Valid chunk. Invalid chunk.",
     )
 
+    with pytest.raises(ChunkGenerationExhaustedError, match="Chapter cannot be completed with missing audio"):
+        await generator.generate_chapter(book.id, chapter, test_db)
+
+    test_db.refresh(chapter)
+    assert chapter.status == ChapterStatus.FAILED
+    assert chapter.audio_path is None
+    assert chapter.error_message is not None
+    assert "Chunk 2 failed after 3 attempts" in chapter.error_message
+    assert "Chapter cannot be completed with missing audio" in chapter.error_message
+    assert generator.engine.calls == 4
+
+
+@pytest.mark.asyncio
+async def test_generate_chapter_retries_by_splitting_failed_chunk(test_db: Session) -> None:
+    """A failed chunk should be retried as sentence-level sub-chunks before aborting the chapter."""
+
+    engine = SplitRetryEngine()
+    generator = AudiobookGenerator(engine)
+    book = create_book(test_db, title="Split Retry Book")
+    chapter = create_chapter(
+        test_db,
+        book_id=book.id,
+        number=1,
+        title="Split Retry Chapter",
+        chapter_type=ChapterType.CHAPTER,
+        text="Alpha sentence. Beta sentence.",
+    )
+
     duration = await generator.generate_chapter(book.id, chapter, test_db)
 
     test_db.refresh(chapter)
+    assert duration > 1.7
+    assert chapter.status == ChapterStatus.GENERATED
+    assert len([call for call in engine.calls if "Alpha sentence." in call and "Beta sentence." in call]) == 3
+    assert any(call == "Alpha sentence." for call in engine.calls)
+    assert any(call == "Beta sentence." for call in engine.calls)
+
+
+@pytest.mark.asyncio
+async def test_generate_chapter_resumes_from_chunk_checkpoints(test_db: Session) -> None:
+    """Existing chunk checkpoints should be reused when resuming a failed chapter."""
+
+    engine = RecordingCheckpointEngine()
+    generator = AudiobookGenerator(engine)
+    book = create_book(test_db, title="Checkpoint Resume Book")
+    chapter = create_chapter(
+        test_db,
+        book_id=book.id,
+        number=1,
+        title="Checkpoint Resume Chapter",
+        chapter_type=ChapterType.CHAPTER,
+        text="First chunk. Second chunk.",
+    )
+
+    checkpoint_audio = Sine(220).to_audio_segment(duration=700, volume=-6.0).set_frame_rate(22050)
+    checkpoint_path = generator._get_chunk_checkpoint_path(book.id, chapter, 0)
+    generator._save_chunk_checkpoint(checkpoint_path, checkpoint_audio)
+
+    duration = await generator.generate_chapter(book.id, chapter, test_db)
+
+    test_db.refresh(chapter)
+    metadata = json.loads(chapter.generation_metadata or "{}")
     assert duration > 0
     assert chapter.status == ChapterStatus.GENERATED
-    assert chapter.qa_status.value == "needs_review"
-    assert chapter.qa_notes is not None
-    assert "FAILED" in chapter.qa_notes
-    assert generator.engine.calls == 4
+    assert metadata["checkpoints"]["checkpoint_hits"] == 1
+    assert metadata["checkpoints"]["chunk_files_written"] >= 1
+    assert engine.calls == ["Second chunk."]
 
 
 @pytest.mark.asyncio

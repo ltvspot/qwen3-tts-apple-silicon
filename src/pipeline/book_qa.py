@@ -7,6 +7,7 @@ import logging
 import re
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -200,43 +201,62 @@ def _require_gate3_ready(book_id: int, db_session: Session) -> tuple[Book, list[
 def measure_integrated_lufs(audio_path: str | Path) -> float | None:
     """Return integrated LUFS using ffmpeg loudnorm when available."""
 
-    ffmpeg_path = shutil.which("ffmpeg")
-    if ffmpeg_path is None:
-        try:
-            return round(float(AudioSegment.from_file(audio_path).dBFS), 3)
-        except Exception:
-            return None
-
-    command = [
-        ffmpeg_path,
-        "-hide_banner",
-        "-i",
-        str(audio_path),
-        "-af",
-        "loudnorm=I=-19:TP=-1.5:LRA=11:print_format=json",
-        "-f",
-        "null",
-        "-",
-    ]
-    try:
-        completed = subprocess.run(command, check=True, capture_output=True, text=True)
-    except subprocess.CalledProcessError as exc:
-        logger.warning("Unable to measure LUFS for %s: %s", audio_path, exc)
-        try:
-            return round(float(AudioSegment.from_file(audio_path).dBFS), 3)
-        except Exception:
-            return None
-
-    output = "\n".join(part for part in (completed.stdout, completed.stderr) if part)
-    match = re.search(r"(\{\s*\"input_i\".*?\})", output, re.DOTALL)
-    if match is None:
-        return None
+    resolved_path = Path(audio_path)
+    measurement_path = resolved_path
+    temp_path: Path | None = None
 
     try:
-        metrics = json.loads(match.group(1))
-        return round(float(metrics["input_i"]), 3)
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-        return None
+        try:
+            original_audio = AudioSegment.from_file(resolved_path)
+            trimmed_audio = _trimmed_audio(original_audio)
+            if 0 < len(trimmed_audio) < len(original_audio):
+                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
+                    temp_path = Path(handle.name)
+                trimmed_audio.set_channels(1).set_sample_width(2).export(temp_path, format="wav")
+                measurement_path = temp_path
+        except Exception:
+            measurement_path = resolved_path
+
+        ffmpeg_path = shutil.which("ffmpeg")
+        if ffmpeg_path is None:
+            try:
+                return round(float(AudioSegment.from_file(measurement_path).dBFS), 3)
+            except Exception:
+                return None
+
+        command = [
+            ffmpeg_path,
+            "-hide_banner",
+            "-i",
+            str(measurement_path),
+            "-af",
+            "loudnorm=I=-19:TP=-1.5:LRA=11:print_format=json",
+            "-f",
+            "null",
+            "-",
+        ]
+        try:
+            completed = subprocess.run(command, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as exc:
+            logger.warning("Unable to measure LUFS for %s: %s", resolved_path, exc)
+            try:
+                return round(float(AudioSegment.from_file(measurement_path).dBFS), 3)
+            except Exception:
+                return None
+
+        output = "\n".join(part for part in (completed.stdout, completed.stderr) if part)
+        match = re.search(r"(\{\s*\"input_i\".*?\})", output, re.DOTALL)
+        if match is None:
+            return None
+
+        try:
+            metrics = json.loads(match.group(1))
+            return round(float(metrics["input_i"]), 3)
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
 
 
 def _leading_silence_ms(audio: AudioSegment, *, silence_thresh: float = -45.0, step_ms: int = 10) -> int:
@@ -708,7 +728,6 @@ def check_acx_compliance(book_id: int, db_session: Session) -> BookQACheck:
     _, chapters, _ = _require_gate3_ready(book_id, db_session)
     violations: list[dict[str, Any]] = []
     blockers: list[str] = []
-    target_sample_rate = _export_sample_rate()
 
     for chapter in chapters:
         audio_path = _chapter_audio_path(chapter)
@@ -732,8 +751,8 @@ def check_acx_compliance(book_id: int, db_session: Session) -> BookQACheck:
             )
             blockers.append(f"Chapter {chapter.number} {issue}: {remediation}")
 
-        if target_sample_rate != ACX_REQUIREMENTS["sample_rate"]:
-            add_violation("sample_rate", "Set export sample rate to 44.1kHz.", target_sample_rate)
+        if audio.frame_rate != ACX_REQUIREMENTS["sample_rate"]:
+            add_violation("sample_rate", "Resample chapter masters to 44.1kHz.", audio.frame_rate)
         if bit_depth != ACX_REQUIREMENTS["bit_depth"]:
             add_violation("bit_depth", "Export chapter masters at 16-bit PCM.", bit_depth)
         if audio.channels != ACX_REQUIREMENTS["channels"]:

@@ -13,7 +13,8 @@ from sqlalchemy.pool import StaticPool
 from src.api import export_routes
 from src.api import generation_runtime
 from src.config import reset_settings_manager
-from src.database import Base, get_db
+from src.api.schemas import HealthCheckItem, StartupHealthSummary
+from src.database import Base, get_db, utc_now
 from src.health_checks import DiskSpaceSnapshot
 from src.main import app
 
@@ -100,11 +101,30 @@ def test_db() -> Generator[Session, None, None]:
 
 
 @pytest.fixture(scope="function")
-def client(test_db: Session) -> Generator[TestClient, None, None]:
+def client(test_db: Session, monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None, None]:
     """Create an application test client."""
 
     def override_get_db() -> Generator[Session, None, None]:
         yield test_db
+
+    async def fake_health_checks() -> StartupHealthSummary:
+        checks = [
+            HealthCheckItem(name="Database Connection", status="pass", detail="ok", critical=True),
+            HealthCheckItem(name="Model Files", status="pass", detail="ok", critical=True),
+            HealthCheckItem(name="mlx-audio Import", status="pass", detail="ok", critical=True),
+            HealthCheckItem(name="ffmpeg", status="pass", detail="ok", critical=True),
+            HealthCheckItem(name="Manuscript Folder", status="pass", detail="ok", critical=False),
+            HealthCheckItem(name="Output Directory", status="pass", detail="ok", critical=True),
+            HealthCheckItem(name="Disk Space", status="pass", detail="ok", critical=False),
+            HealthCheckItem(name="Empty Python Files", status="pass", detail="ok", critical=False),
+        ]
+        return StartupHealthSummary(checked_at=utc_now(), checks=checks, warnings=[], errors=[])
+
+    monkeypatch.setattr("src.main.init_db", lambda: None)
+    monkeypatch.setattr("src.main.run_startup_cleanup", lambda: (0, 0))
+    monkeypatch.setattr("src.main.run_startup_recovery", lambda: 0)
+    monkeypatch.setattr("src.main.install_signal_handlers", lambda: None)
+    monkeypatch.setattr("src.main.run_all_health_checks", fake_health_checks)
 
     app.dependency_overrides[get_db] = override_get_db
     with TestClient(app) as test_client:

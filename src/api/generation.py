@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from src.api.cache import invalidate_library_cache
 from src.config import settings
-from src.api.generation_runtime import ensure_queue_started, get_queue
+from src.api.generation_runtime import ensure_queue_started, get_generator, get_queue
 from src.database import (
     Book,
     BookGenerationStatus,
@@ -22,6 +22,7 @@ from src.database import (
     ChapterStatus,
     GenerationJob,
     GenerationJobStatus,
+    QAStatus,
     get_db,
 )
 from src.pipeline.manuscript_validator import ManuscriptValidator
@@ -93,6 +94,15 @@ class BookGenerationStatusResponse(BaseModel):
     total_chunks: int | None = None
     eta_seconds: int | None = None
     started_at: datetime | None = None
+
+
+class BookResetResponse(BaseModel):
+    """Response returned when a book's generation state is fully reset."""
+
+    book_id: int
+    reset_chapters: int
+    cancelled_jobs: list[int]
+    message: str
 
 def _serialize_job(job: JobInfo) -> JobStatusResponse:
     """Convert in-memory queue job state into an API response model."""
@@ -219,6 +229,29 @@ def _get_book_jobs(book_id: int, db: Session) -> list[GenerationJob]:
         .order_by(GenerationJob.created_at.desc(), GenerationJob.id.desc())
         .all()
     )
+
+
+def _reset_chapter_state(book_id: int, chapter: Chapter) -> None:
+    """Reset one chapter and delete any generated artifacts."""
+
+    generator = get_generator()
+    delete_artifacts = getattr(generator, "delete_chapter_artifacts", None)
+    if callable(delete_artifacts):
+        delete_artifacts(book_id, chapter)
+    chapter.status = ChapterStatus.PENDING
+    chapter.audio_path = None
+    chapter.duration_seconds = None
+    chapter.qa_status = QAStatus.NOT_REVIEWED
+    chapter.qa_notes = None
+    chapter.started_at = None
+    chapter.completed_at = None
+    chapter.error_message = None
+    chapter.audio_file_size_bytes = None
+    chapter.current_chunk = None
+    chapter.total_chunks = None
+    chapter.chunk_boundaries = None
+    chapter.generation_metadata = None
+    chapter.mastered = False
 
 
 def _latest_resume_checkpoint(book_id: int, db: Session) -> int:
@@ -624,6 +657,98 @@ async def generate_chapter(
         book_id=book_id,
         chapter_number=chapter_number,
         message=f"Chapter {chapter_number} queued for generation",
+    )
+
+
+@router.post("/book/{book_id}/chapter/{chapter_number}/resume", response_model=QueueJobResponse)
+async def resume_chapter_generation(
+    book_id: int,
+    chapter_number: int,
+    db: Session = Depends(get_db),
+) -> QueueJobResponse:
+    """Resume one chapter from its saved chunk checkpoints when available."""
+
+    book = _load_book_or_404(book_id, db)
+    if book.status != BookStatus.PARSED:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Book must be parsed first. Current status: {book.status}",
+        )
+
+    chapter = _load_chapter_or_404(book_id, chapter_number, db)
+    if not (chapter.text_content or "").strip():
+        raise HTTPException(status_code=400, detail="Chapter has no text content")
+    if chapter.status == ChapterStatus.GENERATED:
+        raise HTTPException(status_code=400, detail="Chapter audio already exists.")
+    if _has_active_job(book_id, db):
+        raise HTTPException(status_code=409, detail="Generation is already queued or running for this book.")
+
+    try:
+        queue = await ensure_queue_started(db)
+        job_id = await queue.enqueue_chapter(book_id, chapter_number, db, force=False)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except DuplicateGenerationJobError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except QueueDrainingError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Failed to resume book %s chapter %s", book_id, chapter_number)
+        raise HTTPException(status_code=500, detail="Failed to resume chapter generation.") from exc
+
+    invalidate_library_cache()
+    return QueueJobResponse(
+        job_id=job_id,
+        status="queued",
+        book_id=book_id,
+        chapter_number=chapter_number,
+        message=f"Chapter {chapter_number} resumed from saved chunk checkpoints",
+    )
+
+
+@router.post("/book/{book_id}/reset", response_model=BookResetResponse)
+async def reset_book_generation_state(book_id: int, db: Session = Depends(get_db)) -> BookResetResponse:
+    """Return a book to a clean pre-generation state."""
+
+    book = _load_book_or_404(book_id, db)
+    chapters = _get_book_chapters(book_id, db)
+    queue = await ensure_queue_started(db)
+    active_jobs = (
+        db.query(GenerationJob)
+        .filter(
+            GenerationJob.book_id == book_id,
+            GenerationJob.status.in_(
+                (
+                    GenerationJobStatus.QUEUED,
+                    GenerationJobStatus.RUNNING,
+                    GenerationJobStatus.PAUSED,
+                )
+            ),
+        )
+        .all()
+    )
+
+    cancelled_jobs: list[int] = []
+    for job in active_jobs:
+        forced = await queue.force_cancel_job(job.id, db, reason="Book reset requested by operator.")
+        if forced is not None:
+            cancelled_jobs.append(job.id)
+
+    for chapter in chapters:
+        _reset_chapter_state(book_id, chapter)
+
+    book.status = BookStatus.PARSED
+    book.generation_status = BookGenerationStatus.IDLE
+    book.generation_started_at = None
+    book.generation_eta_seconds = None
+    book.current_job_id = None
+    db.commit()
+    invalidate_library_cache()
+    return BookResetResponse(
+        book_id=book.id,
+        reset_chapters=len(chapters),
+        cancelled_jobs=cancelled_jobs,
+        message="Book generation state reset and ready for regeneration",
     )
 
 

@@ -24,11 +24,13 @@ from src.database import (
     QAManualStatus,
     QAStatus,
 )
+from src.pipeline.book_qa import BookQAReport
 from src.pipeline.exporter import (
     _build_export_paths,
     concatenate_chapters_sync,
     export_book_sync,
 )
+from src.pipeline.qa_checker import QAResult
 
 
 @pytest.fixture(autouse=True)
@@ -202,8 +204,41 @@ def test_concatenate_chapters_sync_inserts_expected_silence_and_skips_flagged(te
     assert result.chapter_markers[-1].title == "Closing Credits"
 
 
-def test_export_book_sync_writes_mp3_m4b_and_qa_report(test_db: Session) -> None:
+def test_export_book_sync_writes_mp3_m4b_and_qa_report(
+    test_db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Full export should write both output formats, chapter markers, and a QA report."""
+
+    async def fake_run_qa_checks_for_chapter(chapter: Chapter):
+        return QAResult(
+            chapter_n=chapter.number,
+            book_id=chapter.book_id,
+            timestamp=chapter.updated_at,
+            checks=[],
+            overall_status="pass",
+            chapter_report={"overall_grade": "A", "ready_for_export": True},
+        )
+
+    monkeypatch.setattr("src.pipeline.book_mastering.measure_integrated_lufs", lambda *_args, **_kwargs: -20.0)
+    monkeypatch.setattr("src.pipeline.book_mastering.run_qa_checks_for_chapter", fake_run_qa_checks_for_chapter)
+    monkeypatch.setattr(
+        "src.pipeline.book_mastering.run_book_qa",
+        lambda book_id, db_session: BookQAReport(
+            book_id=book_id,
+            title="Signal Export",
+            total_chapters=3,
+            chapters_grade_a=3,
+            chapters_grade_b=0,
+            chapters_grade_c=0,
+            chapters_grade_f=0,
+            overall_grade="A",
+            ready_for_export=True,
+            cross_chapter_checks={},
+            recommendations=[],
+            export_blockers=[],
+        ),
+    )
 
     book = _create_book(test_db, title="Signal Export")
     opening = _create_chapter(
@@ -265,6 +300,15 @@ def test_export_book_sync_writes_mp3_m4b_and_qa_report(test_db: Session) -> None
     assert qa_report["chapters_approved"] == 3
     assert result.formats["mp3"].file_size_bytes == export_paths["mp3"].stat().st_size
     assert result.formats["m4b"].file_size_bytes == export_paths["m4b"].stat().st_size
+    assert result.formats["mp3"].attempts == 1
+    assert result.formats["m4b"].attempts == 1
+    assert result.formats["mp3"].verification is not None
+    assert result.formats["mp3"].verification["ok"] is True
+    assert result.formats["m4b"].verification["chapterMarkers"] == [
+        "Opening Credits",
+        "Chapter One",
+        "Closing Credits",
+    ]
 
     ffprobe_path = shutil.which("ffprobe")
     if ffprobe_path is not None:

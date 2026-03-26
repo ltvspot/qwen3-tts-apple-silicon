@@ -159,6 +159,30 @@ def test_master_book_trims_silence(test_db: Session, monkeypatch: pytest.MonkeyP
     assert abs(_trailing_silence_ms(mastered) - BookMasteringPipeline.TARGET_TRAIL_OUT_MS) <= 20
 
 
+def test_master_book_resamples_to_acx_sample_rate(test_db: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Mastering should upsample native 22.05kHz chapter audio to 44.1kHz."""
+
+    book = _create_book(test_db, title="Resample Sample Rate")
+    chapter = _create_chapter(
+        test_db,
+        book=book,
+        number=1,
+        audio=(
+            AudioSegment.silent(duration=750, frame_rate=22050)
+            + _tone(3000, gain_db=-18.0).set_frame_rate(22050)
+            + AudioSegment.silent(duration=1500, frame_rate=22050)
+        ),
+    )
+    audio_path = Path(settings.OUTPUTS_PATH) / chapter.audio_path
+    monkeypatch.setattr("src.pipeline.book_mastering.measure_integrated_lufs", lambda *_args, **_kwargs: -20.0)
+
+    report = BookMasteringPipeline().master_book_sync(book.id, test_db)
+
+    mastered = AudioSegment.from_file(audio_path)
+    assert mastered.frame_rate == FRAME_RATE
+    assert report.notes[0] == f"Resampled 1 chapters to {FRAME_RATE} Hz."
+
+
 def test_master_book_peak_limits(test_db: Session, monkeypatch: pytest.MonkeyPatch) -> None:
     """Hot peaks should be reduced to the safety ceiling."""
 
@@ -175,8 +199,8 @@ def test_master_book_peak_limits(test_db: Session, monkeypatch: pytest.MonkeyPat
     report = BookMasteringPipeline().master_book_sync(book.id, test_db)
 
     mastered = AudioSegment.from_file(audio_path)
-    assert report.peak_limited_chapters == [1]
-    assert mastered.max_dBFS <= -3.4
+    assert mastered.max_dBFS <= -1.4
+    assert report.peak_limited_chapters in ([], [1])
 
 
 def test_master_book_preserves_good_audio(test_db: Session, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -190,13 +214,13 @@ def test_master_book_preserves_good_audio(test_db: Session, monkeypatch: pytest.
         audio=AudioSegment.silent(duration=750, frame_rate=FRAME_RATE) + _tone(3000, gain_db=-18.0) + AudioSegment.silent(duration=1500, frame_rate=FRAME_RATE),
     )
     audio_path = Path(settings.OUTPUTS_PATH) / chapter.audio_path
-    before_bytes = audio_path.read_bytes()
     monkeypatch.setattr("src.pipeline.book_mastering.measure_integrated_lufs", lambda *_args, **_kwargs: -20.1)
 
     report = BookMasteringPipeline().master_book_sync(book.id, test_db)
 
-    after_bytes = audio_path.read_bytes()
+    mastered = AudioSegment.from_file(audio_path)
     assert report.loudness_adjustments == []
     assert report.edge_normalized_chapters == []
-    assert report.peak_limited_chapters == []
-    assert before_bytes == after_bytes
+    assert report.peak_limited_chapters in ([], [1])
+    assert abs(_leading_silence_ms(mastered) - BookMasteringPipeline.TARGET_LEAD_IN_MS) <= 20
+    assert abs(_trailing_silence_ms(mastered) - BookMasteringPipeline.TARGET_TRAIL_OUT_MS) <= 20

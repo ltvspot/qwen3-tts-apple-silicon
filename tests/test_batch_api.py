@@ -42,16 +42,24 @@ def test_batch_endpoints_return_progress_and_history(client, monkeypatch) -> Non
 
     payload = {
         "avg_seconds_per_book": 0.0,
+        "avgBookTimeSeconds": 0.0,
+        "avgChapterTimeSeconds": 12.5,
         "batch_id": "batch_20260325_120000",
         "book_results": [],
         "books_completed": 0,
         "books_failed": 0,
         "books_in_progress": 0,
         "books_skipped": 0,
+        "booksCompleted": 0,
+        "booksTotal": 2,
+        "currentBook": "Self-Reliance",
+        "currentChapter": "Chapter 3",
         "current_book_id": None,
         "current_book_title": None,
         "elapsed_seconds": 0.0,
         "estimated_completion": None,
+        "estimatedTimeRemainingSeconds": 3600,
+        "memoryUsageMB": 2100.0,
         "model_reloads": 0,
         "pause_reason": None,
         "percent_complete": 0.0,
@@ -71,6 +79,8 @@ def test_batch_endpoints_return_progress_and_history(client, monkeypatch) -> Non
     start_response = client.post("/api/batch/start", json={"priority": "normal", "skip_already_exported": True})
     assert start_response.status_code == 200
     assert start_response.json()["total_books"] == 2
+    assert start_response.json()["estimatedTimeRemainingSeconds"] == 3600
+    assert start_response.json()["currentBook"] == "Self-Reliance"
 
     pause_response = client.post("/api/batch/pause", json={"reason": "Testing pause"})
     assert pause_response.status_code == 200

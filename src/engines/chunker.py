@@ -16,6 +16,14 @@ _DFT_MATRIX_CACHE: dict[int, np.ndarray] = {}
 class TextChunker:
     """Split long narration text into chunk-safe segments."""
 
+    @dataclass(slots=True)
+    class ChunkPlan:
+        """Text plus boundary metadata used for pause-aware stitching."""
+
+        text: str
+        ends_sentence: bool
+        ends_paragraph: bool
+
     ABBREVIATIONS = {
         "mr",
         "mrs",
@@ -96,27 +104,93 @@ class TextChunker:
         if len(text) <= max_chars:
             return [text]
 
-        chunks: list[str] = []
+        return [plan.text for plan in cls.chunk_text_with_metadata(text, max_chars)]
+
+    @classmethod
+    def chunk_text_with_metadata(cls, text: str, max_chars: int) -> list["TextChunker.ChunkPlan"]:
+        """Split text into chunk plans while preserving sentence and paragraph boundaries."""
+
+        if max_chars < 1:
+            raise ValueError("max_chars must be greater than zero")
+        if not text:
+            return [cls.ChunkPlan(text=text, ends_sentence=False, ends_paragraph=False)]
+        if len(text) <= max_chars:
+            ends_paragraph = bool(re.search(r"\n\s*\n\s*$", text))
+            ends_sentence = text.rstrip().endswith((".", "!", "?")) or ends_paragraph
+            return [cls.ChunkPlan(text=text, ends_sentence=ends_sentence, ends_paragraph=ends_paragraph)]
+
+        chunks: list[TextChunker.ChunkPlan] = []
         current_parts: list[str] = []
         current_length = 0
+        current_ends_sentence = False
+        current_ends_paragraph = False
 
         for segment in cls.split_into_sentences(text):
-            for piece in cls._split_oversized_segment(segment, max_chars):
+            ends_paragraph = bool(re.search(r"\n\s*\n\s*$", segment))
+            segment_ends_sentence = segment.rstrip().endswith((".", "!", "?")) or ends_paragraph
+            pieces = cls._split_oversized_segment(segment, max_chars)
+            for piece_index, piece in enumerate(pieces):
                 piece_length = len(piece)
+                piece_ends_sentence = piece_index == len(pieces) - 1 and segment_ends_sentence
+                piece_ends_paragraph = piece_index == len(pieces) - 1 and ends_paragraph
                 if current_length + piece_length <= max_chars:
                     current_parts.append(piece)
                     current_length += piece_length
+                    current_ends_sentence = piece_ends_sentence
+                    current_ends_paragraph = piece_ends_paragraph
                     continue
 
                 if current_parts:
-                    chunks.append("".join(current_parts))
+                    chunks.append(
+                        cls.ChunkPlan(
+                            text="".join(current_parts),
+                            ends_sentence=current_ends_sentence,
+                            ends_paragraph=current_ends_paragraph,
+                        )
+                    )
                 current_parts = [piece]
                 current_length = piece_length
+                current_ends_sentence = piece_ends_sentence
+                current_ends_paragraph = piece_ends_paragraph
 
         if current_parts:
-            chunks.append("".join(current_parts))
+            chunks.append(
+                cls.ChunkPlan(
+                    text="".join(current_parts),
+                    ends_sentence=current_ends_sentence,
+                    ends_paragraph=current_ends_paragraph,
+                )
+            )
 
         return chunks
+
+    @classmethod
+    def split_for_retry(cls, text: str) -> tuple[str, str] | None:
+        """Split a failed chunk near the midpoint on the nearest sentence boundary."""
+
+        sentences = cls.split_into_sentences(text)
+        if len(sentences) < 2:
+            return None
+
+        target = len(text) / 2
+        cumulative = 0
+        best_index: int | None = None
+        best_distance: float | None = None
+        for index, sentence in enumerate(sentences[:-1], start=1):
+            cumulative += len(sentence)
+            distance = abs(cumulative - target)
+            if best_distance is None or distance < best_distance:
+                best_index = index
+                best_distance = distance
+
+        if best_index is None:
+            return None
+
+        left = "".join(sentences[:best_index]).strip()
+        right = "".join(sentences[best_index:]).strip()
+        if not left or not right:
+            return None
+        return (left, right)
 
     @classmethod
     def split_into_sentences(cls, text: str) -> list[str]:
@@ -291,6 +365,17 @@ class AudioStitcher:
     def stitch_with_metadata(cls, audio_chunks: list[AudioSegment]) -> StitchResult:
         """Return stitched audio plus chunk boundary metadata for downstream QA."""
 
+        return cls.stitch_with_metadata_and_pauses(audio_chunks, pause_after_ms=None)
+
+    @classmethod
+    def stitch_with_metadata_and_pauses(
+        cls,
+        audio_chunks: list[AudioSegment],
+        *,
+        pause_after_ms: list[int] | None,
+    ) -> StitchResult:
+        """Return stitched audio plus chunk boundary metadata with optional inserted pauses."""
+
         if not audio_chunks:
             raise ValueError("No audio chunks to stitch")
         if len(audio_chunks) == 1:
@@ -301,7 +386,18 @@ class AudioStitcher:
         chunk_boundaries = [0.0]
         crossfades_ms: list[int] = []
 
-        for chunk in audio_chunks[1:]:
+        pauses = list(pause_after_ms or [])
+
+        for index, chunk in enumerate(audio_chunks[1:], start=1):
+            prior_pause_ms = pauses[index - 1] if index - 1 < len(pauses) else 0
+            if prior_pause_ms > 0:
+                pause = AudioSegment.silent(duration=prior_pause_ms, frame_rate=result.frame_rate).set_channels(1)
+                result += pause
+                chunk_boundaries.append(len(result) / 1000.0)
+                crossfades_ms.append(0)
+                result += chunk
+                continue
+
             adaptive_crossfade = cls.compute_adaptive_crossfade(result, chunk)
             crossfade = min(adaptive_crossfade, len(result), len(chunk))
             chunk_boundaries.append(max(len(result) - crossfade, 0) / 1000.0)
@@ -315,10 +411,10 @@ class AudioStitcher:
         )
 
     @classmethod
-    def stitch(cls, audio_chunks: list[AudioSegment]) -> AudioSegment:
+    def stitch(cls, audio_chunks: list[AudioSegment], *, pause_after_ms: list[int] | None = None) -> AudioSegment:
         """Return one continuous segment from one or more generated chunks."""
 
-        return cls.stitch_with_metadata(audio_chunks).audio
+        return cls.stitch_with_metadata_and_pauses(audio_chunks, pause_after_ms=pause_after_ms).audio
 
     @staticmethod
     def _normalized_samples(audio: AudioSegment) -> np.ndarray:

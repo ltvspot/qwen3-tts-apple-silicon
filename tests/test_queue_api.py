@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from src.api import generation_runtime
 from src.database import (
     Book,
+    BookGenerationStatus,
     BookStatus,
     Chapter,
     ChapterStatus,
@@ -323,6 +324,110 @@ def test_pause_resume_and_cancel_endpoints_persist_history(client, test_db: Sess
     assert history_actions == ["paused", "resumed", "cancelled"]
 
 
+def test_force_cancel_endpoint_resets_job_and_chapter(client, test_db: Session) -> None:
+    """Force-cancel should fail the job and return the chapter to a clean pending state."""
+
+    book = create_book(test_db, title="Force Cancel Book")
+    book.status = BookStatus.GENERATING
+    book.generation_status = BookGenerationStatus.GENERATING
+    chapter = create_chapter(
+        test_db,
+        book_id=book.id,
+        number=1,
+        title="Interrupted Chapter",
+        status=ChapterStatus.GENERATING,
+    )
+    job = GenerationJob(
+        book_id=book.id,
+        chapter_id=chapter.id,
+        job_type=GenerationJobType.SINGLE_CHAPTER,
+        status=GenerationJobStatus.RUNNING,
+        progress=40.0,
+        current_chapter_progress=50.0,
+        chapters_total=1,
+        chapters_completed=0,
+        chapters_failed=0,
+        current_chapter_n=1,
+        priority=10,
+        force=False,
+    )
+    test_db.add(job)
+    test_db.commit()
+    test_db.refresh(job)
+
+    response = client.post(f"/api/queue/{job.id}/force-cancel")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "error"
+    test_db.refresh(job)
+    test_db.refresh(chapter)
+    assert job.status == GenerationJobStatus.FAILED
+    assert chapter.status == ChapterStatus.PENDING
+    assert chapter.audio_path is None
+
+
+def test_book_reset_endpoint_clears_generation_state(client, test_db: Session) -> None:
+    """Book reset should cancel active jobs and clear all chapter generation artifacts."""
+
+    book = create_book(test_db, title="Reset Book")
+    book.status = BookStatus.GENERATING
+    book.generation_status = BookGenerationStatus.GENERATING
+    first = create_chapter(
+        test_db,
+        book_id=book.id,
+        number=1,
+        title="Completed Chapter",
+        status=ChapterStatus.GENERATED,
+    )
+    first.audio_path = "reset-book/01.wav"
+    first.duration_seconds = 12.0
+    first.qa_notes = "Needs review"
+    first.current_chunk = 2
+    second = create_chapter(
+        test_db,
+        book_id=book.id,
+        number=2,
+        title="Generating Chapter",
+        status=ChapterStatus.GENERATING,
+    )
+    job = GenerationJob(
+        book_id=book.id,
+        chapter_id=second.id,
+        job_type=GenerationJobType.SINGLE_CHAPTER,
+        status=GenerationJobStatus.RUNNING,
+        progress=50.0,
+        current_chapter_progress=60.0,
+        chapters_total=1,
+        chapters_completed=0,
+        chapters_failed=0,
+        current_chapter_n=2,
+        priority=0,
+        force=False,
+    )
+    test_db.add(job)
+    test_db.commit()
+    test_db.refresh(job)
+
+    response = client.post(f"/api/book/{book.id}/reset")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["book_id"] == book.id
+    assert payload["reset_chapters"] == 2
+    assert payload["cancelled_jobs"] == [job.id]
+
+    test_db.refresh(book)
+    test_db.refresh(first)
+    test_db.refresh(second)
+    test_db.refresh(job)
+    assert book.status == BookStatus.PARSED
+    assert book.generation_status == BookGenerationStatus.IDLE
+    assert job.status == GenerationJobStatus.FAILED
+    assert first.status == ChapterStatus.PENDING
+    assert first.audio_path is None
+    assert second.status == ChapterStatus.PENDING
+
+
 def test_resume_book_generation_queues_the_first_incomplete_chapter(client, test_db: Session) -> None:
     """Resuming a book should target the first chapter without generated audio."""
 
@@ -363,6 +468,31 @@ def test_resume_book_generation_queues_the_first_incomplete_chapter(client, test
     job = test_db.query(GenerationJob).filter(GenerationJob.id == payload["job_id"]).one()
     assert job.status == GenerationJobStatus.QUEUED
     assert job.current_chapter_n == 2
+
+
+def test_resume_chapter_generation_queues_requested_chapter(client, test_db: Session) -> None:
+    """The dedicated chapter resume endpoint should requeue the selected chapter."""
+
+    book = create_book(test_db, title="Resume Chapter API Book")
+    create_chapter(
+        test_db,
+        book_id=book.id,
+        number=1,
+        title="Retry Me",
+        status=ChapterStatus.FAILED,
+    )
+
+    response = client.post(f"/api/book/{book.id}/chapter/1/resume")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["book_id"] == book.id
+    assert payload["chapter_number"] == 1
+    assert payload["message"] == "Chapter 1 resumed from saved chunk checkpoints"
+
+    job = test_db.query(GenerationJob).filter(GenerationJob.id == payload["job_id"]).one()
+    assert job.status == GenerationJobStatus.QUEUED
+    assert job.chapter_id is not None
 
 
 def test_pause_running_job_sets_pause_request(client, test_db: Session) -> None:

@@ -26,6 +26,7 @@ class AudioGenerationConfig:
     text: str
     voice: str
     emotion: str | None = None
+    instruction: str | None = None
     speed: float = 1.0
     sample_rate: int = 22050
 

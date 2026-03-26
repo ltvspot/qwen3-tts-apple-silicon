@@ -25,7 +25,7 @@ from src.database import (
     utc_now,
 )
 from src.pipeline.queue_manager import GenerationQueue
-from src.startup import recover_orphaned_jobs
+from src.startup import cleanup_startup_generation_state, recover_orphaned_jobs
 
 
 def _create_book(test_db: Session, *, title: str = "Recovery Book") -> Book:
@@ -164,6 +164,49 @@ def test_orphaned_chapter_reset(test_db: Session) -> None:
     assert chapter.status == ChapterStatus.PENDING
     assert chapter.started_at is None
     assert chapter.current_chunk is None
+    assert book.generation_status == BookGenerationStatus.ERROR
+
+
+def test_startup_cleanup_resets_running_jobs_and_generating_chapters(test_db: Session) -> None:
+    """Startup cleanup should clear stale queued/running state before recovery begins."""
+
+    book = _create_book(test_db, title="Startup Cleanup Book")
+    book.status = BookStatus.GENERATING
+    book.generation_status = BookGenerationStatus.GENERATING
+    chapter = _create_chapter(test_db, book_id=book.id, number=1, status=ChapterStatus.GENERATING)
+    chapter.audio_path = "stale/chapter.wav"
+    chapter.duration_seconds = 12.0
+    chapter.current_chunk = 3
+    chapter.total_chunks = 8
+    job = GenerationJob(
+        book_id=book.id,
+        chapter_id=chapter.id,
+        job_type=GenerationJobType.SINGLE_CHAPTER,
+        status=GenerationJobStatus.RUNNING,
+        progress=35.0,
+        current_chapter_progress=50.0,
+        chapters_total=1,
+        chapters_completed=0,
+        chapters_failed=0,
+        current_chapter_n=1,
+        force=False,
+    )
+    test_db.add(job)
+    test_db.commit()
+
+    cleaned_jobs, cleaned_chapters = cleanup_startup_generation_state(test_db)
+    test_db.refresh(job)
+    test_db.refresh(chapter)
+    test_db.refresh(book)
+
+    assert (cleaned_jobs, cleaned_chapters) == (1, 1)
+    assert job.status == GenerationJobStatus.FAILED
+    assert "Server restarted during generation" in (job.error_message or "")
+    assert chapter.status == ChapterStatus.PENDING
+    assert chapter.audio_path is None
+    assert chapter.duration_seconds is None
+    assert chapter.current_chunk is None
+    assert book.status == BookStatus.PARSED
     assert book.generation_status == BookGenerationStatus.ERROR
 
 

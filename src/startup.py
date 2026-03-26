@@ -31,6 +31,60 @@ _shutdown_task: asyncio.Task[None] | None = None
 
 
 @retry_on_locked()
+def cleanup_startup_generation_state(db_session: Session) -> tuple[int, int]:
+    """Reset queued/running jobs left behind by a prior process exit."""
+
+    stale_jobs = (
+        db_session.query(GenerationJob)
+        .filter(GenerationJob.status.in_((GenerationJobStatus.RUNNING, GenerationJobStatus.QUEUED)))
+        .all()
+    )
+    stale_chapters = (
+        db_session.query(Chapter)
+        .filter(Chapter.status == ChapterStatus.GENERATING)
+        .all()
+    )
+
+    for job in stale_jobs:
+        job.status = GenerationJobStatus.FAILED
+        job.completed_at = utc_now()
+        job.pause_requested = False
+        job.cancel_requested = False
+        job.current_chapter_progress = 0.0
+        job.eta_seconds = None
+        job.error_message = "Server restarted during generation. Job reset for retry."
+
+        book = db_session.query(Book).filter(Book.id == job.book_id).first()
+        if book is not None:
+            if book.status == BookStatus.GENERATING:
+                book.status = BookStatus.PARSED
+            book.generation_status = BookGenerationStatus.ERROR
+            book.generation_eta_seconds = None
+            if book.current_job_id == job.id:
+                book.current_job_id = None
+
+    for chapter in stale_chapters:
+        chapter.status = ChapterStatus.PENDING
+        chapter.audio_path = None
+        chapter.duration_seconds = None
+        chapter.started_at = None
+        chapter.completed_at = None
+        chapter.error_message = None
+        chapter.current_chunk = None
+        chapter.total_chunks = None
+        chapter.chunk_boundaries = None
+        chapter.generation_metadata = None
+
+    db_session.commit()
+    logger.info(
+        "Cleaned up %s stale jobs and %s stale chapters on startup",
+        len(stale_jobs),
+        len(stale_chapters),
+    )
+    return (len(stale_jobs), len(stale_chapters))
+
+
+@retry_on_locked()
 def recover_orphaned_jobs(db_session: Session) -> int:
     """Detect and recover generation jobs interrupted by a prior crash."""
 
@@ -106,6 +160,16 @@ def run_startup_recovery() -> int:
     session = SessionLocal()
     try:
         return recover_orphaned_jobs(session)
+    finally:
+        session.close()
+
+
+def run_startup_cleanup() -> tuple[int, int]:
+    """Reset queued/running generation state left behind by a prior process."""
+
+    session = SessionLocal()
+    try:
+        return cleanup_startup_generation_state(session)
     finally:
         session.close()
 

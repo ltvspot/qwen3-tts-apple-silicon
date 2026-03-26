@@ -203,6 +203,7 @@ class Book(Base):
         nullable=False,
         default=BookExportStatus.IDLE,
     )
+    pronunciation_watchlist: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     chapters: Mapped[list["Chapter"]] = relationship(
         back_populates="book",
@@ -554,6 +555,7 @@ engine = create_database_engine(settings.DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, expire_on_commit=False)
 
 
+@retry_on_locked(max_retries=10, backoff_ms=250)
 def init_db() -> None:
     """Create all database tables if they do not already exist."""
 
@@ -562,6 +564,7 @@ def init_db() -> None:
     _migrate_sqlite_schema()
 
 
+@retry_on_locked(max_retries=10, backoff_ms=250)
 def _migrate_sqlite_schema() -> None:
     """Apply lightweight additive schema migrations for the local SQLite database."""
 
@@ -576,6 +579,7 @@ def _migrate_sqlite_schema() -> None:
             "current_job_id": "INTEGER",
             "last_export_date": "DATETIME",
             "export_status": "VARCHAR(32) NOT NULL DEFAULT 'idle'",
+            "pronunciation_watchlist": "TEXT",
         },
         "chapters": {
             "started_at": "DATETIME",

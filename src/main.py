@@ -36,7 +36,7 @@ from src.config import get_application_settings, reset_settings_manager, setting
 from src.database import init_db, utc_now
 from src.health_checks import get_disk_space_snapshot, run_all_health_checks
 from src.logging_config import configure_logging
-from src.startup import graceful_shutdown, install_signal_handlers, run_startup_recovery
+from src.startup import graceful_shutdown, install_signal_handlers, run_startup_cleanup, run_startup_recovery
 
 configure_logging(level=settings.LOG_LEVEL)
 logger = logging.getLogger(__name__)
@@ -67,6 +67,7 @@ async def lifespan(app: FastAPI):
     logger.info("Starting Alexandria Audiobook Narrator %s", __version__)
     ensure_runtime_directories()
     init_db()
+    run_startup_cleanup()
     run_startup_recovery()
     reset_settings_manager()
     application_settings = get_application_settings()
