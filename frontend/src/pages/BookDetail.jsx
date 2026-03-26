@@ -189,6 +189,7 @@ export default function BookDetail() {
   const exportNeedsRefresh = (
     exportHasArtifacts &&
     mergedChapters.length > 0 &&
+    lastExportChapterCount > 0 &&
     lastExportChapterCount < mergedChapters.length
   );
   const exportStatusLabel = exportSnapshot?.export_status === "processing"

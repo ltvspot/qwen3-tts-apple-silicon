@@ -883,6 +883,98 @@ describe("BookDetail page", () => {
     });
   });
 
+  test("does not show a stale partial-export warning when recovered exports have downloads but no qa report", async () => {
+    const book = createBook({});
+    const chapters = [
+      createChapter({
+        audio_path: "7-the-test-chronicle/chapters/00-opening-credits.wav",
+        audio_file_size_bytes: 19000000,
+        completed_at: "2026-03-24T00:00:47+00:00",
+        duration_seconds: 252,
+        id: 701,
+        status: "generated",
+        title: "Opening Credits",
+      }),
+      createChapter({
+        audio_path: "7-the-test-chronicle/chapters/01-chapter-one.wav",
+        audio_file_size_bytes: 21000000,
+        completed_at: "2026-03-24T00:02:00+00:00",
+        duration_seconds: 500,
+        id: 702,
+        number: 1,
+        status: "generated",
+        text_content: "Chapter one text.",
+        title: "Chapter One",
+        type: "chapter",
+        word_count: 500,
+      }),
+      createChapter({
+        audio_path: "7-the-test-chronicle/chapters/02-chapter-two.wav",
+        audio_file_size_bytes: 20000000,
+        completed_at: "2026-03-24T00:03:00+00:00",
+        duration_seconds: 480,
+        id: 703,
+        number: 2,
+        status: "generated",
+        text_content: "Chapter two text.",
+        title: "Chapter Two",
+        type: "chapter",
+        word_count: 500,
+      }),
+    ];
+
+    fetchMock
+      .mockResolvedValueOnce(createJsonResponse(book))
+      .mockResolvedValueOnce(createJsonResponse(chapters))
+      .mockResolvedValueOnce(createJsonResponse(createStatusSnapshot({
+        chapters: chapters.map((chapter) => ({
+          audio_duration_seconds: chapter.duration_seconds,
+          audio_file_size_bytes: chapter.audio_file_size_bytes,
+          chapter_n: chapter.number,
+          error_message: null,
+          generated_at: chapter.completed_at,
+          generation_seconds: 47.2,
+          expected_total_seconds: 23.4,
+          progress_seconds: null,
+          started_at: "2026-03-24T00:00:00+00:00",
+          status: "completed",
+        })),
+      })))
+      .mockResolvedValueOnce(createJsonResponse(createExportSnapshot({
+        completed_at: "2026-03-24T00:10:00+00:00",
+        current_stage: "Export completed",
+        export_status: "completed",
+        formats: {
+          mp3: {
+            completed_at: "2026-03-24T00:10:00+00:00",
+            download_url: "/api/book/7/export/download/mp3",
+            error_message: null,
+            file_name: "The Test Chronicle.mp3",
+            file_size_bytes: 487923048,
+            status: "completed",
+          },
+          m4b: {
+            completed_at: "2026-03-24T00:10:00+00:00",
+            download_url: "/api/book/7/export/download/m4b",
+            error_message: null,
+            file_name: "The Test Chronicle.m4b",
+            file_size_bytes: 341234056,
+            status: "completed",
+          },
+        },
+        qa_report: null,
+      })))
+      .mockResolvedValueOnce(createJsonResponse(createVoiceListPayload()));
+
+    await renderBookDetail();
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("Ready to download");
+      expect(container.textContent).not.toContain("Past export available");
+      expect(container.textContent).not.toContain("missing from the latest export");
+    });
+  });
+
   test("renders real export progress instead of a fake placeholder bar", async () => {
     const book = createBook({});
     const chapters = [createChapter({ status: "generated", audio_path: "7-the-test-chronicle/chapters/00-opening-credits.wav" })];

@@ -308,6 +308,8 @@ def test_startup_export_cleanup_recovers_existing_files(test_db: Session) -> Non
     assert (recovered, timed_out) == (1, 0)
     assert export_job.export_status == BookExportStatus.COMPLETED
     assert export_job.progress_percent == 100.0
+    assert export_job.current_stage == "Export completed"
+    assert export_job.qa_report is not None
     assert book.export_status == BookExportStatus.COMPLETED
     assert book.status == BookStatus.EXPORTED
 
@@ -356,6 +358,8 @@ def test_startup_export_cleanup_creates_job_for_manual_exports(test_db: Session)
     assert (recovered, timed_out) == (1, 0)
     assert export_job.export_status == BookExportStatus.COMPLETED
     assert export_job.progress_percent == 100.0
+    assert export_job.current_stage == "Export completed"
+    assert export_job.qa_report is not None
     assert book.export_status == BookExportStatus.COMPLETED
 
 

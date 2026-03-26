@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from pydub import AudioSegment
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -921,17 +921,31 @@ def reconcile_export_job_state(
         formats_requested=requested_formats,
     )
 
-    if found_any and export_job.export_status in {BookExportStatus.PROCESSING, BookExportStatus.ERROR}:
+    should_recover_completed_metadata = (
+        export_job.export_status in {BookExportStatus.PROCESSING, BookExportStatus.ERROR}
+        or not export_job.qa_report
+        or export_job.current_stage == "Recovered from existing export files"
+    )
+    if found_any and should_recover_completed_metadata:
+        recovered_qa_report = _load_recovered_qa_report(
+            db_session,
+            book=book,
+            include_only_approved=export_job.include_only_approved,
+            export_date=completed_at or now,
+        )
         export_job.export_status = BookExportStatus.COMPLETED
         export_job.progress_percent = 100.0
-        export_job.current_stage = "Recovered from existing export files"
+        export_job.current_stage = "Export completed"
         export_job.current_format = None
         export_job.completed_at = completed_at or now
         export_job.updated_at = now
         export_job.error_message = None
+        export_job.current_chapter_n = recovered_qa_report.chapters_included
+        export_job.total_chapters = recovered_qa_report.chapters_included
         export_job.format_details = json.dumps(
             {name: result.model_dump(mode="json") for name, result in format_details.items()}
         )
+        export_job.qa_report = recovered_qa_report.model_dump_json()
         book.export_status = BookExportStatus.COMPLETED
         book.last_export_date = export_job.completed_at
         book.status = BookStatus.EXPORTED
@@ -968,6 +982,12 @@ def reconcile_book_export_artifacts(db_session: Session, book: Book) -> bool:
 
     created_at = completed_at or utc_now()
     completed_formats = [name for name, result in format_details.items() if result.status == "completed"]
+    recovered_qa_report = _load_recovered_qa_report(
+        db_session,
+        book=book,
+        include_only_approved=True,
+        export_date=created_at,
+    )
     export_job = ExportJob(
         book_id=book.id,
         job_token=f"recovered_export_{book.id}_{created_at.strftime('%Y%m%d_%H%M%S')}",
@@ -975,17 +995,17 @@ def reconcile_book_export_artifacts(db_session: Session, book: Book) -> bool:
         formats_requested=json.dumps(completed_formats or list(DEFAULT_EXPORT_FORMATS)),
         format_details=json.dumps({name: result.model_dump(mode="json") for name, result in format_details.items()}),
         progress_percent=100.0,
-        current_stage="Recovered from existing export files",
+        current_stage="Export completed",
         current_format=None,
-        current_chapter_n=None,
-        total_chapters=None,
+        current_chapter_n=recovered_qa_report.chapters_included,
+        total_chapters=recovered_qa_report.chapters_included,
         include_only_approved=True,
         created_at=created_at,
         started_at=created_at,
         completed_at=created_at,
         updated_at=utc_now(),
         error_message=None,
-        qa_report=None,
+        qa_report=recovered_qa_report.model_dump_json(),
     )
     db_session.add(export_job)
     book.export_status = BookExportStatus.COMPLETED
@@ -993,6 +1013,88 @@ def reconcile_book_export_artifacts(db_session: Session, book: Book) -> bool:
     book.status = BookStatus.EXPORTED
     db_session.commit()
     return True
+
+
+def _build_recovered_qa_report(
+    db_session: Session,
+    *,
+    book: Book,
+    include_only_approved: bool,
+    export_date: datetime,
+) -> QAReport:
+    """Rebuild enough export QA metadata when only the output files remain."""
+
+    chapters = (
+        db_session.query(Chapter)
+        .filter(Chapter.book_id == book.id)
+        .order_by(Chapter.number, Chapter.id)
+        .all()
+    )
+    qa_records = {
+        record.chapter_n: record
+        for record in db_session.query(ChapterQARecord).filter(ChapterQARecord.book_id == book.id).all()
+    }
+
+    selected: list[SelectedChapter] = []
+    skipped_notes: list[str] = []
+    for chapter in chapters:
+        qa_record = qa_records.get(chapter.number)
+        if chapter.status != ChapterStatus.GENERATED or not chapter.audio_path:
+            if chapter.status != ChapterStatus.GENERATED:
+                skipped_notes.append(f"Skipped chapter {chapter.number}: audio not generated.")
+            continue
+        if qa_record is not None and qa_record.manual_status == QAManualStatus.FLAGGED:
+            skipped_notes.append(f"Skipped chapter {chapter.number}: manually flagged during QA.")
+            continue
+        if include_only_approved and not _chapter_is_approved(chapter, qa_record):
+            skipped_notes.append(f"Skipped chapter {chapter.number}: not QA approved.")
+            continue
+
+        selected.append(
+            SelectedChapter(
+                chapter_n=chapter.number,
+                chapter_title=_chapter_display_title(chapter),
+                chapter_type=chapter.type,
+                audio_path=Path(chapter.audio_path),
+                file_size_bytes=chapter.audio_file_size_bytes or 0,
+                duration_seconds=chapter.duration_seconds or 0.0,
+                qa_status=_chapter_effective_qa_status(chapter, qa_record),
+                export_approved=_chapter_is_approved(chapter, qa_record),
+            )
+        )
+
+    recovered_report = _build_qa_report(
+        book=book,
+        included_chapters=selected,
+        qa_records=qa_records,
+        skipped_notes=skipped_notes,
+        additional_notes=["Recovered export metadata from existing export files."],
+    )
+    return recovered_report.model_copy(update={"export_date": export_date})
+
+
+def _load_recovered_qa_report(
+    db_session: Session,
+    *,
+    book: Book,
+    include_only_approved: bool,
+    export_date: datetime,
+) -> QAReport:
+    """Load an existing QA report from disk when possible, or rebuild a minimal replacement."""
+
+    qa_report_path = _build_export_paths(book)["qa_report"]
+    if qa_report_path.exists():
+        try:
+            return QAReport.model_validate_json(qa_report_path.read_text(encoding="utf-8"))
+        except (OSError, ValidationError, json.JSONDecodeError) as exc:
+            logger.warning("Failed to load recovered QA report for book %s: %s", book.id, exc)
+
+    return _build_recovered_qa_report(
+        db_session,
+        book=book,
+        include_only_approved=include_only_approved,
+        export_date=export_date,
+    )
 
 
 def _build_qa_report(

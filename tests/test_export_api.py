@@ -385,6 +385,41 @@ def test_get_export_status_returns_live_progress_fields(client, test_db: Session
     assert payload["total_chapters"] == 10
 
 
+def test_get_export_status_recovery_populates_qa_report_and_completion_stage(client, test_db: Session) -> None:
+    """Recovered export artifacts should return a usable QA report and a completed stage label."""
+
+    book = _create_book(test_db, title="Recovered Export Status")
+    _create_ready_chapter(test_db, book_id=book.id, number=1)
+    export_job = ExportJob(
+        book_id=book.id,
+        job_token=f"export_{book.id}_20260324_151000",
+        export_status=BookExportStatus.COMPLETED,
+        formats_requested=json.dumps(["mp3"]),
+        format_details=json.dumps({"mp3": {"status": "pending"}}),
+        progress_percent=100.0,
+        current_stage="Recovered from existing export files",
+        include_only_approved=True,
+        started_at=utc_now(),
+        updated_at=utc_now(),
+    )
+    test_db.add(export_job)
+    book.export_status = BookExportStatus.PROCESSING
+    test_db.commit()
+
+    output_path = get_export_output_path(book, "mp3")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(b"recovered mp3")
+
+    response = client.get(f"/api/book/{book.id}/export/status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["export_status"] == "completed"
+    assert payload["current_stage"] == "Export completed"
+    assert payload["qa_report"]["chapters_included"] == 1
+    assert "Recovered export metadata" in payload["qa_report"]["notes"]
+
+
 def test_cancel_export_marks_job_and_book_as_error(client, test_db: Session) -> None:
     """Force-cancelling an export should release the book for a later retry."""
 
