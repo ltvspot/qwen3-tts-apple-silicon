@@ -14,6 +14,7 @@ def test_health_check(client: TestClient) -> None:
     assert payload["version"] == "0.1.0"
     assert isinstance(payload["startup"]["warnings"], list)
     assert isinstance(payload["startup"]["errors"], list)
-    assert len(payload["startup"]["checks"]) == 7
+    assert len(payload["startup"]["checks"]) == 8
+    assert any(check["name"] == "mlx-audio Import" for check in payload["startup"]["checks"])
     assert {"name", "status", "detail", "critical"} <= set(payload["startup"]["checks"][0])
     assert {"total_gb", "free_gb", "percent_used"} <= set(payload["disk"])

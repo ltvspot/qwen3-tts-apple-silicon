@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import logging
 import os
 import shutil
@@ -130,6 +131,31 @@ async def check_model_files_exist() -> None:
         )
 
 
+def mlx_backend_required() -> bool:
+    """Return whether the active runtime configuration expects the MLX backend."""
+
+    backend = settings.TTS_BACKEND.strip().lower()
+    if backend == "synthetic":
+        return False
+    if backend == "auto" and os.environ.get("PYTEST_CURRENT_TEST"):
+        return False
+    return True
+
+
+async def check_mlx_audio_import() -> None:
+    """Verify that mlx-audio imports cleanly when the MLX backend is required."""
+
+    if not mlx_backend_required():
+        return
+
+    try:
+        await asyncio.to_thread(importlib.import_module, "mlx_audio.tts.utils")
+    except Exception as exc:  # pragma: no cover - exercised through tests
+        raise HealthCheckError(
+            "mlx-audio import failed. Reinstall it with `pip install -U mlx-audio`."
+        ) from exc
+
+
 async def check_ffmpeg_installed() -> None:
     """Verify that ffmpeg is available for export-related operations."""
 
@@ -227,6 +253,7 @@ async def run_all_health_checks() -> StartupHealthSummary:
     checks = [
         RegisteredHealthCheck("Database Connection", check_database_connection, True),
         RegisteredHealthCheck("TTS Model Files", check_model_files_exist, True),
+        RegisteredHealthCheck("mlx-audio Import", check_mlx_audio_import, True),
         RegisteredHealthCheck("ffmpeg Installation", check_ffmpeg_installed, False, "warn"),
         RegisteredHealthCheck("Manuscript Folder", check_manuscript_folder_exists, False, "warn"),
         RegisteredHealthCheck("Output Directory", check_output_directory_writable, True),

@@ -62,6 +62,39 @@ async def test_check_output_directory_writable_ignores_cleanup_failures(
 
 
 @pytest.mark.asyncio
+async def test_check_mlx_audio_import_reports_install_hint(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A broken mlx-audio import should produce an actionable install hint when MLX is required."""
+
+    monkeypatch.setattr(health_checks.settings, "TTS_BACKEND", "mlx")
+
+    def raise_import_error(name: str):
+        del name
+        raise ModuleNotFoundError("mlx_audio")
+
+    monkeypatch.setattr(health_checks.importlib, "import_module", raise_import_error)
+
+    with pytest.raises(HealthCheckError, match="pip install -U mlx-audio"):
+        await health_checks.check_mlx_audio_import()
+
+
+@pytest.mark.asyncio
+async def test_check_mlx_audio_import_skips_when_synthetic_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Synthetic backend runs should not require mlx-audio at startup."""
+
+    monkeypatch.setattr(health_checks.settings, "TTS_BACKEND", "synthetic")
+
+    def raise_import_error(name: str):
+        del name
+        raise AssertionError("mlx-audio import should not be attempted")
+
+    monkeypatch.setattr(health_checks.importlib, "import_module", raise_import_error)
+
+    await health_checks.check_mlx_audio_import()
+
+
+@pytest.mark.asyncio
 async def test_check_disk_space_warns_before_critical_threshold(monkeypatch: pytest.MonkeyPatch) -> None:
     """Disk usage above 90% should warn without aborting startup."""
 
@@ -148,6 +181,7 @@ async def test_run_all_health_checks_returns_warning_summary_for_noncritical_fai
 
     monkeypatch.setattr(health_checks, "check_database_connection", pass_check)
     monkeypatch.setattr(health_checks, "check_model_files_exist", pass_check)
+    monkeypatch.setattr(health_checks, "check_mlx_audio_import", pass_check)
     monkeypatch.setattr(health_checks, "check_ffmpeg_installed", ffmpeg_warning)
     monkeypatch.setattr(health_checks, "check_manuscript_folder_exists", manuscript_warning)
     monkeypatch.setattr(health_checks, "check_output_directory_writable", pass_check)
@@ -161,7 +195,16 @@ async def test_run_all_health_checks_returns_warning_summary_for_noncritical_fai
         "ffmpeg Installation: ffmpeg missing",
         "Manuscript Folder: manuscripts missing",
     ]
-    assert [check.status for check in summary.checks] == ["pass", "pass", "warn", "warn", "pass", "pass", "pass"]
+    assert [check.status for check in summary.checks] == [
+        "pass",
+        "pass",
+        "pass",
+        "warn",
+        "warn",
+        "pass",
+        "pass",
+        "pass",
+    ]
 
 
 @pytest.mark.asyncio
@@ -176,6 +219,7 @@ async def test_run_all_health_checks_raises_on_critical_failures(monkeypatch: py
 
     monkeypatch.setattr(health_checks, "check_database_connection", failing_database)
     monkeypatch.setattr(health_checks, "check_model_files_exist", pass_check)
+    monkeypatch.setattr(health_checks, "check_mlx_audio_import", pass_check)
     monkeypatch.setattr(health_checks, "check_ffmpeg_installed", pass_check)
     monkeypatch.setattr(health_checks, "check_manuscript_folder_exists", pass_check)
     monkeypatch.setattr(health_checks, "check_output_directory_writable", pass_check)

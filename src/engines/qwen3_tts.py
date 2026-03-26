@@ -258,16 +258,151 @@ class Qwen3TTS(TTSEngine):
         return [str(speaker).lower() for speaker in spk_id]
 
     def _load_mlx_model(self, path: Path) -> Any:
-        """Load an MLX model instance from disk."""
+        """Load an MLX model instance from disk without triggering mlx-audio's hanging post-load compile."""
 
         try:
-            from mlx_audio.tts.utils import load_model
+            from mlx_audio.tts.utils import MODEL_REMAPPING
+            from mlx_audio.utils import (
+                apply_quantization,
+                get_model_class,
+                load_config,
+                load_weights,
+            )
         except ImportError as exc:
             raise RuntimeError(
                 "mlx-audio is not installed. Install it with `pip install -U mlx-audio`."
             ) from exc
 
-        return load_model(path, lazy=True)
+        config = load_config(path)
+        config["model_path"] = str(path)
+
+        model_name = path.name.lower().split("-")
+        model_type = config.get("model_type") or config.get("architecture") or model_name[0]
+        model_class, resolved_model_type = get_model_class(
+            model_type=model_type,
+            model_name=model_name,
+            category="tts",
+            model_remapping=MODEL_REMAPPING,
+        )
+        if resolved_model_type != "qwen3_tts":
+            raise RuntimeError(f"Unsupported MLX TTS model type for Qwen3TTS adapter: {resolved_model_type}")
+
+        model_config = (
+            model_class.ModelConfig.from_dict(config)
+            if hasattr(model_class, "ModelConfig")
+            else config
+        )
+        model = model_class.Model(model_config)
+
+        weights = load_weights(path)
+        if hasattr(model, "sanitize"):
+            weights = model.sanitize(weights)
+
+        apply_quantization(model, config, weights, getattr(model, "model_quant_predicate", None))
+        model.load_weights(list(weights.items()), strict=True)
+        model.eval()
+
+        model.tokenizer = self._load_tokenizer_for_model(path)
+        model.load_speech_tokenizer(self._load_speech_tokenizer_for_model(path))
+
+        generation_config_path = path / "generation_config.json"
+        if generation_config_path.exists():
+            model.load_generate_config(json.loads(generation_config_path.read_text(encoding="utf-8")))
+
+        return model
+
+    def _load_tokenizer_for_model(self, model_path: Path) -> Any:
+        """Load the text tokenizer required by Qwen3-TTS generation."""
+
+        try:
+            from transformers import AutoTokenizer
+        except ImportError as exc:
+            raise RuntimeError(
+                "transformers is not installed. Install it with `pip install -U transformers`."
+            ) from exc
+
+        try:
+            return AutoTokenizer.from_pretrained(str(model_path))
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load tokenizer from {model_path}: {exc}") from exc
+
+    def _load_speech_tokenizer_for_model(self, model_path: Path) -> Any:
+        """Load the Qwen3-TTS speech tokenizer without compiling the decoder."""
+
+        speech_tokenizer_path = model_path / "speech_tokenizer"
+        if not speech_tokenizer_path.exists():
+            raise RuntimeError(f"Speech tokenizer not found at {speech_tokenizer_path}")
+
+        try:
+            import mlx.core as mx
+            from mlx_audio.tts.models.qwen3_tts.config import (
+                Qwen3TTSTokenizerConfig,
+                Qwen3TTSTokenizerDecoderConfig,
+                Qwen3TTSTokenizerEncoderConfig,
+                filter_dict_for_dataclass,
+            )
+            from mlx_audio.tts.models.qwen3_tts.speech_tokenizer import (
+                Qwen3TTSSpeechTokenizer,
+            )
+        except ImportError as exc:
+            raise RuntimeError(
+                "mlx-audio Qwen3-TTS speech tokenizer dependencies are not installed correctly."
+            ) from exc
+
+        config_path = speech_tokenizer_path / "config.json"
+        if not config_path.exists():
+            raise RuntimeError(f"Speech tokenizer config not found at {config_path}")
+
+        tokenizer_config_dict = json.loads(config_path.read_text(encoding="utf-8"))
+
+        decoder_config = None
+        encoder_config = None
+
+        if "decoder_config" in tokenizer_config_dict:
+            filtered = filter_dict_for_dataclass(
+                Qwen3TTSTokenizerDecoderConfig,
+                tokenizer_config_dict["decoder_config"],
+            )
+            decoder_config = Qwen3TTSTokenizerDecoderConfig(**filtered)
+        if "encoder_config" in tokenizer_config_dict:
+            filtered = filter_dict_for_dataclass(
+                Qwen3TTSTokenizerEncoderConfig,
+                tokenizer_config_dict["encoder_config"],
+            )
+            encoder_config = Qwen3TTSTokenizerEncoderConfig(**filtered)
+
+        tokenizer_config = Qwen3TTSTokenizerConfig(
+            encoder_config=encoder_config,
+            decoder_config=decoder_config,
+        )
+        for key, value in tokenizer_config_dict.items():
+            if key not in {"decoder_config", "encoder_config"} and hasattr(tokenizer_config, key):
+                setattr(tokenizer_config, key, value)
+
+        speech_tokenizer = Qwen3TTSSpeechTokenizer(tokenizer_config)
+        tokenizer_weights: dict[str, Any] = {}
+        for weight_file in sorted(speech_tokenizer_path.glob("*.safetensors")):
+            tokenizer_weights.update(mx.load(str(weight_file)))
+        if not tokenizer_weights:
+            raise RuntimeError(f"No speech tokenizer weights found in {speech_tokenizer_path}")
+
+        tokenizer_weights = Qwen3TTSSpeechTokenizer.sanitize(tokenizer_weights)
+        speech_tokenizer.load_weights(list(tokenizer_weights.items()), strict=False)
+        mx.eval(speech_tokenizer.parameters())
+        speech_tokenizer.eval()
+
+        if speech_tokenizer.encoder_model is not None:
+            quantizer = speech_tokenizer.encoder_model.quantizer
+            for layer in quantizer.rvq_first.vq.layers:
+                layer.codebook.update_in_place()
+            for layer in quantizer.rvq_rest.vq.layers:
+                layer.codebook.update_in_place()
+
+        logger.info(
+            "Loaded Qwen3-TTS speech tokenizer from %s without decoder compilation",
+            speech_tokenizer_path,
+        )
+        return speech_tokenizer
 
     def _ensure_base_model_loaded(self) -> Any:
         """Load the Base model on demand for voice-cloned synthesis."""

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -53,6 +54,91 @@ def test_qwen3_engine_load_and_unload() -> None:
 
     engine.unload()
     assert engine.loaded is False
+
+
+def test_manual_mlx_loader_bypasses_generic_load_model(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The adapter should use the manual load path instead of mlx-audio's generic load_model helper."""
+
+    import mlx_audio.tts.utils as tts_utils
+    import mlx_audio.utils as mlx_utils
+
+    class FakeModelConfig:
+        @classmethod
+        def from_dict(cls, payload: dict[str, object]) -> dict[str, object]:
+            return dict(payload)
+
+    class FakeModel:
+        def __init__(self, config: dict[str, object]) -> None:
+            self.config = config
+            self.loaded_weights: list[tuple[list[tuple[str, object]], bool]] = []
+            self.tokenizer = None
+            self.speech_tokenizer = None
+            self.generate_config = None
+
+        def sanitize(self, weights: dict[str, object]) -> dict[str, object]:
+            return {"sanitized": weights["layer.weight"]}
+
+        def model_quant_predicate(self, path: str, module: object) -> bool:
+            del path, module
+            return True
+
+        def load_weights(self, items: list[tuple[str, object]], strict: bool = False) -> None:
+            self.loaded_weights.append((items, strict))
+
+        def eval(self) -> None:
+            return None
+
+        def load_speech_tokenizer(self, speech_tokenizer: object) -> None:
+            self.speech_tokenizer = speech_tokenizer
+
+        def load_generate_config(self, generate_config: dict[str, object]) -> None:
+            self.generate_config = generate_config
+
+    fake_arch = SimpleNamespace(ModelConfig=FakeModelConfig, Model=FakeModel)
+    quantization_calls: list[tuple[object, dict[str, object], dict[str, object], object]] = []
+    tokenizer = object()
+    speech_tokenizer = object()
+
+    monkeypatch.setattr(
+        tts_utils,
+        "load_model",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("generic load_model should not be used")),
+    )
+    monkeypatch.setattr(
+        mlx_utils,
+        "load_config",
+        lambda model_path: {"model_type": "qwen3_tts", "quantization": {"bits": 4, "group_size": 64}},
+    )
+    monkeypatch.setattr(
+        mlx_utils,
+        "get_model_class",
+        lambda *, model_type, model_name, category, model_remapping: (fake_arch, model_type),
+    )
+    monkeypatch.setattr(mlx_utils, "load_weights", lambda model_path: {"layer.weight": "weights"})
+    monkeypatch.setattr(
+        mlx_utils,
+        "apply_quantization",
+        lambda model, config, weights, predicate: quantization_calls.append((model, config, weights, predicate)),
+    )
+
+    engine = Qwen3TTS(backend="mlx")
+    monkeypatch.setattr(engine, "_load_tokenizer_for_model", lambda model_path: tokenizer)
+    monkeypatch.setattr(engine, "_load_speech_tokenizer_for_model", lambda model_path: speech_tokenizer)
+
+    generation_config_path = tmp_path / "generation_config.json"
+    generation_config_path.write_text(json.dumps({"temperature": 0.6}), encoding="utf-8")
+
+    loaded_model = engine._load_mlx_model(tmp_path)
+
+    assert isinstance(loaded_model, FakeModel)
+    assert loaded_model.loaded_weights == [([("sanitized", "weights")], True)]
+    assert loaded_model.tokenizer is tokenizer
+    assert loaded_model.speech_tokenizer is speech_tokenizer
+    assert loaded_model.generate_config == {"temperature": 0.6}
+    assert len(quantization_calls) == 1
 
 
 def test_list_voices() -> None:
