@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from src.config import settings
 from src.database import Book, BookStatus, Chapter, ChapterStatus, ChapterType
 from src.pipeline.book_mastering import BookMasteringPipeline
-from src.pipeline.book_qa import BookQAReport, _leading_silence_ms, _trailing_silence_ms
+from src.pipeline.book_qa import ACX_REQUIREMENTS, BookQAReport, _leading_silence_ms, _trailing_silence_ms, _true_peak_dbfs
 from src.pipeline.qa_checker import QAResult
 
 FRAME_RATE = 44100
@@ -42,7 +42,7 @@ def mastering_verification_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("src.pipeline.book_mastering.run_qa_checks_for_chapter", fake_run_qa_checks_for_chapter)
     monkeypatch.setattr(
         "src.pipeline.book_mastering.run_book_qa",
-        lambda book_id, db_session: BookQAReport(
+        lambda book_id, db_session, export_mode=False: BookQAReport(
             book_id=book_id,
             title="Mastered Book",
             total_chapters=1,
@@ -199,7 +199,7 @@ def test_master_book_peak_limits(test_db: Session, monkeypatch: pytest.MonkeyPat
     report = BookMasteringPipeline().master_book_sync(book.id, test_db)
 
     mastered = AudioSegment.from_file(audio_path)
-    assert mastered.max_dBFS <= -1.4
+    assert _true_peak_dbfs(mastered) <= ACX_REQUIREMENTS["peak_max_db"]
     assert report.peak_limited_chapters in ([], [1])
 
 
@@ -229,6 +229,29 @@ def test_master_book_fast_chain_completes_and_resamples(test_db: Session, monkey
     assert report.notes[0] == "Using fast ffmpeg mastering chain for export-scale audio."
     assert "Resampled 1 chapters" in " ".join(report.notes)
     assert report.peak_limited_chapters == [1]
+
+
+def test_master_book_fast_chain_true_peak_meets_acx_limit(test_db: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The fast mastering path should keep true peak below the ACX ceiling."""
+
+    book = _create_book(test_db, title="Fast Chain Peak Limit")
+    chapter = _create_chapter(
+        test_db,
+        book=book,
+        number=1,
+        audio=(
+            AudioSegment.silent(duration=900, frame_rate=FRAME_RATE)
+            + _tone(2500, gain_db=-0.1)
+            + AudioSegment.silent(duration=1800, frame_rate=FRAME_RATE)
+        ),
+    )
+    audio_path = Path(settings.OUTPUTS_PATH) / chapter.audio_path
+    monkeypatch.setattr("src.pipeline.book_mastering.measure_integrated_lufs", lambda *_args, **_kwargs: -20.0)
+
+    BookMasteringPipeline().master_book_sync(book.id, test_db, prefer_fast_chain=True)
+
+    mastered = AudioSegment.from_file(audio_path)
+    assert _true_peak_dbfs(mastered) <= ACX_REQUIREMENTS["peak_max_db"]
 
 
 def test_master_book_preserves_good_audio(test_db: Session, monkeypatch: pytest.MonkeyPatch) -> None:

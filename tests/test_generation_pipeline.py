@@ -11,6 +11,7 @@ from pathlib import Path
 import pytest
 from pydub import AudioSegment
 from pydub.generators import Sine
+from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker
 
 from src.api import generation as generation_api
@@ -922,3 +923,39 @@ def test_status_endpoints_surface_generation_errors(client, test_db: Session) ->
     assert payload["status"] == "error"
     assert payload["chapters"][0]["status"] == "error"
     assert payload["chapters"][0]["error_message"] == "Synthetic generation failure."
+
+
+def test_book_status_endpoint_repairs_invalid_generation_job_statuses(client, test_db: Session) -> None:
+    """Status polling should repair legacy generation job enum values instead of returning 500."""
+
+    book = create_book(test_db, title="Repair Job Status Book")
+    create_chapter(
+        test_db,
+        book_id=book.id,
+        number=1,
+        title="Chapter One",
+        chapter_type=ChapterType.CHAPTER,
+        text="Status repair regression coverage.",
+    )
+    job = GenerationJob(
+        book_id=book.id,
+        status=GenerationJobStatus.FAILED,
+        progress=0.0,
+        current_chapter_progress=0.0,
+        chapters_total=1,
+        chapters_completed=0,
+        chapters_failed=1,
+        force=False,
+    )
+    test_db.add(job)
+    test_db.commit()
+    test_db.execute(text("UPDATE generation_jobs SET status = 'error' WHERE id = :job_id"), {"job_id": job.id})
+    test_db.commit()
+
+    response = client.get(f"/api/book/{book.id}/status")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "idle"
+    repaired_job = test_db.query(GenerationJob).filter(GenerationJob.id == job.id).one()
+    assert repaired_job.status == GenerationJobStatus.FAILED

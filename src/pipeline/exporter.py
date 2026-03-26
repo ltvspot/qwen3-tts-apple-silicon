@@ -589,7 +589,7 @@ def normalize_loudness(
         "-i",
         str(input_wav),
         "-af",
-        f"loudnorm=I={target_lufs}:TP=-1.5:LRA=11",
+        f"loudnorm=I={target_lufs}:TP={BookMasteringPipeline.PEAK_TARGET_DBFS}:LRA=11",
         str(output_wav),
     ]
     run_ffmpeg(command)
@@ -1190,6 +1190,7 @@ def export_book_sync(
             book_id,
             mastering_session,
             prefer_fast_chain=True,
+            export_mode=True,
             progress_callback=report_mastering_progress,
             session_factory=session_factory,
         )

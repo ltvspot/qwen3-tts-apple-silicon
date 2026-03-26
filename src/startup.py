@@ -7,6 +7,7 @@ import logging
 import signal
 from datetime import timedelta
 
+from sqlalchemy import text
 from sqlalchemy.orm import Session
 
 from src.api.generation_runtime import peek_queue, shutdown_generation_runtime
@@ -32,11 +33,54 @@ STALE_THRESHOLD_MINUTES = 5
 _draining = False
 _shutdown_task: asyncio.Task[None] | None = None
 
+_VALID_GENERATION_JOB_STATUSES = tuple(status.name for status in GenerationJobStatus)
+
+
+def repair_invalid_generation_job_statuses(db_session: Session, *, book_id: int | None = None) -> int:
+    """Repair legacy or invalid generation job statuses before ORM enum coercion runs."""
+
+    repaired_at = utc_now()
+    conditions = [
+        "status IS NOT NULL",
+        f"status NOT IN ({', '.join(repr(status) for status in _VALID_GENERATION_JOB_STATUSES)})",
+    ]
+    parameters: dict[str, object] = {
+        "failed_status": GenerationJobStatus.FAILED.name,
+        "repaired_at": repaired_at,
+        "repair_message": "Legacy invalid generation job status repaired to failed.",
+    }
+    if book_id is not None:
+        conditions.append("book_id = :book_id")
+        parameters["book_id"] = book_id
+
+    statement = text(
+        f"""
+        UPDATE generation_jobs
+        SET status = :failed_status,
+            completed_at = COALESCE(completed_at, :repaired_at),
+            updated_at = :repaired_at,
+            pause_requested = 0,
+            cancel_requested = 0,
+            error_message = COALESCE(error_message, :repair_message)
+        WHERE {' AND '.join(conditions)}
+        """
+    )
+    result = db_session.execute(statement, parameters)
+    repaired = int(result.rowcount or 0)
+    if repaired:
+        logger.warning(
+            "Repaired %s generation job row(s) with invalid statuses%s",
+            repaired,
+            f" for book {book_id}" if book_id is not None else "",
+        )
+    return repaired
+
 
 @retry_on_locked()
 def cleanup_startup_generation_state(db_session: Session) -> tuple[int, int]:
     """Reset queued/running jobs left behind by a prior process exit."""
 
+    repair_invalid_generation_job_statuses(db_session)
     stale_jobs = (
         db_session.query(GenerationJob)
         .filter(GenerationJob.status.in_((GenerationJobStatus.RUNNING, GenerationJobStatus.QUEUED)))
@@ -91,6 +135,7 @@ def cleanup_startup_generation_state(db_session: Session) -> tuple[int, int]:
 def recover_orphaned_jobs(db_session: Session) -> int:
     """Detect and recover generation jobs interrupted by a prior crash."""
 
+    repair_invalid_generation_job_statuses(db_session)
     stale_cutoff = utc_now() - timedelta(minutes=STALE_THRESHOLD_MINUTES)
     orphaned_jobs = (
         db_session.query(GenerationJob)

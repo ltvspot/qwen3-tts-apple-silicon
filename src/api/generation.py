@@ -27,6 +27,7 @@ from src.database import (
 )
 from src.pipeline.manuscript_validator import ManuscriptValidator
 from src.pipeline.queue_manager import DuplicateGenerationJobError, JobInfo, QueueDrainingError
+from src.startup import repair_invalid_generation_job_statuses
 
 logger = logging.getLogger(__name__)
 
@@ -223,12 +224,25 @@ def _get_book_chapters(book_id: int, db: Session) -> list[Chapter]:
 def _get_book_jobs(book_id: int, db: Session) -> list[GenerationJob]:
     """Return generation jobs for a book ordered by creation time."""
 
-    return (
-        db.query(GenerationJob)
-        .filter(GenerationJob.book_id == book_id)
-        .order_by(GenerationJob.created_at.desc(), GenerationJob.id.desc())
-        .all()
-    )
+    def load_jobs() -> list[GenerationJob]:
+        return (
+            db.query(GenerationJob)
+            .filter(GenerationJob.book_id == book_id)
+            .order_by(GenerationJob.created_at.desc(), GenerationJob.id.desc())
+            .all()
+        )
+
+    try:
+        return load_jobs()
+    except LookupError:
+        logger.warning("Repairing invalid generation job statuses while loading book %s status", book_id, exc_info=True)
+        db.rollback()
+        repaired = repair_invalid_generation_job_statuses(db, book_id=book_id)
+        if repaired:
+            db.commit()
+            return load_jobs()
+        logger.exception("Unable to repair invalid generation job statuses for book %s", book_id)
+        return []
 
 
 def _reset_chapter_state(book_id: int, chapter: Chapter) -> None:

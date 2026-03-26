@@ -8,6 +8,7 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
+from sqlalchemy import text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -220,6 +221,34 @@ def test_startup_cleanup_resets_running_jobs_and_generating_chapters(test_db: Se
     assert chapter.current_chunk is None
     assert book.status == BookStatus.PARSED
     assert book.generation_status == BookGenerationStatus.ERROR
+
+
+def test_startup_cleanup_repairs_invalid_generation_job_statuses(test_db: Session) -> None:
+    """Legacy generation job rows with status='error' should be repaired to failed on startup."""
+
+    book = _create_book(test_db, title="Repair Invalid Status")
+    job = GenerationJob(
+        book_id=book.id,
+        job_type=GenerationJobType.FULL_BOOK,
+        status=GenerationJobStatus.FAILED,
+        progress=0.0,
+        current_chapter_progress=0.0,
+        chapters_total=1,
+        chapters_completed=0,
+        chapters_failed=1,
+        force=False,
+    )
+    test_db.add(job)
+    test_db.commit()
+    test_db.execute(text("UPDATE generation_jobs SET status = 'error' WHERE id = :job_id"), {"job_id": job.id})
+    test_db.commit()
+
+    cleaned_jobs, cleaned_chapters = cleanup_startup_generation_state(test_db)
+
+    repaired_job = test_db.query(GenerationJob).filter(GenerationJob.id == job.id).one()
+    assert (cleaned_jobs, cleaned_chapters) == (0, 0)
+    assert repaired_job.status == GenerationJobStatus.FAILED
+    assert repaired_job.error_message == "Legacy invalid generation job status repaired to failed."
 
 
 def test_fresh_job_not_recovered(test_db: Session) -> None:

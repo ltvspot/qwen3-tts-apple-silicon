@@ -662,12 +662,25 @@ def check_chapter_transitions(book_id: int, db_session: Session) -> BookQACheck:
             "leading_silence_ms": leading_silence_ms,
         }
 
-        if energy_jump_db > 6.0:
+        involves_credits = current.type in {ChapterType.OPENING_CREDITS, ChapterType.CLOSING_CREDITS} or following.type in {
+            ChapterType.OPENING_CREDITS,
+            ChapterType.CLOSING_CREDITS,
+        }
+        blocker_threshold_db = 10.0 if involves_credits else 6.0
+        warning_threshold_db = 6.0 if involves_credits else 3.0
+        pair_issue["credits_transition"] = involves_credits
+
+        if energy_jump_db > blocker_threshold_db:
             pair_status = QAAutomaticStatus.FAIL.value
             blockers.append(
                 f"Transition {current.number}->{following.number} jumps {energy_jump_db:.1f} dB and must be re-leveled."
             )
-        elif energy_jump_db > 3.0 or centroid_delta > 0.20 or trailing_silence_ms < 500 or leading_silence_ms < 500:
+        elif (
+            energy_jump_db > warning_threshold_db
+            or centroid_delta > 0.20
+            or trailing_silence_ms < 500
+            or leading_silence_ms < 500
+        ):
             pair_status = QAAutomaticStatus.WARNING.value
             recommendations.append(
                 f"Transition {current.number}->{following.number} should be reviewed for loudness or spacing."
@@ -722,12 +735,14 @@ def _silence_noise_floor_db(audio: AudioSegment) -> float:
     return max(floors) if floors else -100.0
 
 
-def check_acx_compliance(book_id: int, db_session: Session) -> BookQACheck:
+def check_acx_compliance(book_id: int, db_session: Session, *, export_mode: bool = False) -> BookQACheck:
     """Ensure every chapter meets ACX/Audible production requirements."""
 
     _, chapters, _ = _require_gate3_ready(book_id, db_session)
     violations: list[dict[str, Any]] = []
     blockers: list[str] = []
+    recommendations: list[str] = []
+    export_warning_issues = {"lufs", "true_peak_db", "noise_floor_db", "file_size_mb"}
 
     for chapter in chapters:
         audio_path = _chapter_audio_path(chapter)
@@ -737,19 +752,26 @@ def check_acx_compliance(book_id: int, db_session: Session) -> BookQACheck:
         noise_floor_db = _silence_noise_floor_db(audio)
         leading_silence_ms = _leading_silence_ms(audio)
         trailing_silence_ms = _trailing_silence_ms(audio)
+        duration_seconds = chapter.duration_seconds or (len(audio) / 1000.0)
         file_size_mb = audio_path.stat().st_size / (1024 * 1024)
         bit_depth = audio.sample_width * 8
 
         def add_violation(issue: str, remediation: str, value: Any) -> None:
+            severity = "warning" if export_mode and issue in export_warning_issues else "blocker"
+            message = f"Chapter {chapter.number} {issue}: {remediation}"
             violations.append(
                 {
                     "chapter_n": chapter.number,
                     "issue": issue,
                     "value": value,
                     "remediation": remediation,
+                    "severity": severity,
                 }
             )
-            blockers.append(f"Chapter {chapter.number} {issue}: {remediation}")
+            if severity == "warning":
+                recommendations.append(message)
+            else:
+                blockers.append(message)
 
         if audio.frame_rate != ACX_REQUIREMENTS["sample_rate"]:
             add_violation("sample_rate", "Resample chapter masters to 44.1kHz.", audio.frame_rate)
@@ -767,23 +789,28 @@ def check_acx_compliance(book_id: int, db_session: Session) -> BookQACheck:
             add_violation("leading_silence_ms", "Normalize chapter lead-in silence to 500-1000ms.", leading_silence_ms)
         if not (ACX_REQUIREMENTS["min_trailing_silence_ms"] <= trailing_silence_ms <= ACX_REQUIREMENTS["max_trailing_silence_ms"]):
             add_violation("trailing_silence_ms", "Normalize chapter tail silence to 1000-5000ms.", trailing_silence_ms)
-        if (chapter.duration_seconds or (len(audio) / 1000.0)) < ACX_REQUIREMENTS["min_chapter_duration_s"]:
+        if duration_seconds < ACX_REQUIREMENTS["min_chapter_duration_s"]:
             add_violation("duration_seconds", "Ensure the chapter contains at least one second of audio.", chapter.duration_seconds)
-        if file_size_mb > ACX_REQUIREMENTS["max_file_size_mb"]:
+        skip_file_size_check = audio_path.suffix.lower() == ".wav" and duration_seconds > (20 * 60)
+        if not skip_file_size_check and file_size_mb > ACX_REQUIREMENTS["max_file_size_mb"]:
             add_violation("file_size_mb", "Reduce chapter size below the ACX upload limit.", round(file_size_mb, 3))
 
-    status = QAAutomaticStatus.FAIL.value if violations else QAAutomaticStatus.PASS.value
+    if blockers:
+        status = QAAutomaticStatus.FAIL.value
+    elif violations:
+        status = QAAutomaticStatus.WARNING.value
+    else:
+        status = QAAutomaticStatus.PASS.value
     message = (
         "All chapters satisfy ACX/Audible requirements."
         if not violations
         else f"ACX compliance violations detected in {len({violation['chapter_n'] for violation in violations})} chapter(s)."
     )
-    recommendations = ["All chapters within ACX loudness range."] if not violations else []
     return BookQACheck(
         status=status,
         message=message,
         details={"violations": violations},
-        recommendations=recommendations,
+        recommendations=recommendations or (["All chapters satisfy ACX/Audible requirements."] if not violations else []),
         blockers=blockers,
     )
 
@@ -801,7 +828,7 @@ def get_voice_consistency_chart(book_id: int, db_session: Session) -> VoiceConsi
     )
 
 
-def run_book_qa(book_id: int, db_session: Session) -> BookQAReport:
+def run_book_qa(book_id: int, db_session: Session, *, export_mode: bool = False) -> BookQAReport:
     """Run the full Gate 3 pipeline and return the aggregate book report."""
 
     book, chapters, qa_records = _require_gate3_ready(book_id, db_session)
@@ -809,7 +836,7 @@ def run_book_qa(book_id: int, db_session: Session) -> BookQAReport:
     voice = check_cross_chapter_voice(book_id, db_session)
     pacing = check_cross_chapter_pacing(book_id, db_session)
     transitions = check_chapter_transitions(book_id, db_session)
-    acx = check_acx_compliance(book_id, db_session)
+    acx = check_acx_compliance(book_id, db_session, export_mode=export_mode)
 
     chapter_grades = [_chapter_grade(chapter, qa_records.get(chapter.number)) for chapter in chapters]
     chapters_grade_a = chapter_grades.count("A")

@@ -236,7 +236,7 @@ def test_export_book_sync_writes_mp3_m4b_and_qa_report(
     monkeypatch.setattr("src.pipeline.book_mastering.run_qa_checks_for_chapter", fake_run_qa_checks_for_chapter)
     monkeypatch.setattr(
         "src.pipeline.book_mastering.run_book_qa",
-        lambda book_id, db_session: BookQAReport(
+        lambda book_id, db_session, export_mode=False: BookQAReport(
             book_id=book_id,
             title="Signal Export",
             total_chapters=3,
@@ -485,11 +485,13 @@ def test_export_book_sync_reports_mastering_and_qa_progress_ranges(
         db_session: Session,
         *,
         prefer_fast_chain=None,
+        export_mode=False,
         progress_callback=None,
         session_factory=None,
     ) -> MasteringReport:
         del self, book_id, db_session, prefer_fast_chain, session_factory
         assert progress_callback is not None
+        assert export_mode is True
         progress_callback("mastering", 1, 2, opening)
         progress_callback("mastering", 2, 2, chapter_one)
         progress_callback("qa", 1, 2, opening)
@@ -510,10 +512,10 @@ def test_export_book_sync_reports_mastering_and_qa_progress_ranges(
                 chapters_grade_b=0,
                 chapters_grade_c=0,
                 chapters_grade_f=0,
-                overall_grade="A",
+                overall_grade="B",
                 ready_for_export=True,
                 cross_chapter_checks={},
-                recommendations=[],
+                recommendations=["Final export normalization will resolve remaining ACX mastering warnings."],
                 export_blockers=[],
             ),
         )

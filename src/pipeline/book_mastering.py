@@ -50,8 +50,8 @@ class BookMasteringPipeline:
     TARGET_LUFS = -20.0
     TARGET_LEAD_IN_MS = 750
     TARGET_TRAIL_OUT_MS = 1500
-    MAX_PEAK_DBFS = -1.5
-    PEAK_TARGET_DBFS = -1.5
+    MAX_PEAK_DBFS = ACX_REQUIREMENTS["peak_max_db"]
+    PEAK_TARGET_DBFS = -3.5
     NOISE_GATE_THRESHOLD_DBFS = -50.0
     NOISE_GATE_REDUCTION_DB = 18.0
     HIGH_PASS_HZ = 80
@@ -61,7 +61,7 @@ class BookMasteringPipeline:
     CHAPTER_MASTERING_TIMEOUT_SECONDS = 300
     FAST_CHAIN_BOOK_DURATION_SECONDS = 1800.0
     FAST_CHAIN_BOOK_BYTES = 250 * 1024 * 1024
-    FAST_CHAIN_LIMIT_LINEAR = 0.841
+    FAST_CHAIN_LIMIT_LINEAR = 0.668
 
     async def master_book(
         self,
@@ -69,6 +69,7 @@ class BookMasteringPipeline:
         db_session: Session,
         *,
         prefer_fast_chain: bool | None = None,
+        export_mode: bool = False,
         progress_callback: MasteringProgressCallback | None = None,
         session_factory: sessionmaker[Session] | None = None,
     ) -> MasteringReport:
@@ -89,6 +90,7 @@ class BookMasteringPipeline:
             book_id,
             chapters,
             db_session,
+            export_mode=export_mode,
             progress_callback=progress_callback,
             session_factory=session_factory,
         )
@@ -110,6 +112,7 @@ class BookMasteringPipeline:
         db_session: Session,
         *,
         prefer_fast_chain: bool | None = None,
+        export_mode: bool = False,
         progress_callback: MasteringProgressCallback | None = None,
         session_factory: sessionmaker[Session] | None = None,
     ) -> MasteringReport:
@@ -131,6 +134,7 @@ class BookMasteringPipeline:
                 book_id,
                 chapters,
                 db_session,
+                export_mode=export_mode,
                 progress_callback=progress_callback,
                 session_factory=session_factory,
             )
@@ -330,6 +334,7 @@ class BookMasteringPipeline:
         temporary_output = audio_path.with_suffix(".mastered.tmp.wav")
         filter_chain = ",".join(
             [
+                "agate=threshold=-60dB:ratio=4:attack=0.5:release=50",
                 f"loudnorm=I={self.TARGET_LUFS}:TP={self.PEAK_TARGET_DBFS}:LRA=11",
                 f"alimiter=limit={self.FAST_CHAIN_LIMIT_LINEAR}",
             ]
@@ -593,6 +598,7 @@ class BookMasteringPipeline:
         chapters: list[Chapter],
         db_session: Session,
         *,
+        export_mode: bool = False,
         progress_callback: MasteringProgressCallback | None = None,
         session_factory: sessionmaker[Session] | None = None,
     ) -> BookQAReport:
@@ -629,7 +635,7 @@ class BookMasteringPipeline:
                 progress_callback("qa", index, len(chapters), chapter)
 
         with verification_session_factory() as book_session:
-            return run_book_qa(book_id, book_session)
+            return run_book_qa(book_id, book_session, export_mode=export_mode)
 
     @staticmethod
     def _strip_silence(audio: AudioSegment) -> AudioSegment:

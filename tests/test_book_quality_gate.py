@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -91,6 +92,7 @@ def _create_chapter(
     title: str,
     audio: AudioSegment,
     word_count: int = 120,
+    chapter_type: ChapterType = ChapterType.CHAPTER,
 ) -> Chapter:
     """Persist one generated chapter row plus a WAV file."""
 
@@ -102,7 +104,7 @@ def _create_chapter(
         book_id=book.id,
         number=number,
         title=title,
-        type=ChapterType.CHAPTER,
+        type=chapter_type,
         text_content=f"{title} narration text.",
         word_count=word_count,
         status=ChapterStatus.GENERATED,
@@ -155,6 +157,7 @@ def _create_ready_chapter(
     audio: AudioSegment,
     word_count: int = 120,
     grade: str = "A",
+    chapter_type: ChapterType = ChapterType.CHAPTER,
 ) -> Chapter:
     """Create a chapter that already passed Gate 2."""
 
@@ -165,6 +168,7 @@ def _create_ready_chapter(
         title=title,
         audio=audio,
         word_count=word_count,
+        chapter_type=chapter_type,
     )
     _store_qa_record(test_db, chapter, grade=grade)
     return chapter
@@ -319,6 +323,35 @@ def test_chapter_transition_jarring(test_db: Session) -> None:
     assert result.blockers
 
 
+def test_chapter_transition_relaxes_threshold_for_credit_boundaries(test_db: Session) -> None:
+    """Credit transitions should warn before they block on moderate energy jumps."""
+
+    book = _create_book(test_db, title="Credit Transition Warning")
+    _create_ready_chapter(
+        test_db,
+        book=book,
+        number=0,
+        title="Opening Credits",
+        audio=_with_edges(_tone(4000, 220, gain_db=-25.0)),
+        chapter_type=ChapterType.OPENING_CREDITS,
+    )
+    _create_ready_chapter(
+        test_db,
+        book=book,
+        number=1,
+        title="Chapter One",
+        audio=_with_edges(_tone(4000, 220, gain_db=-17.0)),
+        chapter_type=ChapterType.CHAPTER,
+    )
+
+    result = check_chapter_transitions(book.id, test_db)
+
+    assert result.status == "warning"
+    assert result.blockers == []
+    assert result.details["issues"][0]["credits_transition"] is True
+    assert result.details["issues"][0]["status"] == "warning"
+
+
 def test_acx_compliance_pass(test_db: Session, monkeypatch: pytest.MonkeyPatch) -> None:
     """A properly shaped chapter should satisfy ACX validation."""
 
@@ -343,6 +376,66 @@ def test_acx_compliance_peak_violation(test_db: Session, monkeypatch: pytest.Mon
 
     assert result.status == "fail"
     assert any(violation["issue"] == "true_peak_db" for violation in result.details["violations"])
+
+
+def test_acx_compliance_export_mode_downgrades_mastering_violations(
+    test_db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Export mode should convert fixable ACX mastering issues into warnings."""
+
+    book = _create_book(test_db, title="ACX Export Warning")
+    _create_ready_chapter(test_db, book=book, number=1, title="One", audio=_with_edges(_tone(3000, 220, gain_db=-0.2)))
+    monkeypatch.setattr("src.pipeline.book_qa.measure_integrated_lufs", lambda *_args, **_kwargs: -16.0)
+
+    result = check_acx_compliance(book.id, test_db, export_mode=True)
+
+    assert result.status == "warning"
+    assert result.blockers == []
+    assert any(violation["issue"] == "lufs" and violation["severity"] == "warning" for violation in result.details["violations"])
+    assert any(violation["issue"] == "true_peak_db" and violation["severity"] == "warning" for violation in result.details["violations"])
+    assert any("true_peak_db" in recommendation for recommendation in result.recommendations)
+
+
+def test_acx_compliance_skips_long_wav_file_size_false_positive(
+    test_db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Long intermediate WAV chapters should not fail the final ACX file-size check."""
+
+    book = _create_book(test_db, title="ACX Long WAV")
+    chapter = _create_ready_chapter(test_db, book=book, number=1, title="One", audio=_with_edges(_tone(3000, 220, gain_db=-18.0)))
+    chapter.duration_seconds = 21 * 60
+    test_db.commit()
+    audio_path = Path(settings.OUTPUTS_PATH) / str(chapter.audio_path)
+    real_stat = Path.stat
+
+    def fake_stat(self: Path, *args, **kwargs):
+        stat_result = real_stat(self, *args, **kwargs)
+        if self != audio_path:
+            return stat_result
+        return os.stat_result(
+            (
+                stat_result.st_mode,
+                stat_result.st_ino,
+                stat_result.st_dev,
+                stat_result.st_nlink,
+                stat_result.st_uid,
+                stat_result.st_gid,
+                int(171.0 * 1024 * 1024),
+                int(stat_result.st_atime),
+                int(stat_result.st_mtime),
+                int(stat_result.st_ctime),
+            )
+        )
+
+    monkeypatch.setattr(Path, "stat", fake_stat)
+    monkeypatch.setattr("src.pipeline.book_qa.measure_integrated_lufs", lambda *_args, **_kwargs: -20.0)
+
+    result = check_acx_compliance(book.id, test_db)
+
+    assert result.status == "pass"
+    assert not any(violation["issue"] == "file_size_mb" for violation in result.details["violations"])
 
 
 def test_book_qa_api_endpoint(client, test_db: Session, monkeypatch: pytest.MonkeyPatch) -> None:
