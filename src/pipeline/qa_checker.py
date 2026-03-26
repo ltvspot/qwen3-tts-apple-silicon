@@ -8,6 +8,7 @@ import logging
 import re
 import shutil
 import subprocess
+import wave
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -56,6 +57,9 @@ CHECK_NAMES = (
     "lufs_compliance",
 )
 _DFT_MATRIX_CACHE: dict[int, np.ndarray] = {}
+QA_CHAPTER_TIMEOUT_SECONDS = 60
+QA_FAST_PATH_DURATION_SECONDS = 300.0
+QA_LUFS_TIMEOUT_SECONDS = 45
 CONTEXT_SILENCE_RULES = {
     "mid_sentence": {"min_ms": 0, "max_ms": 800, "expected_ms": 200},
     "sentence_boundary": {"min_ms": 300, "max_ms": 1500, "expected_ms": 600},
@@ -320,6 +324,56 @@ def _load_audio_analysis(audio_path: str | Path) -> _AudioAnalysis:
     )
 
 
+def _wav_duration_seconds(audio_path: str | Path) -> float:
+    """Read WAV duration from the file header without decoding the entire file."""
+
+    with wave.open(str(audio_path), "rb") as wav_file:
+        frame_rate = wav_file.getframerate()
+        frame_count = wav_file.getnframes()
+    return frame_count / frame_rate if frame_rate else 0.0
+
+
+def _stream_peak_amplitude(audio_path: str | Path) -> float:
+    """Measure peak amplitude by streaming WAV samples instead of loading the full file."""
+
+    with wave.open(str(audio_path), "rb") as wav_file:
+        channels = max(wav_file.getnchannels(), 1)
+        sample_width = wav_file.getsampwidth()
+        sample_rate = wav_file.getframerate()
+        frame_count = wav_file.getnframes()
+        total_duration = frame_count / sample_rate if sample_rate else 0.0
+        max_amplitude = float(1 << ((8 * sample_width) - 1))
+        sample_stride = max(1, int(sample_rate / 8_000)) if total_duration >= QA_FAST_PATH_DURATION_SECONDS else 1
+        peak_amplitude = 0.0
+
+        dtype_map: dict[int, Any] = {
+            1: np.int8,
+            2: np.int16,
+            4: np.int32,
+        }
+        dtype = dtype_map.get(sample_width)
+        if dtype is None:
+            raise ValueError(f"Unsupported sample width for clipping analysis: {sample_width}")
+
+        chunk_frames = max(sample_rate * 10, 1)
+        while True:
+            frame_data = wav_file.readframes(chunk_frames)
+            if not frame_data:
+                break
+            samples = np.frombuffer(frame_data, dtype=dtype)
+            if channels > 1:
+                samples = samples[::channels]
+            if sample_stride > 1:
+                samples = samples[::sample_stride]
+            if samples.size == 0:
+                continue
+            chunk_peak = float(np.max(np.abs(samples.astype(np.float32)))) / max_amplitude
+            if chunk_peak > peak_amplitude:
+                peak_amplitude = chunk_peak
+
+    return peak_amplitude
+
+
 def _magnitude_spectrum(samples: np.ndarray) -> np.ndarray:
     """Return a real-spectrum magnitude without relying on ``numpy.fft``."""
 
@@ -544,7 +598,12 @@ def _write_chapter_report_sidecar(audio_path: Path | None, qa_result: QAResult) 
     report_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
 
 
-def check_duration(audio_path: str | Path, word_count: int | None) -> QACheckResult:
+def check_duration(
+    audio_path: str | Path,
+    word_count: int | None,
+    *,
+    actual_duration: float | None = None,
+) -> QACheckResult:
     """Validate chapter duration against the word-count heuristic."""
 
     if word_count is None or word_count <= 0:
@@ -555,56 +614,60 @@ def check_duration(audio_path: str | Path, word_count: int | None) -> QACheckRes
             value=None,
         )
 
-    analysis = _load_audio_analysis(audio_path)
+    resolved_duration = actual_duration if actual_duration is not None else _load_audio_analysis(audio_path).actual_duration
     expected_duration = word_count * QA_THRESHOLDS["words_per_second"]
     tolerance = QA_THRESHOLDS["duration_tolerance_percent"] / 100
     min_duration = expected_duration * (1 - tolerance)
     max_duration = expected_duration * (1 + tolerance)
 
-    if min_duration <= analysis.actual_duration <= max_duration:
+    if min_duration <= resolved_duration <= max_duration:
         return QACheckResult(
             name="duration_check",
             status=QAAutomaticStatus.PASS.value,
             message=(
-                f"Duration {analysis.actual_duration:.1f}s within expected range "
+                f"Duration {resolved_duration:.1f}s within expected range "
                 f"{expected_duration:.1f}s (+/-{QA_THRESHOLDS['duration_tolerance_percent']}%)."
             ),
-            value=round(analysis.actual_duration, 3),
+            value=round(resolved_duration, 3),
         )
 
     return QACheckResult(
         name="duration_check",
         status=QAAutomaticStatus.WARNING.value,
         message=(
-            f"Duration {analysis.actual_duration:.1f}s outside expected range "
+            f"Duration {resolved_duration:.1f}s outside expected range "
             f"{expected_duration:.1f}s (+/-{QA_THRESHOLDS['duration_tolerance_percent']}%)."
         ),
-        value=round(analysis.actual_duration, 3),
+        value=round(resolved_duration, 3),
     )
 
 
-def check_clipping(audio_path: str | Path) -> QACheckResult:
+def check_clipping(
+    audio_path: str | Path,
+    *,
+    peak_amplitude: float | None = None,
+) -> QACheckResult:
     """Detect clipping by checking normalized peak amplitude."""
 
-    analysis = _load_audio_analysis(audio_path)
+    resolved_peak = peak_amplitude if peak_amplitude is not None else _load_audio_analysis(audio_path).peak_amplitude
     threshold = float(QA_THRESHOLDS["clipping_threshold"])
 
-    if analysis.peak_amplitude < threshold:
+    if resolved_peak < threshold:
         return QACheckResult(
             name="clipping_detection",
             status=QAAutomaticStatus.PASS.value,
-            message=f"No clipping detected (peak: {analysis.peak_amplitude:.3f}).",
-            value=round(analysis.peak_amplitude, 6),
+            message=f"No clipping detected (peak: {resolved_peak:.3f}).",
+            value=round(resolved_peak, 6),
         )
 
     return QACheckResult(
         name="clipping_detection",
         status=QAAutomaticStatus.FAIL.value,
         message=(
-            f"Clipping detected (peak: {analysis.peak_amplitude:.3f}, "
+            f"Clipping detected (peak: {resolved_peak:.3f}, "
             f"threshold: {threshold:.2f})."
         ),
-        value=round(analysis.peak_amplitude, 6),
+        value=round(resolved_peak, 6),
     )
 
 
@@ -1442,7 +1505,11 @@ def check_pacing_consistency(audio: AudioSegment, text: str) -> QACheckResult:
     )
 
 
-def check_lufs_compliance(audio_path: str | Path) -> QACheckResult:
+def check_lufs_compliance(
+    audio_path: str | Path,
+    *,
+    timeout_seconds: int = QA_LUFS_TIMEOUT_SECONDS,
+) -> QACheckResult:
     """Measure integrated LUFS and compare it against audiobook loudness targets."""
 
     ffmpeg_path = shutil.which("ffmpeg")
@@ -1466,7 +1533,14 @@ def check_lufs_compliance(audio_path: str | Path) -> QACheckResult:
         "-",
     ]
     try:
-        completed = subprocess.run(command, check=True, capture_output=True, text=True)
+        completed = subprocess.run(command, check=True, capture_output=True, text=True, timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        return QACheckResult(
+            name="lufs_compliance",
+            status=QAAutomaticStatus.WARNING.value,
+            message=f"LUFS compliance timed out after {timeout_seconds}s.",
+            value=None,
+        )
     except subprocess.CalledProcessError as exc:
         return QACheckResult(
             name="lufs_compliance",
@@ -1583,8 +1657,8 @@ def _run_qa_checks_sync(
         parsed_chunk_boundaries = _parse_chunk_boundaries(chunk_boundaries)
         checks.extend(
             [
-                check_duration(audio_path, word_count),
-                check_clipping(audio_path),
+                check_duration(audio_path, word_count, actual_duration=analysis.actual_duration),
+                check_clipping(audio_path, peak_amplitude=analysis.peak_amplitude),
                 check_contextual_silence(audio_path, text_content, parsed_chunk_boundaries),
                 check_volume_consistency(audio_path),
                 check_voice_consistency(audio_path, parsed_chunk_boundaries),
@@ -1632,6 +1706,137 @@ def _run_qa_checks_sync(
     return qa_result
 
 
+def _run_fast_qa_checks_sync(
+    *,
+    book_id: int,
+    chapter_n: int,
+    audio_path: Path | None,
+    word_count: int | None,
+    chapter_title: str,
+    notes: str = "",
+) -> QAResult:
+    """Run the bounded fast QA fallback for long or timed-out chapters."""
+
+    file_result = _file_exists_result(audio_path)
+    checks = [file_result]
+    chapter_duration = 0.0
+
+    if file_result.status == QAAutomaticStatus.FAIL.value or audio_path is None:
+        checks.extend(_analysis_error_results("Audio file could not be analyzed because it is missing or empty."))
+    else:
+        try:
+            chapter_duration = _wav_duration_seconds(audio_path)
+            peak_amplitude = _stream_peak_amplitude(audio_path)
+            checks.extend(
+                [
+                    check_duration(audio_path, word_count, actual_duration=chapter_duration),
+                    check_clipping(audio_path, peak_amplitude=peak_amplitude),
+                    check_lufs_compliance(audio_path),
+                ]
+            )
+        except Exception as exc:
+            logger.warning("Unable to run fast QA for chapter %s in book %s: %s", chapter_n, book_id, exc)
+            checks.extend(
+                [
+                    QACheckResult(name="duration_check", status=QAAutomaticStatus.FAIL.value, message=str(exc), value=None),
+                    QACheckResult(name="clipping_detection", status=QAAutomaticStatus.FAIL.value, message=str(exc), value=None),
+                    QACheckResult(name="lufs_compliance", status=QAAutomaticStatus.WARNING.value, message=str(exc), value=None),
+                ]
+            )
+
+    overall_status = _overall_status(checks)
+    qa_result = QAResult(
+        chapter_n=chapter_n,
+        book_id=book_id,
+        timestamp=utc_now(),
+        checks=checks,
+        overall_status=overall_status,
+        notes=notes,
+        chapter_report=_synthesize_chapter_report(
+            QAResult(
+                chapter_n=chapter_n,
+                book_id=book_id,
+                timestamp=utc_now(),
+                checks=checks,
+                overall_status=overall_status,
+                notes=notes,
+            ),
+            chapter_number=chapter_n,
+            chapter_title=chapter_title,
+            duration_seconds=chapter_duration,
+        ),
+    )
+    _write_chapter_report_sidecar(audio_path, qa_result)
+    return qa_result
+
+
+async def _run_qa_checks_with_fallback(
+    *,
+    book_id: int,
+    chapter_n: int,
+    audio_path: Path | None,
+    word_count: int | None,
+    text_content: str,
+    chapter_title: str,
+    chunk_boundaries: str | None,
+) -> QAResult:
+    """Run full QA when feasible and fall back to fast QA for long-running chapters."""
+
+    if audio_path is not None and audio_path.exists():
+        try:
+            duration_seconds = _wav_duration_seconds(audio_path)
+        except Exception:
+            duration_seconds = 0.0
+        if duration_seconds >= QA_FAST_PATH_DURATION_SECONDS:
+            logger.info(
+                "QA fast-path for book=%s chapter=%s because duration %.1fs exceeds %.1fs",
+                book_id,
+                chapter_n,
+                duration_seconds,
+                QA_FAST_PATH_DURATION_SECONDS,
+            )
+            return await asyncio.to_thread(
+                _run_fast_qa_checks_sync,
+                book_id=book_id,
+                chapter_n=chapter_n,
+                audio_path=audio_path,
+                word_count=word_count,
+                chapter_title=chapter_title,
+                notes=f"Fast QA fallback used for large chapter ({duration_seconds:.1f}s).",
+            )
+
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(
+                _run_qa_checks_sync,
+                book_id=book_id,
+                chapter_n=chapter_n,
+                audio_path=audio_path,
+                word_count=word_count,
+                text_content=text_content,
+                chapter_title=chapter_title,
+                chunk_boundaries=chunk_boundaries,
+            ),
+            timeout=QA_CHAPTER_TIMEOUT_SECONDS,
+        )
+    except TimeoutError:
+        logger.warning(
+            "QA timed out for book=%s chapter=%s after %ss; using fast fallback",
+            book_id,
+            chapter_n,
+            QA_CHAPTER_TIMEOUT_SECONDS,
+        )
+        return await asyncio.to_thread(
+            _run_fast_qa_checks_sync,
+            book_id=book_id,
+            chapter_n=chapter_n,
+            audio_path=audio_path,
+            word_count=word_count,
+            chapter_title=chapter_title,
+            notes=f"Fast QA fallback used after {QA_CHAPTER_TIMEOUT_SECONDS}s timeout.",
+        )
+
+
 async def run_qa_checks(
     book_id: int,
     chapter_n: int,
@@ -1656,8 +1861,7 @@ async def run_qa_checks(
             raise ValueError(f"Chapter {chapter_n} not found in book {book_id}")
 
         audio_path = _resolve_audio_path(chapter.audio_path)
-        return await asyncio.to_thread(
-            _run_qa_checks_sync,
+        return await _run_qa_checks_with_fallback(
             book_id=book_id,
             chapter_n=chapter_n,
             audio_path=audio_path,
@@ -1674,8 +1878,7 @@ async def run_qa_checks(
 async def run_qa_checks_for_chapter(chapter: Chapter) -> QAResult:
     """Run QA checks using an already-loaded chapter ORM instance."""
 
-    return await asyncio.to_thread(
-        _run_qa_checks_sync,
+    return await _run_qa_checks_with_fallback(
         book_id=chapter.book_id,
         chapter_n=chapter.number,
         audio_path=_resolve_audio_path(chapter.audio_path),

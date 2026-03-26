@@ -530,11 +530,11 @@ class BatchBookStatus(Base):
     book: Mapped["Book"] = relationship(back_populates="batch_book_statuses")
 
 
-def _sqlite_connect_args(database_url: str) -> dict[str, bool]:
+def _sqlite_connect_args(database_url: str) -> dict[str, Any]:
     """Return SQLite connection arguments when needed."""
 
     if database_url.startswith("sqlite"):
-        return {"check_same_thread": False}
+        return {"check_same_thread": False, "timeout": 5.0}
     return {}
 
 

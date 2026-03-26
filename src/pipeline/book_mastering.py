@@ -6,13 +6,14 @@ import asyncio
 import logging
 import shutil
 import wave
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel
 from pydub import AudioSegment, silence
 from pydub.effects import compress_dynamic_range, high_pass_filter
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from src.database import Chapter, ChapterStatus
 from src.pipeline.book_qa import ACX_REQUIREMENTS, BookQAReport, measure_integrated_lufs, run_book_qa
@@ -21,6 +22,7 @@ from src.utils.subprocess_utils import run_ffmpeg
 
 logger = logging.getLogger(__name__)
 ACX_SAMPLE_RATE = ACX_REQUIREMENTS["sample_rate"]
+MasteringProgressCallback = Callable[[str, int, int, Chapter], None]
 
 
 class MasteringReport(BaseModel):
@@ -67,6 +69,8 @@ class BookMasteringPipeline:
         db_session: Session,
         *,
         prefer_fast_chain: bool | None = None,
+        progress_callback: MasteringProgressCallback | None = None,
+        session_factory: sessionmaker[Session] | None = None,
     ) -> MasteringReport:
         """Async entrypoint used by API routes."""
 
@@ -78,8 +82,16 @@ class BookMasteringPipeline:
             db_session,
             notes,
             prefer_fast_chain=prefer_fast_chain,
+            progress_callback=progress_callback,
         )
-        book_report = await self._verify_mastered_quality_async(book_id, chapters, db_session)
+        db_session.commit()
+        book_report = await self._verify_mastered_quality_async(
+            book_id,
+            chapters,
+            db_session,
+            progress_callback=progress_callback,
+            session_factory=session_factory,
+        )
         if blockers:
             book_report.export_blockers.extend(blocker for blocker in blockers if blocker not in book_report.export_blockers)
         return self._build_report(
@@ -98,6 +110,8 @@ class BookMasteringPipeline:
         db_session: Session,
         *,
         prefer_fast_chain: bool | None = None,
+        progress_callback: MasteringProgressCallback | None = None,
+        session_factory: sessionmaker[Session] | None = None,
     ) -> MasteringReport:
         """Run all book-level auto-fixes and re-verify the mastered result."""
 
@@ -109,8 +123,18 @@ class BookMasteringPipeline:
             db_session,
             notes,
             prefer_fast_chain=prefer_fast_chain,
+            progress_callback=progress_callback,
         )
-        book_report = asyncio.run(self._verify_mastered_quality_async(book_id, chapters, db_session))
+        db_session.commit()
+        book_report = asyncio.run(
+            self._verify_mastered_quality_async(
+                book_id,
+                chapters,
+                db_session,
+                progress_callback=progress_callback,
+                session_factory=session_factory,
+            )
+        )
         if blockers:
             book_report.export_blockers.extend(blocker for blocker in blockers if blocker not in book_report.export_blockers)
 
@@ -155,16 +179,17 @@ class BookMasteringPipeline:
         notes: list[str],
         *,
         prefer_fast_chain: bool | None,
+        progress_callback: MasteringProgressCallback | None,
     ) -> tuple[list[dict[str, Any]], list[int], list[int], list[str]]:
         """Run the appropriate mastering chain and fall back when the rich chain fails."""
 
         use_fast_chain = self._should_use_fast_chain(chapters) if prefer_fast_chain is None else prefer_fast_chain
         if use_fast_chain:
             notes.append("Using fast ffmpeg mastering chain for export-scale audio.")
-            return self._master_book_fast(book_id, chapters, db_session, notes)
+            return self._master_book_fast(book_id, chapters, db_session, notes, progress_callback=progress_callback)
 
         try:
-            return self._master_book_rich(chapters, db_session, notes)
+            return self._master_book_rich(chapters, db_session, notes, progress_callback=progress_callback)
         except Exception:
             logger.warning(
                 "Rich mastering chain failed for book %s, switching to ffmpeg fallback",
@@ -172,13 +197,14 @@ class BookMasteringPipeline:
                 exc_info=True,
             )
             notes.append("Rich mastering failed; applied ffmpeg fallback chain.")
-            return self._master_book_fast(book_id, chapters, db_session, notes)
+            return self._master_book_fast(book_id, chapters, db_session, notes, progress_callback=progress_callback)
 
     def _master_book_rich(
         self,
         chapters: list[Chapter],
         db_session: Session,
         notes: list[str],
+        progress_callback: MasteringProgressCallback | None = None,
     ) -> tuple[list[dict[str, Any]], list[int], list[int], list[str]]:
         """Run the original higher-touch mastering chain."""
 
@@ -198,6 +224,8 @@ class BookMasteringPipeline:
         edge_normalized = self._normalize_chapter_edges(chapters, db_session)
         peak_limited = self._apply_final_peak_limit(chapters, db_session)
         notes.append("Sentence-boundary padding verified via chapter QA after mastering.")
+        if progress_callback is not None and chapters:
+            progress_callback("mastering", len(chapters), len(chapters), chapters[-1])
         blockers = self._final_verify(chapters, db_session)
         return loudness_adjustments, edge_normalized, peak_limited, blockers
 
@@ -341,6 +369,8 @@ class BookMasteringPipeline:
         chapters: list[Chapter],
         db_session: Session,
         notes: list[str],
+        *,
+        progress_callback: MasteringProgressCallback | None = None,
     ) -> tuple[list[dict[str, Any]], list[int], list[int], list[str]]:
         """Run a bounded ffmpeg mastering chain suitable for large export jobs."""
 
@@ -361,6 +391,8 @@ class BookMasteringPipeline:
             peak_limited.append(chapter.number)
             if original_rate != ACX_SAMPLE_RATE:
                 resampled.append(chapter.number)
+            if progress_callback is not None:
+                progress_callback("mastering", index, len(chapters), chapter)
             logger.info(
                 "Fast mastering complete for chapter %s/%s for book %s",
                 index,
@@ -560,15 +592,44 @@ class BookMasteringPipeline:
         book_id: int,
         chapters: list[Chapter],
         db_session: Session,
+        *,
+        progress_callback: MasteringProgressCallback | None = None,
+        session_factory: sessionmaker[Session] | None = None,
     ) -> BookQAReport:
         """Re-run Gate 2 per-chapter QA and then Gate 3 whole-book QA."""
 
-        for chapter in chapters:
-            qa_result = await run_qa_checks_for_chapter(chapter)
-            persist_qa_result(db_session, chapter, qa_result)
+        verification_session_factory = session_factory or sessionmaker(
+            bind=db_session.get_bind(),
+            autoflush=False,
+            autocommit=False,
+            expire_on_commit=False,
+        )
 
-        db_session.commit()
-        return run_book_qa(book_id, db_session)
+        for index, chapter in enumerate(chapters, start=1):
+            audio_label = Path(chapter.audio_path).name if chapter.audio_path else f"chapter-{chapter.number}.wav"
+            logger.info(
+                "QA analyzing chapter %s/%s (%s, %.1fs)...",
+                index,
+                len(chapters),
+                audio_label,
+                float(chapter.duration_seconds or 0.0),
+            )
+            qa_result = await run_qa_checks_for_chapter(chapter)
+            with verification_session_factory() as qa_session:
+                persisted_chapter = (
+                    qa_session.query(Chapter)
+                    .filter(Chapter.book_id == chapter.book_id, Chapter.number == chapter.number)
+                    .first()
+                )
+                if persisted_chapter is None:
+                    raise ValueError(f"Chapter {chapter.number} disappeared during QA verification.")
+                persist_qa_result(qa_session, persisted_chapter, qa_result)
+                qa_session.commit()
+            if progress_callback is not None:
+                progress_callback("qa", index, len(chapters), chapter)
+
+        with verification_session_factory() as book_session:
+            return run_book_qa(book_id, book_session)
 
     @staticmethod
     def _strip_silence(audio: AudioSegment) -> AudioSegment:

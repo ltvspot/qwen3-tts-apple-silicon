@@ -23,7 +23,7 @@ from src.database import (
     QAStatus,
     utc_now,
 )
-from src.pipeline.exporter import get_export_output_path
+from src.pipeline.exporter import ExportFormatResult, ExportResult, QAReport, get_export_output_path, run_export_job_sync
 
 
 def _create_book(test_db: Session, *, title: str = "Export API Book") -> Book:
@@ -419,6 +419,70 @@ def test_cancel_export_marks_job_and_book_as_error(client, test_db: Session) -> 
     assert export_job.export_status == BookExportStatus.ERROR
     assert export_job.current_stage == "Export cancelled"
     assert export_job.error_message == "Export cancelled by operator."
+    assert book.export_status == BookExportStatus.ERROR
+
+
+def test_cancel_export_succeeds_while_worker_is_running(
+    client,
+    test_db: Session,
+    monkeypatch,
+) -> None:
+    """Cancelling an in-flight export should work even while the worker thread is active."""
+
+    book = _create_book(test_db, title="Cancelable Running Export")
+    export_job = ExportJob(
+        book_id=book.id,
+        job_token=f"export_{book.id}_20260324_152500",
+        export_status=BookExportStatus.PROCESSING,
+        formats_requested=json.dumps(["mp3"]),
+        format_details=json.dumps({"mp3": {"status": "pending"}}),
+        include_only_approved=True,
+        started_at=utc_now(),
+        updated_at=utc_now(),
+    )
+    test_db.add(export_job)
+    book.export_status = BookExportStatus.PROCESSING
+    test_db.commit()
+    test_db.refresh(export_job)
+
+    session_factory = export_routes._session_factory_for(test_db)
+    worker_started = threading.Event()
+
+    def fake_export_book_sync(
+        book_id: int,
+        *,
+        export_formats=None,
+        include_only_approved=True,
+        session_factory=None,
+        progress_callback=None,
+        should_abort=None,
+    ) -> ExportResult:
+        del book_id, export_formats, include_only_approved, session_factory
+        assert progress_callback is not None
+        assert should_abort is not None
+        progress_callback(25.0, "Running QA analysis", None, 1, 1)
+        worker_started.set()
+        while True:
+            time.sleep(0.01)
+            should_abort()
+
+    monkeypatch.setattr("src.pipeline.exporter.export_book_sync", fake_export_book_sync)
+
+    worker = threading.Thread(
+        target=run_export_job_sync,
+        kwargs={"export_job_id": export_job.id, "session_factory": session_factory},
+        daemon=True,
+    )
+    worker.start()
+    assert worker_started.wait(timeout=1.0)
+
+    response = client.post(f"/api/book/{book.id}/export/cancel")
+    worker.join(timeout=1.0)
+
+    assert response.status_code == 200
+    test_db.refresh(export_job)
+    test_db.refresh(book)
+    assert export_job.export_status == BookExportStatus.ERROR
     assert book.export_status == BookExportStatus.ERROR
 
 

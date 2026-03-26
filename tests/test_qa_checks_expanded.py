@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import subprocess
+import time
 from pathlib import Path
 
 import numpy as np
@@ -10,10 +12,13 @@ import pytest
 from pydub import AudioSegment
 from pydub.generators import Sine
 
+from src.database import Chapter, ChapterStatus, ChapterType
 from src.pipeline.qa_checker import (
+    QACheckResult,
     check_lufs_compliance,
     check_pacing_consistency,
     check_stitch_clicks,
+    run_qa_checks_for_chapter,
 )
 
 FRAME_RATE = 22050
@@ -148,3 +153,51 @@ def test_check_lufs_compliance_fails_when_far_outside_range(monkeypatch: pytest.
 
     assert result.status == "fail"
     assert result.value == pytest.approx(-14.0)
+
+
+@pytest.mark.asyncio
+async def test_run_qa_checks_for_chapter_times_out_to_fast_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Timed-out full QA should fall back to the bounded fast QA path."""
+
+    audio_path = tmp_path / "timeout-chapter.wav"
+    _tone(1500).export(audio_path, format="wav")
+    chapter = Chapter(
+        book_id=1,
+        number=1,
+        title="Timeout Chapter",
+        type=ChapterType.CHAPTER,
+        status=ChapterStatus.GENERATED,
+        audio_path=str(audio_path),
+        word_count=3,
+        text_content="one two three",
+    )
+
+    def slow_full_qa(**kwargs):
+        del kwargs
+        time.sleep(0.05)
+        raise AssertionError("full QA should have timed out")
+
+    monkeypatch.setattr("src.pipeline.qa_checker._run_qa_checks_sync", slow_full_qa)
+    monkeypatch.setattr("src.pipeline.qa_checker.QA_CHAPTER_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(
+        "src.pipeline.qa_checker.check_lufs_compliance",
+        lambda *args, **kwargs: QACheckResult(
+            name="lufs_compliance",
+            status="pass",
+            message="Synthetic LUFS pass.",
+            value=-19.0,
+        ),
+    )
+
+    result = await run_qa_checks_for_chapter(chapter)
+
+    assert "timeout" in result.notes.lower()
+    assert [check.name for check in result.checks] == [
+        "file_exists",
+        "duration_check",
+        "clipping_detection",
+        "lufs_compliance",
+    ]
