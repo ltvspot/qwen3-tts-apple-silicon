@@ -34,10 +34,9 @@ def isolated_settings_manager() -> Generator[None, None, None]:
 def isolated_generation_runtime() -> Generator[None, None, None]:
     """Reset process-local generation singletons around each test."""
 
-    export_routes._export_tasks.clear()
-    for thread in list(export_routes._export_threads.values()):
+    export_routes._clear_export_tasks()
+    for thread in export_routes._clear_export_threads():
         thread.join(timeout=0.1)
-    export_routes._export_threads.clear()
     export_routes._batch_export_monitor_task = None
     export_routes._batch_export_progress = None
     generation_runtime.release_model_manager()
@@ -48,12 +47,10 @@ def isolated_generation_runtime() -> Generator[None, None, None]:
     try:
         yield
     finally:
-        for task in list(export_routes._export_tasks):
+        for task in export_routes._clear_export_tasks():
             task.cancel()
-        export_routes._export_tasks.clear()
-        for thread in list(export_routes._export_threads.values()):
+        for thread in export_routes._clear_export_threads():
             thread.join(timeout=0.5)
-        export_routes._export_threads.clear()
         if export_routes._batch_export_monitor_task is not None:
             export_routes._batch_export_monitor_task.cancel()
         export_routes._batch_export_monitor_task = None

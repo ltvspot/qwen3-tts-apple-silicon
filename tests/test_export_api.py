@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import asyncio
 import threading
 import time
+from typing import cast
 from urllib.parse import unquote
 
+from pydub import AudioSegment
 from sqlalchemy.orm import Session
 
 from src.api import export_routes
@@ -89,6 +92,13 @@ def _create_generated_chapter(
     return chapter
 
 
+def _write_decodable_mp3(path) -> None:
+    """Write a tiny valid MP3 artifact."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    AudioSegment.silent(duration=1000).export(path, format="mp3")
+
+
 def test_export_accepts_fully_generated_book(
     client,
     test_db: Session,
@@ -168,7 +178,7 @@ def test_export_endpoint_returns_quickly_and_health_stays_responsive(
     health_elapsed = time.monotonic() - health_started
 
     release_worker.set()
-    for thread in list(export_routes._export_threads.values()):
+    for thread in export_routes._snapshot_export_threads():
         thread.join(timeout=1.0)
 
     assert response.status_code == 200
@@ -407,8 +417,7 @@ def test_get_export_status_recovery_populates_qa_report_and_completion_stage(cli
     test_db.commit()
 
     output_path = get_export_output_path(book, "mp3")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_bytes(b"recovered mp3")
+    _write_decodable_mp3(output_path)
 
     response = client.get(f"/api/book/{book.id}/export/status")
 
@@ -491,8 +500,9 @@ def test_cancel_export_succeeds_while_worker_is_running(
         session_factory=None,
         progress_callback=None,
         should_abort=None,
+        export_job_id=None,
     ) -> ExportResult:
-        del book_id, export_formats, include_only_approved, session_factory
+        del book_id, export_formats, include_only_approved, session_factory, export_job_id
         assert progress_callback is not None
         assert should_abort is not None
         progress_callback(25.0, "Running QA analysis", None, 1, 1)
@@ -519,6 +529,30 @@ def test_cancel_export_succeeds_while_worker_is_running(
     test_db.refresh(book)
     assert export_job.export_status == BookExportStatus.ERROR
     assert book.export_status == BookExportStatus.ERROR
+
+
+def test_export_task_registry_is_thread_safe() -> None:
+    """Concurrent task add/remove operations should not corrupt the registry."""
+
+    tasks = [cast(asyncio.Task[None], object()) for _ in range(200)]
+
+    def mutate_registry(chunk: list[asyncio.Task[None]]) -> None:
+        for _ in range(20):
+            for task in chunk:
+                export_routes._track_export_task(task)
+            for task in reversed(chunk):
+                export_routes._discard_export_task(task)
+
+    threads = [
+        threading.Thread(target=mutate_registry, args=(tasks[index:index + 25],), daemon=True)
+        for index in range(0, len(tasks), 25)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=1.0)
+
+    assert export_routes._snapshot_export_tasks() == []
 
 
 def test_batch_export_queues_ready_books_and_exposes_progress(client, test_db: Session, monkeypatch) -> None:

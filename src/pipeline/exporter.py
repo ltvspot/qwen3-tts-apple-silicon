@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -48,6 +49,7 @@ VALID_EXPORT_FORMATS = frozenset(DEFAULT_EXPORT_FORMATS)
 ExportProgressCallback = Callable[[float, str | None, str | None, int | None, int | None], None]
 EXPORT_VERIFY_TIMEOUT_SECONDS = 30
 EXPORT_STALE_TIMEOUT = timedelta(minutes=15)
+FORMAT_DETAILS_ARTIFACTS_KEY = "_artifacts"
 
 
 class ExportFormatResult(BaseModel):
@@ -55,6 +57,7 @@ class ExportFormatResult(BaseModel):
 
     status: str
     file_size_bytes: int | None = None
+    sha256: str | None = None
     file_name: str | None = None
     download_url: str | None = None
     completed_at: datetime | None = None
@@ -138,6 +141,14 @@ class ConcatenationResult:
     included_chapters: list[SelectedChapter]
     skipped_notes: list[str]
     qa_records: dict[int, ChapterQARecord]
+
+
+@dataclass(slots=True)
+class EncodedExportArtifact:
+    """Encoded export file metadata captured before verification."""
+
+    file_size_bytes: int
+    sha256: str
 
 
 def _slugify(value: str, *, fallback: str, max_length: int = 50) -> str:
@@ -241,6 +252,16 @@ def _require_ffmpeg() -> str:
     if ffmpeg_path is None:
         raise RuntimeError("ffmpeg is required for exports. Install it with `brew install ffmpeg`.")
     return ffmpeg_path
+
+
+def _file_sha256(path: Path, *, chunk_size: int = 64 * 1024) -> str:
+    """Return the SHA256 for one file without loading it into memory."""
+
+    digest = hashlib.sha256()
+    with path.open("rb") as file_handle:
+        for chunk in iter(lambda: file_handle.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _resolve_chapter_audio_path(chapter: Chapter) -> Path | None:
@@ -641,7 +662,7 @@ def export_mp3(
     *,
     book: Book,
     cover_art_path: Path | None,
-) -> None:
+) -> EncodedExportArtifact:
     """Encode a normalized master WAV into audiobook MP3 format."""
 
     ffmpeg_path = _require_ffmpeg()
@@ -690,6 +711,10 @@ def export_mp3(
             "comment=Cover (front)",
         ]
     run_ffmpeg(command)
+    return EncodedExportArtifact(
+        file_size_bytes=output_path.stat().st_size,
+        sha256=_file_sha256(output_path),
+    )
 
 
 def export_m4b(
@@ -699,7 +724,7 @@ def export_m4b(
     book: Book,
     chapter_markers: list[ChapterMarker],
     metadata_path: Path,
-) -> None:
+) -> EncodedExportArtifact:
     """Encode a normalized master WAV into M4B with chapter markers."""
 
     ffmpeg_path = _require_ffmpeg()
@@ -730,6 +755,10 @@ def export_m4b(
         str(output_path),
     ]
     run_ffmpeg(command)
+    return EncodedExportArtifact(
+        file_size_bytes=output_path.stat().st_size,
+        sha256=_file_sha256(output_path),
+    )
 
 
 def _probe_media(path: Path) -> dict[str, Any]:
@@ -862,10 +891,115 @@ def _job_formats_requested(export_job: ExportJob | None) -> list[str]:
         return list(DEFAULT_EXPORT_FORMATS)
 
 
+def _load_format_details_payload(raw_payload: str | dict[str, Any] | None) -> dict[str, Any]:
+    """Deserialize stored format details into a mutable mapping."""
+
+    if raw_payload is None:
+        return {}
+    if isinstance(raw_payload, dict):
+        return dict(raw_payload)
+
+    try:
+        decoded = json.loads(raw_payload)
+    except json.JSONDecodeError:
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def _format_details_artifacts(raw_payload: str | dict[str, Any] | None) -> dict[str, Any]:
+    """Return the internal artifact metadata stored alongside format details."""
+
+    artifacts = _load_format_details_payload(raw_payload).get(FORMAT_DETAILS_ARTIFACTS_KEY)
+    return dict(artifacts) if isinstance(artifacts, dict) else {}
+
+
+def _serialize_format_details_payload(
+    format_results: dict[str, ExportFormatResult],
+    *,
+    artifacts: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build the persisted format-details payload, preserving auxiliary artifacts."""
+
+    payload: dict[str, Any] = {
+        name: format_result.model_dump(mode="json")
+        for name, format_result in format_results.items()
+    }
+    if artifacts:
+        payload[FORMAT_DETAILS_ARTIFACTS_KEY] = artifacts
+    return payload
+
+
+def _persist_export_checkpoint(
+    db_session_factory: sessionmaker[Session],
+    export_job_id: int,
+    updates: dict[str, Any],
+) -> None:
+    """Persist one export checkpoint using an isolated DB session."""
+
+    @retry_on_locked(max_retries=5, backoff_ms=250)
+    def _persist() -> None:
+        with db_session_factory() as checkpoint_session:
+            export_job = checkpoint_session.query(ExportJob).filter(ExportJob.id == export_job_id).first()
+            if export_job is None or export_job.export_status != BookExportStatus.PROCESSING:
+                raise ExportCancelledError("Export job was cancelled.")
+
+            serialized_updates = dict(updates)
+            serialized_updates.setdefault("updated_at", utc_now())
+            for field_name, field_value in serialized_updates.items():
+                if field_name == "format_details" and field_value is not None:
+                    if isinstance(field_value, str):
+                        value_to_set = field_value
+                    else:
+                        value_to_set = json.dumps(field_value)
+                elif field_name == "qa_report" and isinstance(field_value, QAReport):
+                    value_to_set = field_value.model_dump_json()
+                elif field_name == "qa_report" and isinstance(field_value, dict):
+                    value_to_set = json.dumps(field_value)
+                else:
+                    value_to_set = field_value
+                setattr(export_job, field_name, value_to_set)
+
+            checkpoint_session.commit()
+
+    _persist()
+
+
+def _recoverable_completed_at(
+    output_path: Path,
+    *,
+    stored_result: ExportFormatResult | None,
+) -> datetime:
+    """Prefer persisted completion timestamps and fall back to filesystem metadata."""
+
+    if stored_result is not None and stored_result.completed_at is not None:
+        return stored_result.completed_at
+    return datetime.fromtimestamp(output_path.stat().st_mtime, tz=timezone.utc)
+
+
+def _recovery_probe_output(output_path: Path) -> str | None:
+    """Return an integrity error for one recovered export output when probing fails."""
+
+    try:
+        probe = _probe_media(output_path)
+    except Exception as exc:
+        return f"ffprobe/decode failed during recovery: {exc}"
+
+    file_size_bytes = output_path.stat().st_size
+    if file_size_bytes <= 0:
+        return "file size is 0 bytes"
+
+    actual_duration = float(probe.get("format", {}).get("duration", 0.0) or 0.0)
+    if actual_duration <= 0.0:
+        return "decoded duration is 0 seconds"
+
+    return None
+
+
 def _existing_export_artifacts(
     book: Book,
     *,
     formats_requested: list[str] | None = None,
+    stored_format_details: str | dict[str, Any] | None = None,
 ) -> tuple[dict[str, ExportFormatResult], datetime | None, bool]:
     """Return on-disk export artifacts already present for one book."""
 
@@ -873,20 +1007,61 @@ def _existing_export_artifacts(
     latest_completed_at: datetime | None = None
     found_any = False
     results = _empty_format_details(requested)
+    stored_payload = _load_format_details_payload(stored_format_details)
 
     for export_format in requested:
         output_path = get_export_output_path(book, export_format)
         if not output_path.exists():
             continue
 
-        found_any = True
+        stored_result: ExportFormatResult | None = None
+        raw_stored_result = stored_payload.get(export_format)
+        if isinstance(raw_stored_result, dict):
+            try:
+                stored_result = ExportFormatResult.model_validate(raw_stored_result)
+            except ValidationError as exc:
+                logger.warning(
+                    "Ignoring invalid stored format metadata for book %s format %s during recovery: %s",
+                    book.id,
+                    export_format,
+                    exc,
+                )
+
+        integrity_error = _recovery_probe_output(output_path)
+        actual_sha256: str | None = None
+        expected_sha256 = stored_result.sha256 if stored_result is not None else None
+        if expected_sha256:
+            actual_sha256 = _file_sha256(output_path)
+            if actual_sha256 != expected_sha256:
+                integrity_error = (
+                    f"sha256 mismatch during recovery: expected {expected_sha256}, got {actual_sha256}"
+                )
+
         stat_result = output_path.stat()
-        completed_at = datetime.fromtimestamp(stat_result.st_mtime, tz=timezone.utc)
+        if integrity_error:
+            results[export_format] = ExportFormatResult(
+                status="error",
+                file_size_bytes=stat_result.st_size,
+                sha256=actual_sha256 or expected_sha256,
+                file_name=output_path.name,
+                error_message=integrity_error,
+            )
+            logger.warning(
+                "Refusing to recover export artifact for book %s format %s: %s",
+                book.id,
+                export_format,
+                integrity_error,
+            )
+            continue
+
+        found_any = True
+        completed_at = _recoverable_completed_at(output_path, stored_result=stored_result)
         if latest_completed_at is None or completed_at > latest_completed_at:
             latest_completed_at = completed_at
         results[export_format] = ExportFormatResult(
             status="completed",
             file_size_bytes=stat_result.st_size,
+            sha256=actual_sha256 or expected_sha256,
             file_name=output_path.name,
             download_url=f"/api/book/{book.id}/export/download/{export_format}",
             completed_at=completed_at,
@@ -919,6 +1094,7 @@ def reconcile_export_job_state(
     format_details, completed_at, found_any = _existing_export_artifacts(
         book,
         formats_requested=requested_formats,
+        stored_format_details=export_job.format_details,
     )
 
     should_recover_completed_metadata = (
@@ -932,35 +1108,91 @@ def reconcile_export_job_state(
             book=book,
             include_only_approved=export_job.include_only_approved,
             export_date=completed_at or now,
+            stored_format_details=export_job.format_details,
         )
-        export_job.export_status = BookExportStatus.COMPLETED
-        export_job.progress_percent = 100.0
-        export_job.current_stage = "Export completed"
-        export_job.current_format = None
-        export_job.completed_at = completed_at or now
-        export_job.updated_at = now
-        export_job.error_message = None
-        export_job.current_chapter_n = recovered_qa_report.chapters_included
-        export_job.total_chapters = recovered_qa_report.chapters_included
-        export_job.format_details = json.dumps(
-            {name: result.model_dump(mode="json") for name, result in format_details.items()}
-        )
-        export_job.qa_report = recovered_qa_report.model_dump_json()
-        book.export_status = BookExportStatus.COMPLETED
-        book.last_export_date = export_job.completed_at
-        book.status = BookStatus.EXPORTED
-        db_session.commit()
-        return "recovered"
+        if recovered_qa_report is not None:
+            recovery_completed_at = completed_at or now
+            export_updates = {
+                "export_status": BookExportStatus.COMPLETED,
+                "progress_percent": 100.0,
+                "current_stage": "Export completed",
+                "current_format": None,
+                "completed_at": recovery_completed_at,
+                "updated_at": now,
+                "error_message": None,
+                "current_chapter_n": recovered_qa_report.chapters_included,
+                "total_chapters": recovered_qa_report.chapters_included,
+                "format_details": json.dumps(
+                    _serialize_format_details_payload(
+                        format_details,
+                        artifacts=_format_details_artifacts(export_job.format_details),
+                    )
+                ),
+                "qa_report": recovered_qa_report.model_dump_json(),
+            }
+            book_updates = {
+                "export_status": BookExportStatus.COMPLETED,
+                "last_export_date": recovery_completed_at,
+                "status": BookStatus.EXPORTED,
+            }
+            logger.info(
+                "Recovering export job %s for book %s with export updates=%s and book updates=%s",
+                export_job.id,
+                book.id,
+                export_updates,
+                book_updates,
+            )
+            try:
+                for field_name, field_value in export_updates.items():
+                    setattr(export_job, field_name, field_value)
+                db_session.flush()
+                for field_name, field_value in book_updates.items():
+                    setattr(book, field_name, field_value)
+                db_session.commit()
+            except Exception:
+                db_session.rollback()
+                logger.exception(
+                    "Failed to atomically recover export job %s for book %s",
+                    export_job.id,
+                    book.id,
+                )
+                raise
+            return "recovered"
 
     last_activity = _as_utc_datetime(export_job.updated_at or export_job.started_at or export_job.created_at)
     if export_job.export_status == BookExportStatus.PROCESSING and last_activity < (now - EXPORT_STALE_TIMEOUT):
-        export_job.export_status = BookExportStatus.ERROR
-        export_job.current_stage = "Export timed out"
-        export_job.completed_at = now
-        export_job.updated_at = now
-        export_job.error_message = "Export timed out after 15 minutes without a progress update."
-        book.export_status = BookExportStatus.ERROR
-        db_session.commit()
+        timeout_updates = {
+            "export_status": BookExportStatus.ERROR,
+            "current_stage": "Export timed out",
+            "completed_at": now,
+            "updated_at": now,
+            "error_message": "Export timed out after 15 minutes without a progress update.",
+        }
+        book_updates = {
+            "export_status": BookExportStatus.ERROR,
+        }
+        logger.info(
+            "Timing out stale export job %s for book %s with export updates=%s and book updates=%s",
+            export_job.id,
+            book.id,
+            timeout_updates,
+            book_updates,
+        )
+        try:
+            for field_name, field_value in timeout_updates.items():
+                setattr(export_job, field_name, field_value)
+            db_session.flush()
+            for field_name, field_value in book_updates.items():
+                setattr(book, field_name, field_value)
+            db_session.commit()
+        except Exception:
+            db_session.rollback()
+            logger.exception(
+                "Failed to atomically time out export job %s for book %s",
+                export_job.id,
+                book.id,
+            )
+            raise
         return "timed_out"
 
     return None
@@ -1079,14 +1311,46 @@ def _load_recovered_qa_report(
     book: Book,
     include_only_approved: bool,
     export_date: datetime,
-) -> QAReport:
+    stored_format_details: str | dict[str, Any] | None = None,
+) -> QAReport | None:
     """Load an existing QA report from disk when possible, or rebuild a minimal replacement."""
 
     qa_report_path = _build_export_paths(book)["qa_report"]
+    qa_report_artifact = _format_details_artifacts(stored_format_details).get("qa_report")
+    expected_qa_report_sha256 = (
+        qa_report_artifact.get("sha256")
+        if isinstance(qa_report_artifact, dict)
+        else None
+    )
+    if expected_qa_report_sha256:
+        if not qa_report_path.exists():
+            logger.warning(
+                "Refusing to recover QA report for book %s because the hashed artifact is missing",
+                book.id,
+            )
+            return None
+
+        actual_qa_report_sha256 = _file_sha256(qa_report_path)
+        if actual_qa_report_sha256 != expected_qa_report_sha256:
+            logger.warning(
+                "Refusing to recover QA report for book %s because the hash mismatched (expected=%s actual=%s)",
+                book.id,
+                expected_qa_report_sha256,
+                actual_qa_report_sha256,
+            )
+            return None
+
     if qa_report_path.exists():
         try:
             return QAReport.model_validate_json(qa_report_path.read_text(encoding="utf-8"))
         except (OSError, ValidationError, json.JSONDecodeError) as exc:
+            if expected_qa_report_sha256:
+                logger.warning(
+                    "Refusing to recover QA report for book %s because the hashed artifact could not be parsed: %s",
+                    book.id,
+                    exc,
+                )
+                return None
             logger.warning("Failed to load recovered QA report for book %s: %s", book.id, exc)
 
     return _build_recovered_qa_report(
@@ -1210,6 +1474,7 @@ def export_book_sync(
     session_factory: sessionmaker[Session] | None = None,
     progress_callback: ExportProgressCallback | None = None,
     should_abort: Callable[[], None] | None = None,
+    export_job_id: int | None = None,
 ) -> ExportResult:
     """Synchronously export a completed book into MP3 and/or M4B formats."""
 
@@ -1240,6 +1505,16 @@ def export_book_sync(
     mastering_notes: list[str] = []
     concatenation: ConcatenationResult | None = None
     total_chapters = 0
+    checkpoint_artifacts: dict[str, Any] = {}
+
+    def persist_checkpoint(**updates: Any) -> None:
+        if export_job_id is None:
+            return
+        _persist_export_checkpoint(
+            session_factory,
+            export_job_id,
+            updates,
+        )
 
     _emit_progress(
         progress_callback,
@@ -1313,10 +1588,15 @@ def export_book_sync(
         raise ExportBlockedError(
             "Mastering found blocking issues: " + "; ".join(mastering_report.blockers)
         )
+    persist_checkpoint(
+        current_stage="Mastering complete",
+        progress_percent=30.0,
+        current_format=None,
+    )
     _emit_progress(
         progress_callback,
         progress_percent=30.0,
-        stage="Running QA analysis",
+        stage="Mastering complete",
     )
 
     try:
@@ -1346,15 +1626,27 @@ def export_book_sync(
         )
         ensure_active()
         total_chapters = len(concatenation.included_chapters)
+        checkpoint_artifacts["master_wav_hash"] = _file_sha256(concatenation.master_wav_path)
         normalize_loudness(
             concatenation.master_wav_path,
             export_paths["normalized_wav"],
             target_lufs=settings.EXPORT_TARGET_LUFS,
         )
+        persist_checkpoint(
+            current_stage="Concatenation complete",
+            progress_percent=50.0,
+            current_format=None,
+            current_chapter_n=total_chapters or None,
+            total_chapters=total_chapters or None,
+            format_details=_serialize_format_details_payload(
+                format_results,
+                artifacts=checkpoint_artifacts,
+            ),
+        )
         _emit_progress(
             progress_callback,
             progress_percent=50.0,
-            stage="Concatenating chapters complete",
+            stage="Concatenation complete",
             current_chapter_n=total_chapters or None,
             total_chapters=total_chapters or None,
         )
@@ -1366,6 +1658,7 @@ def export_book_sync(
         )
 
         encoded_outputs: dict[str, Path] = {}
+        encoded_artifacts: dict[str, EncodedExportArtifact] = {}
         for format_index, export_format in enumerate(formats):
             ensure_active()
             encode_start = 50.0 + ((format_index / max(len(formats), 1)) * 30.0)
@@ -1392,21 +1685,40 @@ def export_book_sync(
 
             try:
                 if export_format == "mp3":
-                    export_mp3(
+                    encoded_artifact = export_mp3(
                         export_paths["normalized_wav"],
                         export_paths["mp3"],
                         book=book,
                         cover_art_path=cover_art_path,
                     )
                 else:
-                    export_m4b(
+                    encoded_artifact = export_m4b(
                         export_paths["normalized_wav"],
                         export_paths["m4b"],
                         book=book,
                         chapter_markers=concatenation.chapter_markers,
                         metadata_path=export_paths["metadata"],
                     )
+                encoded_artifacts[export_format] = encoded_artifact
                 encoded_outputs[export_format] = output_path
+                format_results[export_format] = ExportFormatResult(
+                    status="encoded",
+                    file_size_bytes=encoded_artifact.file_size_bytes,
+                    sha256=encoded_artifact.sha256,
+                    file_name=output_path.name,
+                    attempts=0,
+                )
+                persist_checkpoint(
+                    current_stage=_format_stage_label("Encoded", export_format),
+                    progress_percent=encode_end,
+                    current_format=export_format,
+                    current_chapter_n=total_chapters or None,
+                    total_chapters=total_chapters or None,
+                    format_details=_serialize_format_details_payload(
+                        format_results,
+                        artifacts=checkpoint_artifacts,
+                    ),
+                )
                 _emit_progress(
                     progress_callback,
                     progress_percent=encode_end,
@@ -1423,6 +1735,17 @@ def export_book_sync(
                     error_message=str(exc),
                     file_name=output_path.name,
                     file_size_bytes=output_path.stat().st_size if output_path.exists() else None,
+                )
+                persist_checkpoint(
+                    current_stage=_format_stage_label("Encoding failed", export_format),
+                    progress_percent=encode_end,
+                    current_format=export_format,
+                    current_chapter_n=total_chapters or None,
+                    total_chapters=total_chapters or None,
+                    format_details=_serialize_format_details_payload(
+                        format_results,
+                        artifacts=checkpoint_artifacts,
+                    ),
                 )
 
         verifiable_formats = [export_format for export_format in formats if export_format in encoded_outputs]
@@ -1463,14 +1786,14 @@ def export_book_sync(
 
                 ensure_active()
                 if export_format == "mp3":
-                    export_mp3(
+                    encoded_artifacts[export_format] = export_mp3(
                         export_paths["normalized_wav"],
                         export_paths["mp3"],
                         book=book,
                         cover_art_path=cover_art_path,
                     )
                 else:
-                    export_m4b(
+                    encoded_artifacts[export_format] = export_m4b(
                         export_paths["normalized_wav"],
                         export_paths["m4b"],
                         book=book,
@@ -1488,10 +1811,22 @@ def export_book_sync(
                 format_results[export_format] = ExportFormatResult(
                     status="error",
                     file_size_bytes=output_path.stat().st_size if output_path.exists() else None,
+                    sha256=encoded_artifacts.get(export_format).sha256 if export_format in encoded_artifacts else None,
                     file_name=output_path.name,
                     error_message=error_message,
                     verification=verification,
                     attempts=attempts,
+                )
+                persist_checkpoint(
+                    current_stage=_format_stage_label("Verification failed", export_format),
+                    progress_percent=verify_end,
+                    current_format=export_format,
+                    current_chapter_n=total_chapters or None,
+                    total_chapters=total_chapters or None,
+                    format_details=_serialize_format_details_payload(
+                        format_results,
+                        artifacts=checkpoint_artifacts,
+                    ),
                 )
                 _emit_progress(
                     progress_callback,
@@ -1505,12 +1840,24 @@ def export_book_sync(
 
             format_results[export_format] = ExportFormatResult(
                 status="completed",
-                file_size_bytes=output_path.stat().st_size,
+                file_size_bytes=encoded_artifacts[export_format].file_size_bytes,
+                sha256=encoded_artifacts[export_format].sha256,
                 file_name=output_path.name,
                 download_url=f"/api/book/{book.id}/export/download/{export_format}",
                 completed_at=utc_now(),
                 verification=verification,
                 attempts=attempts,
+            )
+            persist_checkpoint(
+                current_stage=_format_stage_label("Verified", export_format),
+                progress_percent=verify_end,
+                current_format=export_format,
+                current_chapter_n=total_chapters or None,
+                total_chapters=total_chapters or None,
+                format_details=_serialize_format_details_payload(
+                    format_results,
+                    artifacts=checkpoint_artifacts,
+                ),
             )
             _emit_progress(
                 progress_callback,
@@ -1556,6 +1903,23 @@ def export_book_sync(
     export_paths["qa_report"].write_text(
         json.dumps(qa_report.model_dump(mode="json"), indent=2),
         encoding="utf-8",
+    )
+    checkpoint_artifacts["qa_report"] = {
+        "file_name": export_paths["qa_report"].name,
+        "file_size_bytes": export_paths["qa_report"].stat().st_size,
+        "sha256": _file_sha256(export_paths["qa_report"]),
+    }
+    persist_checkpoint(
+        current_stage="Finalizing",
+        progress_percent=95.0,
+        current_format=None,
+        current_chapter_n=total_chapters or None,
+        total_chapters=total_chapters or None,
+        format_details=_serialize_format_details_payload(
+            format_results,
+            artifacts=checkpoint_artifacts,
+        ),
+        qa_report=qa_report,
     )
 
     _emit_progress(
@@ -1669,12 +2033,11 @@ def run_export_job_sync(export_job_id: int, session_factory: sessionmaker[Sessio
             progress_job.total_chapters = total_chapters
             progress_job.updated_at = utc_now()
             if export_format is not None:
-                try:
-                    format_details = json.loads(progress_job.format_details or "{}")
-                except json.JSONDecodeError:
-                    format_details = {}
+                format_details = _load_format_details_payload(progress_job.format_details)
                 current_details = format_details.get(export_format, {})
-                if current_details.get("status") != "completed":
+                if not isinstance(current_details, dict):
+                    current_details = {}
+                if current_details.get("status") in {None, "pending", "processing"}:
                     current_details["status"] = "processing"
                 format_details[export_format] = current_details
                 progress_job.format_details = json.dumps(format_details)
@@ -1721,6 +2084,7 @@ def run_export_job_sync(export_job_id: int, session_factory: sessionmaker[Sessio
             session_factory=session_factory,
             progress_callback=persist_progress,
             should_abort=ensure_job_active,
+            export_job_id=export_job_id,
         )
     except ExportCancelledError:
         logger.info("Export job %s cancelled before completion", export_job_id)

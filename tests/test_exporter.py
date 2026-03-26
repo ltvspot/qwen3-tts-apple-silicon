@@ -31,10 +31,13 @@ from src.pipeline.book_qa import BookQAReport
 from src.pipeline.exporter import (
     ChapterMarker,
     ConcatenationResult,
+    EncodedExportArtifact,
     QAChapterSummary,
     QAReport,
     SelectedChapter,
     _build_export_paths,
+    _file_sha256,
+    _persist_export_checkpoint,
     concatenate_chapters_sync,
     export_book_sync,
     run_export_job_sync,
@@ -311,7 +314,9 @@ def test_export_book_sync_writes_mp3_m4b_and_qa_report(
     assert qa_report["chapters_included"] == 3
     assert qa_report["chapters_approved"] == 3
     assert result.formats["mp3"].file_size_bytes == export_paths["mp3"].stat().st_size
+    assert result.formats["mp3"].sha256 == _file_sha256(export_paths["mp3"])
     assert result.formats["m4b"].file_size_bytes == export_paths["m4b"].stat().st_size
+    assert result.formats["m4b"].sha256 == _file_sha256(export_paths["m4b"])
     assert result.formats["mp3"].attempts == 1
     assert result.formats["m4b"].attempts == 1
     assert result.formats["mp3"].verification is not None
@@ -380,10 +385,12 @@ def test_run_export_job_sync_persists_progress_updates(
         session_factory=None,
         progress_callback=None,
         should_abort=None,
+        export_job_id=None,
     ) -> ExportResult:
         del book_id, export_formats, include_only_approved, should_abort
         assert session_factory is not None
         assert progress_callback is not None
+        assert export_job_id == export_job.id
         progress_callback(20.0, "Mastering complete", None, None, 3)
         with session_factory() as progress_session:
             job = progress_session.query(ExportJob).filter(ExportJob.id == export_job.id).one()
@@ -447,6 +454,94 @@ def test_run_export_job_sync_persists_progress_updates(
     assert export_job.current_chapter_n == 3
     assert export_job.total_chapters == 3
     assert book.export_status == BookExportStatus.COMPLETED
+
+
+def test_persist_export_checkpoint_updates_db_fields_in_isolation(test_db: Session) -> None:
+    """Checkpoint persistence should update export state via a detached session."""
+
+    book = _create_book(test_db, title="Checkpoint Isolation")
+    export_job = ExportJob(
+        book_id=book.id,
+        job_token=f"export_{book.id}_20260326_120000",
+        export_status=BookExportStatus.PROCESSING,
+        formats_requested=json.dumps(["mp3"]),
+        format_details=json.dumps({"mp3": {"status": "pending"}}),
+        include_only_approved=True,
+        started_at=utc_now(),
+        updated_at=utc_now(),
+    )
+    test_db.add(export_job)
+    test_db.commit()
+    test_db.refresh(export_job)
+
+    session_factory = sessionmaker(
+        bind=test_db.get_bind(),
+        autoflush=False,
+        autocommit=False,
+        expire_on_commit=False,
+    )
+    qa_report = QAReport(
+        book_id=book.id,
+        book_title=book.title,
+        export_date=utc_now(),
+        chapters_included=1,
+        chapters_approved=1,
+        chapters_flagged=0,
+        chapters_warnings=0,
+        export_approved=True,
+        notes="Checkpointed report",
+        chapter_summary=[
+            QAChapterSummary(
+                chapter_n=1,
+                chapter_title="Chapter One",
+                status="approved",
+                file_size_bytes=123,
+                duration_seconds=1.0,
+            )
+        ],
+    )
+
+    _persist_export_checkpoint(
+        session_factory,
+        export_job.id,
+        {
+            "current_stage": "Concatenation complete",
+            "progress_percent": 50.0,
+            "format_details": {
+                "mp3": {
+                    "status": "encoded",
+                    "file_name": "checkpoint.mp3",
+                    "file_size_bytes": 321,
+                    "sha256": "abc123",
+                },
+                "_artifacts": {
+                    "master_wav_hash": "master123",
+                },
+            },
+            "qa_report": qa_report,
+        },
+    )
+
+    with session_factory() as verify_session:
+        persisted_job = verify_session.query(ExportJob).filter(ExportJob.id == export_job.id).one()
+        payload = json.loads(persisted_job.format_details)
+        persisted_report = json.loads(persisted_job.qa_report or "{}")
+
+    assert persisted_job.current_stage == "Concatenation complete"
+    assert persisted_job.progress_percent == 50.0
+    assert payload["mp3"]["status"] == "encoded"
+    assert payload["mp3"]["sha256"] == "abc123"
+    assert payload["_artifacts"]["master_wav_hash"] == "master123"
+    assert persisted_report["notes"] == "Checkpointed report"
+
+
+def test_file_sha256_matches_known_hash(tmp_path: Path) -> None:
+    """Chunked SHA256 hashing should match a known digest."""
+
+    target = tmp_path / "hash.txt"
+    target.write_text("abc", encoding="utf-8")
+
+    assert _file_sha256(target) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
 
 
 def test_export_book_sync_reports_mastering_and_qa_progress_ranges(
@@ -563,14 +658,19 @@ def test_export_book_sync_reports_mastering_and_qa_progress_ranges(
         "src.pipeline.exporter.normalize_loudness",
         lambda _input_path, output_path, target_lufs: output_path.write_bytes(f"{target_lufs}".encode()),
     )
-    monkeypatch.setattr(
-        "src.pipeline.exporter.export_mp3",
-        lambda _input_path, output_path, **kwargs: output_path.write_bytes(b"mp3"),
-    )
-    monkeypatch.setattr(
-        "src.pipeline.exporter.export_m4b",
-        lambda _input_path, output_path, **kwargs: output_path.write_bytes(b"m4b"),
-    )
+
+    def fake_export_mp3(_input_path, output_path, **kwargs) -> EncodedExportArtifact:
+        del kwargs
+        output_path.write_bytes(b"mp3")
+        return EncodedExportArtifact(file_size_bytes=3, sha256="mp3hash")
+
+    def fake_export_m4b(_input_path, output_path, **kwargs) -> EncodedExportArtifact:
+        del kwargs
+        output_path.write_bytes(b"m4b")
+        return EncodedExportArtifact(file_size_bytes=3, sha256="m4bhash")
+
+    monkeypatch.setattr("src.pipeline.exporter.export_mp3", fake_export_mp3)
+    monkeypatch.setattr("src.pipeline.exporter.export_m4b", fake_export_m4b)
     monkeypatch.setattr(
         "src.pipeline.exporter._verify_export_output",
         lambda output_path, **kwargs: {
@@ -610,8 +710,96 @@ def test_export_book_sync_reports_mastering_and_qa_progress_ranges(
     assert (12.5, "Mastering chapters", None) in progress_events
     assert (25.0, "Running QA analysis", None) in progress_events
     assert (40.0, "Concatenating chapters", None) in progress_events
-    assert (50.0, "Concatenating chapters complete", None) in progress_events
+    assert (30.0, "Mastering complete", None) in progress_events
+    assert (50.0, "Concatenation complete", None) in progress_events
     assert any(percent == 50.0 and stage.startswith("Encoding MP3") and export_format == "mp3" for percent, stage, export_format in progress_events)
     assert any(percent == 80.0 and stage.startswith("Verifying output MP3") and export_format == "mp3" for percent, stage, export_format in progress_events)
     assert (95.0, "Finalizing", None) in progress_events
     assert progress_events[-1] == (100.0, "Ready", None)
+
+
+def test_export_book_sync_persists_mastering_checkpoint_before_crash(
+    test_db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A crash after mastering should leave the DB at the last persisted milestone."""
+
+    monkeypatch.setattr(settings, "EXPORT_INCLUDE_ALBUM_ART", False)
+    book = _create_book(test_db, title="Crash After Mastering")
+    export_job = ExportJob(
+        book_id=book.id,
+        job_token=f"export_{book.id}_20260326_130000",
+        export_status=BookExportStatus.PROCESSING,
+        formats_requested=json.dumps(["mp3"]),
+        format_details=json.dumps({"mp3": {"status": "pending"}}),
+        include_only_approved=True,
+        started_at=utc_now(),
+        updated_at=utc_now(),
+    )
+    test_db.add(export_job)
+    test_db.commit()
+    test_db.refresh(export_job)
+
+    session_factory = sessionmaker(
+        bind=test_db.get_bind(),
+        autoflush=False,
+        autocommit=False,
+        expire_on_commit=False,
+    )
+
+    def fake_master_book_sync(
+        self,
+        book_id: int,
+        db_session: Session,
+        *,
+        prefer_fast_chain=None,
+        export_mode=False,
+        progress_callback=None,
+        session_factory=None,
+    ) -> MasteringReport:
+        del self, book_id, db_session, prefer_fast_chain, export_mode, progress_callback, session_factory
+        return MasteringReport(
+            book_id=book.id,
+            mastered_chapters=1,
+            loudness_adjustments=[],
+            edge_normalized_chapters=[],
+            peak_limited_chapters=[],
+            notes=[],
+            blockers=[],
+            book_report=BookQAReport(
+                book_id=book.id,
+                title=book.title,
+                total_chapters=1,
+                chapters_grade_a=1,
+                chapters_grade_b=0,
+                chapters_grade_c=0,
+                chapters_grade_f=0,
+                overall_grade="A",
+                ready_for_export=True,
+                cross_chapter_checks={},
+                recommendations=[],
+                export_blockers=[],
+            ),
+        )
+
+    monkeypatch.setattr("src.pipeline.exporter.BookMasteringPipeline.master_book_sync", fake_master_book_sync)
+    monkeypatch.setattr(
+        "src.pipeline.exporter.concatenate_chapters_sync",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("simulated crash after mastering")),
+    )
+
+    with pytest.raises(RuntimeError, match="simulated crash after mastering"):
+        export_book_sync(
+            book.id,
+            export_formats=["mp3"],
+            include_only_approved=True,
+            session_factory=session_factory,
+            export_job_id=export_job.id,
+        )
+
+    with session_factory() as verify_session:
+        persisted_job = verify_session.query(ExportJob).filter(ExportJob.id == export_job.id).one()
+
+    assert persisted_job.export_status == BookExportStatus.PROCESSING
+    assert persisted_job.progress_percent == 30.0
+    assert persisted_job.current_stage == "Mastering complete"

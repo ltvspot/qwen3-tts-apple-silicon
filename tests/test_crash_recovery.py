@@ -8,7 +8,8 @@ from datetime import timedelta
 from pathlib import Path
 
 import pytest
-from sqlalchemy import text
+from pydub import AudioSegment
+from sqlalchemy import event, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -29,7 +30,14 @@ from src.database import (
     utc_now,
 )
 from src.config import settings
-from src.pipeline.exporter import get_export_output_path
+from src.pipeline.exporter import (
+    QAChapterSummary,
+    QAReport,
+    _build_export_paths,
+    _file_sha256,
+    get_export_output_path,
+    reconcile_export_job_state,
+)
 from src.pipeline.queue_manager import GenerationQueue
 from src.startup import cleanup_startup_export_state, cleanup_startup_generation_state, recover_orphaned_jobs
 
@@ -75,6 +83,42 @@ def _create_chapter(
     test_db.commit()
     test_db.refresh(chapter)
     return chapter
+
+
+def _write_recoverable_audio(path: Path, *, format_name: str = "mp3") -> None:
+    """Write a tiny decodable export artifact for recovery tests."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    AudioSegment.silent(duration=1000).export(path, format=format_name)
+
+
+def _write_recovered_qa_report(book: Book) -> tuple[Path, QAReport]:
+    """Write a valid QA report artifact for recovery tests."""
+
+    report = QAReport(
+        book_id=book.id,
+        book_title=book.title,
+        export_date=utc_now(),
+        chapters_included=0,
+        chapters_approved=0,
+        chapters_flagged=0,
+        chapters_warnings=0,
+        export_approved=True,
+        notes="Recovered QA artifact.",
+        chapter_summary=[
+            QAChapterSummary(
+                chapter_n=0,
+                chapter_title="Recovered",
+                status="approved",
+                file_size_bytes=0,
+                duration_seconds=0.0,
+            )
+        ],
+    )
+    qa_report_path = _build_export_paths(book)["qa_report"]
+    qa_report_path.parent.mkdir(parents=True, exist_ok=True)
+    qa_report_path.write_text(json.dumps(report.model_dump(mode="json"), indent=2), encoding="utf-8")
+    return qa_report_path, report
 
 
 class RecordingGenerator:
@@ -298,8 +342,7 @@ def test_startup_export_cleanup_recovers_existing_files(test_db: Session) -> Non
     test_db.commit()
 
     output_path = get_export_output_path(book, "mp3")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_bytes(b"recovered mp3")
+    _write_recoverable_audio(output_path, format_name="mp3")
 
     recovered, timed_out = cleanup_startup_export_state(test_db)
 
@@ -348,8 +391,7 @@ def test_startup_export_cleanup_creates_job_for_manual_exports(test_db: Session)
 
     book = _create_book(test_db, title="Manual Export Recovery")
     output_path = get_export_output_path(book, "mp3")
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_bytes(b"manual export")
+    _write_recoverable_audio(output_path, format_name="mp3")
 
     recovered, timed_out = cleanup_startup_export_state(test_db)
 
@@ -361,6 +403,161 @@ def test_startup_export_cleanup_creates_job_for_manual_exports(test_db: Session)
     assert export_job.current_stage == "Export completed"
     assert export_job.qa_report is not None
     assert book.export_status == BookExportStatus.COMPLETED
+
+
+def test_reconcile_export_job_state_recovers_hashed_artifacts(test_db: Session) -> None:
+    """Recovery should succeed when on-disk hashes match the persisted export metadata."""
+
+    book = _create_book(test_db, title="Hashed Recovery")
+    output_path = get_export_output_path(book, "mp3")
+    _write_recoverable_audio(output_path, format_name="mp3")
+    qa_report_path, qa_report = _write_recovered_qa_report(book)
+    completed_at = utc_now()
+    export_job = ExportJob(
+        book_id=book.id,
+        job_token=f"export_{book.id}_20260326_150000",
+        export_status=BookExportStatus.PROCESSING,
+        formats_requested=json.dumps(["mp3"]),
+        format_details=json.dumps(
+            {
+                "mp3": {
+                    "status": "completed",
+                    "file_name": output_path.name,
+                    "file_size_bytes": output_path.stat().st_size,
+                    "sha256": _file_sha256(output_path),
+                    "completed_at": completed_at.isoformat(),
+                },
+                "_artifacts": {
+                    "qa_report": {
+                        "file_name": qa_report_path.name,
+                        "file_size_bytes": qa_report_path.stat().st_size,
+                        "sha256": _file_sha256(qa_report_path),
+                    }
+                },
+            }
+        ),
+        include_only_approved=True,
+        started_at=completed_at,
+        updated_at=completed_at,
+    )
+    test_db.add(export_job)
+    book.export_status = BookExportStatus.PROCESSING
+    test_db.commit()
+
+    result = reconcile_export_job_state(test_db, book, export_job)
+
+    test_db.refresh(export_job)
+    test_db.refresh(book)
+    assert result == "recovered"
+    assert export_job.export_status == BookExportStatus.COMPLETED
+    assert export_job.qa_report is not None
+    assert json.loads(export_job.qa_report)["notes"] == qa_report.notes
+    assert book.export_status == BookExportStatus.COMPLETED
+
+
+def test_reconcile_export_job_state_skips_mismatched_hash(test_db: Session) -> None:
+    """Recovery should fail gracefully when a persisted output hash no longer matches disk."""
+
+    book = _create_book(test_db, title="Mismatched Hash Recovery")
+    output_path = get_export_output_path(book, "mp3")
+    _write_recoverable_audio(output_path, format_name="mp3")
+    qa_report_path, _ = _write_recovered_qa_report(book)
+    export_job = ExportJob(
+        book_id=book.id,
+        job_token=f"export_{book.id}_20260326_151500",
+        export_status=BookExportStatus.PROCESSING,
+        formats_requested=json.dumps(["mp3"]),
+        format_details=json.dumps(
+            {
+                "mp3": {
+                    "status": "completed",
+                    "file_name": output_path.name,
+                    "file_size_bytes": output_path.stat().st_size,
+                    "sha256": "0" * 64,
+                },
+                "_artifacts": {
+                    "qa_report": {
+                        "file_name": qa_report_path.name,
+                        "file_size_bytes": qa_report_path.stat().st_size,
+                        "sha256": _file_sha256(qa_report_path),
+                    }
+                },
+            }
+        ),
+        include_only_approved=True,
+        started_at=utc_now(),
+        updated_at=utc_now(),
+    )
+    test_db.add(export_job)
+    book.export_status = BookExportStatus.PROCESSING
+    test_db.commit()
+
+    result = reconcile_export_job_state(test_db, book, export_job)
+
+    test_db.refresh(export_job)
+    test_db.refresh(book)
+    assert result is None
+    assert export_job.export_status == BookExportStatus.PROCESSING
+    assert export_job.current_stage is None
+    assert book.export_status == BookExportStatus.PROCESSING
+
+
+def test_reconcile_export_job_state_rolls_back_when_book_update_fails(test_db: Session) -> None:
+    """Recovery should roll back export_job changes if the book update fails."""
+
+    book = _create_book(test_db, title="Atomic Recovery")
+    output_path = get_export_output_path(book, "mp3")
+    _write_recoverable_audio(output_path, format_name="mp3")
+    qa_report_path, _ = _write_recovered_qa_report(book)
+    export_job = ExportJob(
+        book_id=book.id,
+        job_token=f"export_{book.id}_20260326_153000",
+        export_status=BookExportStatus.PROCESSING,
+        formats_requested=json.dumps(["mp3"]),
+        format_details=json.dumps(
+            {
+                "mp3": {
+                    "status": "completed",
+                    "file_name": output_path.name,
+                    "file_size_bytes": output_path.stat().st_size,
+                    "sha256": _file_sha256(output_path),
+                },
+                "_artifacts": {
+                    "qa_report": {
+                        "file_name": qa_report_path.name,
+                        "file_size_bytes": qa_report_path.stat().st_size,
+                        "sha256": _file_sha256(qa_report_path),
+                    }
+                },
+            }
+        ),
+        include_only_approved=True,
+        started_at=utc_now(),
+        updated_at=utc_now(),
+    )
+    test_db.add(export_job)
+    book.export_status = BookExportStatus.PROCESSING
+    test_db.commit()
+
+    def fail_book_status_set(_target, value, _oldvalue, _initiator):
+        if value == BookStatus.EXPORTED:
+            raise RuntimeError("synthetic book update failure")
+        return value
+
+    event.listen(Book.status, "set", fail_book_status_set, retval=True)
+    try:
+        with pytest.raises(RuntimeError, match="synthetic book update failure"):
+            reconcile_export_job_state(test_db, book, export_job)
+    finally:
+        event.remove(Book.status, "set", fail_book_status_set)
+
+    test_db.expire_all()
+    rolled_back_job = test_db.query(ExportJob).filter(ExportJob.id == export_job.id).one()
+    rolled_back_book = test_db.query(Book).filter(Book.id == book.id).one()
+    assert rolled_back_job.export_status == BookExportStatus.PROCESSING
+    assert rolled_back_job.qa_report is None
+    assert rolled_back_book.export_status == BookExportStatus.PROCESSING
+    assert rolled_back_book.status == BookStatus.PARSED
 
 
 @pytest.mark.asyncio

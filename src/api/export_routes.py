@@ -37,6 +37,53 @@ _batch_export_monitor_task: asyncio.Task[None] | None = None
 _batch_export_progress: "BatchExportProgressResponse | None" = None
 
 
+def _track_export_task(task: asyncio.Task[None]) -> asyncio.Task[None]:
+    """Register one in-process export task under the shared runtime lock."""
+
+    with _export_threads_lock:
+        _export_tasks.add(task)
+    return task
+
+
+def _discard_export_task(task: asyncio.Task[None]) -> None:
+    """Remove one tracked export task under the shared runtime lock."""
+
+    with _export_threads_lock:
+        _export_tasks.discard(task)
+
+
+def _snapshot_export_tasks() -> list[asyncio.Task[None]]:
+    """Return a stable snapshot of tracked export tasks."""
+
+    with _export_threads_lock:
+        return list(_export_tasks)
+
+
+def _snapshot_export_threads() -> list[threading.Thread]:
+    """Return a stable snapshot of tracked export threads."""
+
+    with _export_threads_lock:
+        return list(_export_threads.values())
+
+
+def _clear_export_threads() -> list[threading.Thread]:
+    """Clear tracked export threads and return the prior snapshot."""
+
+    with _export_threads_lock:
+        threads = list(_export_threads.values())
+        _export_threads.clear()
+    return threads
+
+
+def _clear_export_tasks() -> list[asyncio.Task[None]]:
+    """Clear tracked export tasks and return the prior snapshot."""
+
+    with _export_threads_lock:
+        tasks = list(_export_tasks)
+        _export_tasks.clear()
+    return tasks
+
+
 class ExportRequest(BaseModel):
     """Request payload for starting an export."""
 
@@ -727,14 +774,15 @@ async def batch_export(
     with _batch_export_lock:
         _batch_export_progress = state
         if queued_book_ids:
-            _batch_export_monitor_task = asyncio.create_task(
+            _batch_export_monitor_task = _track_export_task(asyncio.create_task(
                 _monitor_batch_export(
                     batch_id=batch_id,
                     book_ids=queued_book_ids,
                     session_factory=session_factory,
                 ),
                 name=f"batch-export-{batch_id}",
-            )
+            ))
+            _batch_export_monitor_task.add_done_callback(_discard_export_task)
         else:
             _batch_export_monitor_task = None
 
