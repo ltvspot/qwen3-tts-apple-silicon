@@ -20,7 +20,14 @@ fi
 if [ ! -f "frontend/build/index.html" ]; then
     echo "-> Frontend not built. Building now..."
     cd frontend
-    npm install --silent
+    if [ -f ".nvmrc" ] && [ -s "${NVM_DIR:-$HOME/.nvm}/nvm.sh" ]; then
+        # Align frontend tooling with the pinned Node.js LTS version.
+        export NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+        . "$NVM_DIR/nvm.sh"
+        nvm use >/dev/null
+        echo "[ok] Using Node $(node -v)"
+    fi
+    npm ci --silent --no-audit --no-fund
     npm run build
     cd ..
     echo "[ok] Frontend built"

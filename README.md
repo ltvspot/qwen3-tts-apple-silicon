@@ -44,7 +44,8 @@ python src/main.py
 
 ```bash
 cd frontend
-npm install
+nvm use
+npm ci
 npm run build
 ```
 
