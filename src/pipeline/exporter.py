@@ -11,7 +11,7 @@ import subprocess
 import wave
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +45,8 @@ logger = logging.getLogger(__name__)
 DEFAULT_EXPORT_FORMATS = ("mp3", "m4b")
 VALID_EXPORT_FORMATS = frozenset(DEFAULT_EXPORT_FORMATS)
 ExportProgressCallback = Callable[[float, str | None, str | None, int | None, int | None], None]
+EXPORT_VERIFY_TIMEOUT_SECONDS = 30
+EXPORT_STALE_TIMEOUT = timedelta(minutes=15)
 
 
 class ExportFormatResult(BaseModel):
@@ -96,6 +98,10 @@ class ExportResult(BaseModel):
 
 class ExportBlockedError(RuntimeError):
     """Raised when mastering finds blocking issues that must be fixed before export."""
+
+
+class ExportCancelledError(RuntimeError):
+    """Raised when an operator force-cancels an in-flight export job."""
 
 
 @dataclass(slots=True)
@@ -752,6 +758,7 @@ def _probe_media(path: Path) -> dict[str, Any]:
         check=True,
         capture_output=True,
         text=True,
+        timeout=EXPORT_VERIFY_TIMEOUT_SECONDS,
     )
     return json.loads(completed.stdout or "{}")
 
@@ -840,6 +847,151 @@ def get_export_output_path(book: Book, export_format: str) -> Path:
     if export_format not in VALID_EXPORT_FORMATS:
         raise ValueError(f"Unsupported export format: {export_format}")
     return _build_export_paths(book)[export_format]
+
+
+def _job_formats_requested(export_job: ExportJob | None) -> list[str]:
+    """Return the normalized requested formats for one persisted export job."""
+
+    if export_job is None:
+        return list(DEFAULT_EXPORT_FORMATS)
+
+    try:
+        return _normalize_export_formats(json.loads(export_job.formats_requested))
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return list(DEFAULT_EXPORT_FORMATS)
+
+
+def _existing_export_artifacts(
+    book: Book,
+    *,
+    formats_requested: list[str] | None = None,
+) -> tuple[dict[str, ExportFormatResult], datetime | None, bool]:
+    """Return on-disk export artifacts already present for one book."""
+
+    requested = _normalize_export_formats(formats_requested)
+    latest_completed_at: datetime | None = None
+    found_any = False
+    results = _empty_format_details(requested)
+
+    for export_format in requested:
+        output_path = get_export_output_path(book, export_format)
+        if not output_path.exists():
+            continue
+
+        found_any = True
+        stat_result = output_path.stat()
+        completed_at = datetime.fromtimestamp(stat_result.st_mtime, tz=timezone.utc)
+        if latest_completed_at is None or completed_at > latest_completed_at:
+            latest_completed_at = completed_at
+        results[export_format] = ExportFormatResult(
+            status="completed",
+            file_size_bytes=stat_result.st_size,
+            file_name=output_path.name,
+            download_url=f"/api/book/{book.id}/export/download/{export_format}",
+            completed_at=completed_at,
+        )
+
+    return (results, latest_completed_at, found_any)
+
+
+def _as_utc_datetime(value: datetime | None) -> datetime | None:
+    """Normalize persisted datetimes so SQLite naive values compare safely."""
+
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def reconcile_export_job_state(
+    db_session: Session,
+    book: Book,
+    export_job: ExportJob,
+    *,
+    now: datetime | None = None,
+) -> str | None:
+    """Reconcile a persisted export job against stale timers and disk artifacts."""
+
+    now = _as_utc_datetime(now or utc_now()) or utc_now()
+    requested_formats = _job_formats_requested(export_job)
+    format_details, completed_at, found_any = _existing_export_artifacts(
+        book,
+        formats_requested=requested_formats,
+    )
+
+    if found_any and export_job.export_status in {BookExportStatus.PROCESSING, BookExportStatus.ERROR}:
+        export_job.export_status = BookExportStatus.COMPLETED
+        export_job.progress_percent = 100.0
+        export_job.current_stage = "Recovered from existing export files"
+        export_job.current_format = None
+        export_job.completed_at = completed_at or now
+        export_job.updated_at = now
+        export_job.error_message = None
+        export_job.format_details = json.dumps(
+            {name: result.model_dump(mode="json") for name, result in format_details.items()}
+        )
+        book.export_status = BookExportStatus.COMPLETED
+        book.last_export_date = export_job.completed_at
+        book.status = BookStatus.EXPORTED
+        db_session.commit()
+        return "recovered"
+
+    last_activity = _as_utc_datetime(export_job.updated_at or export_job.started_at or export_job.created_at)
+    if export_job.export_status == BookExportStatus.PROCESSING and last_activity < (now - EXPORT_STALE_TIMEOUT):
+        export_job.export_status = BookExportStatus.ERROR
+        export_job.current_stage = "Export timed out"
+        export_job.completed_at = now
+        export_job.updated_at = now
+        export_job.error_message = "Export timed out after 15 minutes without a progress update."
+        book.export_status = BookExportStatus.ERROR
+        db_session.commit()
+        return "timed_out"
+
+    return None
+
+
+def reconcile_book_export_artifacts(db_session: Session, book: Book) -> bool:
+    """Create or repair export metadata for books that already have export files on disk."""
+
+    export_job = db_session.query(ExportJob).filter(ExportJob.book_id == book.id).first()
+    if export_job is not None:
+        return reconcile_export_job_state(db_session, book, export_job) == "recovered"
+
+    format_details, completed_at, found_any = _existing_export_artifacts(
+        book,
+        formats_requested=list(DEFAULT_EXPORT_FORMATS),
+    )
+    if not found_any:
+        return False
+
+    created_at = completed_at or utc_now()
+    completed_formats = [name for name, result in format_details.items() if result.status == "completed"]
+    export_job = ExportJob(
+        book_id=book.id,
+        job_token=f"recovered_export_{book.id}_{created_at.strftime('%Y%m%d_%H%M%S')}",
+        export_status=BookExportStatus.COMPLETED,
+        formats_requested=json.dumps(completed_formats or list(DEFAULT_EXPORT_FORMATS)),
+        format_details=json.dumps({name: result.model_dump(mode="json") for name, result in format_details.items()}),
+        progress_percent=100.0,
+        current_stage="Recovered from existing export files",
+        current_format=None,
+        current_chapter_n=None,
+        total_chapters=None,
+        include_only_approved=True,
+        created_at=created_at,
+        started_at=created_at,
+        completed_at=created_at,
+        updated_at=utc_now(),
+        error_message=None,
+        qa_report=None,
+    )
+    db_session.add(export_job)
+    book.export_status = BookExportStatus.COMPLETED
+    book.last_export_date = created_at
+    book.status = BookStatus.EXPORTED
+    db_session.commit()
+    return True
 
 
 def _build_qa_report(
@@ -954,11 +1106,16 @@ def export_book_sync(
     include_only_approved: bool = True,
     session_factory: sessionmaker[Session] | None = None,
     progress_callback: ExportProgressCallback | None = None,
+    should_abort: Callable[[], None] | None = None,
 ) -> ExportResult:
     """Synchronously export a completed book into MP3 and/or M4B formats."""
 
     formats = _normalize_export_formats(export_formats)
     session_factory = session_factory or SessionLocal
+
+    def ensure_active() -> None:
+        if should_abort is not None:
+            should_abort()
 
     with session_factory() as db_session:
         book = db_session.query(Book).filter(Book.id == book_id).first()
@@ -985,9 +1142,15 @@ def export_book_sync(
             progress_percent=0.0,
             stage="Preparing export job",
         )
+        ensure_active()
 
         mastering = BookMasteringPipeline()
-        mastering_report = mastering.master_book_sync(book_id, db_session)
+        _emit_progress(
+            progress_callback,
+            progress_percent=5.0,
+            stage="Mastering chapters",
+        )
+        mastering_report = mastering.master_book_sync(book_id, db_session, prefer_fast_chain=True)
         if mastering_report.loudness_adjustments:
             mastering_notes.append(
                 f"Mastering leveled {len(mastering_report.loudness_adjustments)} chapters toward -20 LUFS."
@@ -1005,63 +1168,67 @@ def export_book_sync(
             raise ExportBlockedError(
                 "Mastering found blocking issues: " + "; ".join(mastering_report.blockers)
             )
+        _emit_progress(
+            progress_callback,
+            progress_percent=20.0,
+            stage="Mastering complete",
+        )
 
         try:
-            for format_index, export_format in enumerate(formats):
-                format_share = 100.0 / max(len(formats), 1)
-                format_start = format_index * format_share
-                stitch_end = format_start + (format_share * 0.8)
-                format_end = format_start + format_share
-
-                if concatenation is None:
-                    def report_concatenation_progress(current_chapter_n: int, chapter_count: int) -> None:
-                        _emit_progress(
-                            progress_callback,
-                            progress_percent=format_start + ((current_chapter_n / max(chapter_count, 1)) * (format_share * 0.8)),
-                            stage=_format_stage_label(
-                                "Stitching",
-                                export_format,
-                                current_chapter_n=current_chapter_n,
-                                total_chapters=chapter_count,
-                            ),
-                            export_format=export_format,
-                            current_chapter_n=current_chapter_n,
-                            total_chapters=chapter_count,
-                        )
-
-                    concatenation = concatenate_chapters_sync(
-                        book_id,
-                        include_only_approved=include_only_approved,
-                        chapter_silence_seconds=settings.EXPORT_CHAPTER_SILENCE_SECONDS,
-                        opening_silence_seconds=settings.EXPORT_OPENING_SILENCE_SECONDS,
-                        closing_silence_seconds=settings.EXPORT_CLOSING_SILENCE_SECONDS,
-                        session_factory=session_factory,
-                        progress_callback=report_concatenation_progress,
-                    )
-                    total_chapters = len(concatenation.included_chapters)
-                    normalize_loudness(
-                        concatenation.master_wav_path,
-                        export_paths["normalized_wav"],
-                        target_lufs=settings.EXPORT_TARGET_LUFS,
-                    )
-                else:
-                    _emit_progress(
-                        progress_callback,
-                        progress_percent=stitch_end,
-                        stage=_format_stage_label(
-                            "Stitching",
-                            export_format,
-                            current_chapter_n=total_chapters or None,
-                            total_chapters=total_chapters or None,
-                        ),
-                        export_format=export_format,
-                        current_chapter_n=total_chapters or None,
-                        total_chapters=total_chapters or None,
-                    )
-
+            def report_concatenation_progress(current_chapter_n: int, chapter_count: int) -> None:
+                ensure_active()
                 _emit_progress(
                     progress_callback,
-                    progress_percent=stitch_end,
+                    progress_percent=20.0 + ((current_chapter_n / max(chapter_count, 1)) * 60.0),
+                    stage=_format_stage_label(
+                        "Stitching",
+                        None,
+                        current_chapter_n=current_chapter_n,
+                        total_chapters=chapter_count,
+                    ),
+                    current_chapter_n=current_chapter_n,
+                    total_chapters=chapter_count,
+                )
+
+            concatenation = concatenate_chapters_sync(
+                book_id,
+                include_only_approved=include_only_approved,
+                chapter_silence_seconds=settings.EXPORT_CHAPTER_SILENCE_SECONDS,
+                opening_silence_seconds=settings.EXPORT_OPENING_SILENCE_SECONDS,
+                closing_silence_seconds=settings.EXPORT_CLOSING_SILENCE_SECONDS,
+                session_factory=session_factory,
+                progress_callback=report_concatenation_progress,
+            )
+            ensure_active()
+            total_chapters = len(concatenation.included_chapters)
+            normalize_loudness(
+                concatenation.master_wav_path,
+                export_paths["normalized_wav"],
+                target_lufs=settings.EXPORT_TARGET_LUFS,
+            )
+            _emit_progress(
+                progress_callback,
+                progress_percent=80.0,
+                stage="Master WAV normalized",
+                current_chapter_n=total_chapters or None,
+                total_chapters=total_chapters or None,
+            )
+
+            expected_duration_seconds = (
+                concatenation.chapter_markers[-1].end_ms / 1000.0
+                if concatenation.chapter_markers
+                else sum(chapter.duration_seconds for chapter in concatenation.included_chapters)
+            )
+
+            encoded_outputs: dict[str, Path] = {}
+            for format_index, export_format in enumerate(formats):
+                ensure_active()
+                encode_start = 80.0 + ((format_index / max(len(formats), 1)) * 15.0)
+                encode_end = 80.0 + (((format_index + 1) / max(len(formats), 1)) * 15.0)
+                output_path = export_paths["mp3"] if export_format == "mp3" else export_paths["m4b"]
+                _emit_progress(
+                    progress_callback,
+                    progress_percent=encode_start,
                     stage=_format_stage_label(
                         "Encoding",
                         export_format,
@@ -1074,94 +1241,145 @@ def export_book_sync(
                 )
 
                 try:
-                    output_path = export_paths["mp3"] if export_format == "mp3" else export_paths["m4b"]
-                    verification: dict[str, Any] | None = None
-                    attempts = 0
-                    expected_duration_seconds = (
-                        concatenation.chapter_markers[-1].end_ms / 1000.0
-                        if concatenation.chapter_markers
-                        else sum(chapter.duration_seconds for chapter in concatenation.included_chapters)
-                    )
-
-                    for attempts in range(1, 3):
-                        if export_format == "mp3":
-                            export_mp3(
-                                export_paths["normalized_wav"],
-                                export_paths["mp3"],
-                                book=book,
-                                cover_art_path=cover_art_path,
-                            )
-                        else:
-                            export_m4b(
-                                export_paths["normalized_wav"],
-                                export_paths["m4b"],
-                                book=book,
-                                chapter_markers=concatenation.chapter_markers,
-                                metadata_path=export_paths["metadata"],
-                            )
-
-                        verification = _verify_export_output(
-                            output_path,
-                            expected_duration_seconds=expected_duration_seconds,
-                            export_format=export_format,
-                            expected_markers=concatenation.chapter_markers if export_format == "m4b" else None,
+                    if export_format == "mp3":
+                        export_mp3(
+                            export_paths["normalized_wav"],
+                            export_paths["mp3"],
+                            book=book,
+                            cover_art_path=cover_art_path,
                         )
-                        if verification.get("ok"):
-                            break
-                        logger.warning(
-                            "Export verification failed for %s on attempt %s: %s",
-                            output_path,
-                            attempts,
-                            "; ".join(verification.get("issues", [])),
+                    else:
+                        export_m4b(
+                            export_paths["normalized_wav"],
+                            export_paths["m4b"],
+                            book=book,
+                            chapter_markers=concatenation.chapter_markers,
+                            metadata_path=export_paths["metadata"],
                         )
-                    if verification is None or not verification.get("ok"):
-                        raise RuntimeError(
-                            "Export verification failed: "
-                            + "; ".join((verification or {}).get("issues", ["unknown verification error"]))
-                        )
-
-                    format_results[export_format] = ExportFormatResult(
-                        status="completed",
-                        file_size_bytes=output_path.stat().st_size,
-                        file_name=output_path.name,
-                        download_url=f"/api/book/{book.id}/export/download/{export_format}",
-                        completed_at=utc_now(),
-                        verification=verification,
-                        attempts=attempts,
-                    )
+                    encoded_outputs[export_format] = output_path
                     _emit_progress(
                         progress_callback,
-                        progress_percent=format_end,
-                        stage=_format_stage_label("Completed", export_format),
+                        progress_percent=encode_end,
+                        stage=_format_stage_label("Encoded", export_format),
                         export_format=export_format,
                         current_chapter_n=total_chapters or None,
                         total_chapters=total_chapters or None,
                     )
-                    loudness_result = check_lufs_compliance(output_path)
-                    if loudness_result.status != QAAutomaticStatus.PASS.value:
-                        logger.warning(
-                            "Export %s for book %s loudness check returned %s: %s",
-                            export_format,
-                            book.id,
-                            loudness_result.status,
-                            loudness_result.message,
-                        )
-                        lufs_notes.append(f"{output_path.name}: {loudness_result.message}")
                 except Exception as exc:
                     logger.exception("Failed to export %s for book %s", export_format, book.id)
                     errors.append(f"{export_format}: {exc}")
                     format_results[export_format] = ExportFormatResult(
                         status="error",
                         error_message=str(exc),
+                        file_name=output_path.name,
+                        file_size_bytes=output_path.stat().st_size if output_path.exists() else None,
+                    )
+
+            verifiable_formats = [export_format for export_format in formats if export_format in encoded_outputs]
+            for verify_index, export_format in enumerate(verifiable_formats):
+                ensure_active()
+                output_path = encoded_outputs[export_format]
+                verify_start = 95.0 + ((verify_index / max(len(verifiable_formats), 1)) * 5.0)
+                verify_end = 95.0 + (((verify_index + 1) / max(len(verifiable_formats), 1)) * 5.0)
+                _emit_progress(
+                    progress_callback,
+                    progress_percent=verify_start,
+                    stage=_format_stage_label("Verifying", export_format),
+                    export_format=export_format,
+                    current_chapter_n=total_chapters or None,
+                    total_chapters=total_chapters or None,
+                )
+
+                verification: dict[str, Any] | None = None
+                attempts = 0
+                for attempts in range(1, 3):
+                    verification = _verify_export_output(
+                        output_path,
+                        expected_duration_seconds=expected_duration_seconds,
+                        export_format=export_format,
+                        expected_markers=concatenation.chapter_markers if export_format == "m4b" else None,
+                    )
+                    if verification.get("ok"):
+                        break
+
+                    logger.warning(
+                        "Export verification failed for %s on attempt %s: %s",
+                        output_path,
+                        attempts,
+                        "; ".join(verification.get("issues", [])),
+                    )
+                    if attempts >= 2:
+                        break
+
+                    ensure_active()
+                    if export_format == "mp3":
+                        export_mp3(
+                            export_paths["normalized_wav"],
+                            export_paths["mp3"],
+                            book=book,
+                            cover_art_path=cover_art_path,
+                        )
+                    else:
+                        export_m4b(
+                            export_paths["normalized_wav"],
+                            export_paths["m4b"],
+                            book=book,
+                            chapter_markers=concatenation.chapter_markers,
+                            metadata_path=export_paths["metadata"],
+                        )
+
+                if verification is None or not verification.get("ok"):
+                    error_message = (
+                        "Export verification failed: "
+                        + "; ".join((verification or {}).get("issues", ["unknown verification error"]))
+                    )
+                    logger.error("Keeping %s on disk despite verification failure: %s", output_path, error_message)
+                    errors.append(f"{export_format}: {error_message}")
+                    format_results[export_format] = ExportFormatResult(
+                        status="error",
+                        file_size_bytes=output_path.stat().st_size if output_path.exists() else None,
+                        file_name=output_path.name,
+                        error_message=error_message,
+                        verification=verification,
+                        attempts=attempts,
                     )
                     _emit_progress(
                         progress_callback,
-                        progress_percent=max(format_start, min(stitch_end, format_end)),
-                        stage=_format_stage_label("Failed", export_format),
+                        progress_percent=verify_end,
+                        stage=_format_stage_label("Verification failed", export_format),
                         export_format=export_format,
                         current_chapter_n=total_chapters or None,
                         total_chapters=total_chapters or None,
                     )
+                    continue
+
+                format_results[export_format] = ExportFormatResult(
+                    status="completed",
+                    file_size_bytes=output_path.stat().st_size,
+                    file_name=output_path.name,
+                    download_url=f"/api/book/{book.id}/export/download/{export_format}",
+                    completed_at=utc_now(),
+                    verification=verification,
+                    attempts=attempts,
+                )
+                _emit_progress(
+                    progress_callback,
+                    progress_percent=verify_end,
+                    stage=_format_stage_label("Verified", export_format),
+                    export_format=export_format,
+                    current_chapter_n=total_chapters or None,
+                    total_chapters=total_chapters or None,
+                )
+                loudness_result = check_lufs_compliance(output_path)
+                if loudness_result.status != QAAutomaticStatus.PASS.value:
+                    logger.warning(
+                        "Export %s for book %s loudness check returned %s: %s",
+                        export_format,
+                        book.id,
+                        loudness_result.status,
+                        loudness_result.message,
+                    )
+                    lufs_notes.append(f"{output_path.name}: {loudness_result.message}")
         finally:
             for temporary_path in (
                 export_paths["master_wav"],
@@ -1234,15 +1452,30 @@ def estimate_export_seconds(
         if book is None:
             raise ValueError(f"Book {book_id} not found")
 
-        selected, _, _ = _load_selected_chapters(
-            db_session,
-            book,
-            include_only_approved=include_only_approved,
+        chapters = (
+            db_session.query(Chapter)
+            .filter(Chapter.book_id == book.id)
+            .order_by(Chapter.number, Chapter.id)
+            .all()
         )
-        if not selected:
+        qa_records = {
+            record.chapter_n: record
+            for record in db_session.query(ChapterQARecord).filter(ChapterQARecord.book_id == book.id).all()
+        }
+        selected_durations = [
+            chapter.duration_seconds or max((chapter.word_count or 0) / 2.5, 1.0)
+            for chapter in chapters
+            if chapter.status == ChapterStatus.GENERATED
+            and chapter.audio_path
+            and (
+                not include_only_approved
+                or _chapter_is_approved(chapter, qa_records.get(chapter.number))
+            )
+        ]
+        if not selected_durations:
             raise ValueError("No chapter audio is eligible for export.")
 
-        total_duration = sum(chapter.duration_seconds for chapter in selected)
+        total_duration = sum(selected_durations)
         estimated_seconds = int(round(total_duration / 30.0)) + (8 * len(formats)) + 6
         return max(5, estimated_seconds)
 
@@ -1251,6 +1484,12 @@ def run_export_job_sync(export_job_id: int, session_factory: sessionmaker[Sessio
     """Execute an export job and persist the terminal result back to the database."""
 
     session_factory = session_factory or SessionLocal
+
+    def ensure_job_active() -> None:
+        with session_factory() as active_session:
+            active_job = active_session.query(ExportJob).filter(ExportJob.id == export_job_id).first()
+            if active_job is None or active_job.export_status != BookExportStatus.PROCESSING:
+                raise ExportCancelledError("Export job was cancelled.")
 
     def persist_progress(
         progress_percent: float,
@@ -1261,14 +1500,15 @@ def run_export_job_sync(export_job_id: int, session_factory: sessionmaker[Sessio
     ) -> None:
         with session_factory() as progress_session:
             progress_job = progress_session.query(ExportJob).filter(ExportJob.id == export_job_id).first()
-            if progress_job is None:
-                return
+            if progress_job is None or progress_job.export_status != BookExportStatus.PROCESSING:
+                raise ExportCancelledError("Export job was cancelled.")
 
             progress_job.progress_percent = round(max(0.0, min(progress_percent, 100.0)), 2)
             progress_job.current_stage = stage
             progress_job.current_format = export_format
             progress_job.current_chapter_n = current_chapter_n
             progress_job.total_chapters = total_chapters
+            progress_job.updated_at = utc_now()
             progress_session.commit()
 
     with session_factory() as db_session:
@@ -1287,6 +1527,7 @@ def run_export_job_sync(export_job_id: int, session_factory: sessionmaker[Sessio
         export_job.export_status = BookExportStatus.PROCESSING
         export_job.started_at = utc_now()
         export_job.completed_at = None
+        export_job.updated_at = utc_now()
         export_job.error_message = None
         export_job.qa_report = None
         export_job.progress_percent = 0.0
@@ -1310,7 +1551,11 @@ def run_export_job_sync(export_job_id: int, session_factory: sessionmaker[Sessio
             include_only_approved=include_only_approved,
             session_factory=session_factory,
             progress_callback=persist_progress,
+            should_abort=ensure_job_active,
         )
+    except ExportCancelledError:
+        logger.info("Export job %s cancelled before completion", export_job_id)
+        return
     except Exception as exc:
         logger.exception("Export job %s failed", export_job_id)
         with session_factory() as db_session:
@@ -1320,6 +1565,7 @@ def run_export_job_sync(export_job_id: int, session_factory: sessionmaker[Sessio
             if failed_job is not None:
                 failed_job.export_status = BookExportStatus.ERROR
                 failed_job.completed_at = utc_now()
+                failed_job.updated_at = failed_job.completed_at
                 failed_job.error_message = str(exc)
                 failed_job.current_stage = "Export failed"
             if failed_book is not None:
@@ -1332,10 +1578,14 @@ def run_export_job_sync(export_job_id: int, session_factory: sessionmaker[Sessio
         completed_book = db_session.query(Book).filter(Book.id == result.book_id).first()
         if completed_job is None or completed_book is None:
             return
+        if completed_job.export_status != BookExportStatus.PROCESSING:
+            logger.info("Skipping terminal update for export job %s because it is no longer active", export_job_id)
+            return
 
         completed_at = utc_now()
         completed_job.export_status = BookExportStatus(result.export_status)
         completed_job.completed_at = completed_at
+        completed_job.updated_at = completed_at
         completed_job.error_message = "; ".join(
             format_result.error_message
             for format_result in result.formats.values()

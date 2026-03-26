@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import timedelta
 from pathlib import Path
 
@@ -12,11 +13,13 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from src.database import (
     Book,
+    BookExportStatus,
     BookGenerationStatus,
     BookStatus,
     Chapter,
     ChapterStatus,
     ChapterType,
+    ExportJob,
     GenerationJob,
     GenerationJobStatus,
     GenerationJobType,
@@ -24,8 +27,17 @@ from src.database import (
     retry_on_locked,
     utc_now,
 )
+from src.config import settings
+from src.pipeline.exporter import get_export_output_path
 from src.pipeline.queue_manager import GenerationQueue
-from src.startup import cleanup_startup_generation_state, recover_orphaned_jobs
+from src.startup import cleanup_startup_export_state, cleanup_startup_generation_state, recover_orphaned_jobs
+
+
+@pytest.fixture(autouse=True)
+def recovery_outputs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Route recovery test artifacts into a test-only output directory."""
+
+    monkeypatch.setattr(settings, "OUTPUTS_PATH", str(tmp_path / "outputs"))
 
 
 def _create_book(test_db: Session, *, title: str = "Recovery Book") -> Book:
@@ -236,6 +248,86 @@ def test_fresh_job_not_recovered(test_db: Session) -> None:
 
     assert recovered == 0
     assert job.status == GenerationJobStatus.RUNNING
+
+
+def test_startup_export_cleanup_recovers_existing_files(test_db: Session) -> None:
+    """Startup export cleanup should recover disk artifacts into the DB."""
+
+    book = _create_book(test_db, title="Recovered Export")
+    export_job = ExportJob(
+        book_id=book.id,
+        job_token=f"export_{book.id}_20260324_170000",
+        export_status=BookExportStatus.PROCESSING,
+        formats_requested=json.dumps(["mp3"]),
+        format_details=json.dumps({"mp3": {"status": "pending"}}),
+        include_only_approved=True,
+        started_at=utc_now() - timedelta(minutes=5),
+        updated_at=utc_now() - timedelta(minutes=5),
+    )
+    test_db.add(export_job)
+    book.export_status = BookExportStatus.PROCESSING
+    test_db.commit()
+
+    output_path = get_export_output_path(book, "mp3")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(b"recovered mp3")
+
+    recovered, timed_out = cleanup_startup_export_state(test_db)
+
+    test_db.refresh(export_job)
+    test_db.refresh(book)
+    assert (recovered, timed_out) == (1, 0)
+    assert export_job.export_status == BookExportStatus.COMPLETED
+    assert export_job.progress_percent == 100.0
+    assert book.export_status == BookExportStatus.COMPLETED
+    assert book.status == BookStatus.EXPORTED
+
+
+def test_startup_export_cleanup_times_out_stale_processing_jobs(test_db: Session) -> None:
+    """PROCESSING export jobs without updates should auto-fail on startup."""
+
+    book = _create_book(test_db, title="Timed Out Export")
+    export_job = ExportJob(
+        book_id=book.id,
+        job_token=f"export_{book.id}_20260324_171500",
+        export_status=BookExportStatus.PROCESSING,
+        formats_requested=json.dumps(["mp3"]),
+        format_details=json.dumps({"mp3": {"status": "pending"}}),
+        include_only_approved=True,
+        started_at=utc_now() - timedelta(minutes=20),
+        updated_at=utc_now() - timedelta(minutes=20),
+    )
+    test_db.add(export_job)
+    book.export_status = BookExportStatus.PROCESSING
+    test_db.commit()
+
+    recovered, timed_out = cleanup_startup_export_state(test_db)
+
+    test_db.refresh(export_job)
+    test_db.refresh(book)
+    assert (recovered, timed_out) == (0, 1)
+    assert export_job.export_status == BookExportStatus.ERROR
+    assert export_job.current_stage == "Export timed out"
+    assert "15 minutes" in (export_job.error_message or "")
+    assert book.export_status == BookExportStatus.ERROR
+
+
+def test_startup_export_cleanup_creates_job_for_manual_exports(test_db: Session) -> None:
+    """Manual exports on disk should be backfilled into export_jobs on startup."""
+
+    book = _create_book(test_db, title="Manual Export Recovery")
+    output_path = get_export_output_path(book, "mp3")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(b"manual export")
+
+    recovered, timed_out = cleanup_startup_export_state(test_db)
+
+    export_job = test_db.query(ExportJob).filter(ExportJob.book_id == book.id).one()
+    test_db.refresh(book)
+    assert (recovered, timed_out) == (1, 0)
+    assert export_job.export_status == BookExportStatus.COMPLETED
+    assert export_job.progress_percent == 100.0
+    assert book.export_status == BookExportStatus.COMPLETED
 
 
 @pytest.mark.asyncio

@@ -203,6 +203,34 @@ def test_master_book_peak_limits(test_db: Session, monkeypatch: pytest.MonkeyPat
     assert report.peak_limited_chapters in ([], [1])
 
 
+def test_master_book_fast_chain_completes_and_resamples(test_db: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The ffmpeg fast mastering path should finish quickly and emit ACX-ready WAVs."""
+
+    book = _create_book(test_db, title="Fast Chain Mastering")
+    chapter = _create_chapter(
+        test_db,
+        book=book,
+        number=1,
+        audio=(
+            AudioSegment.silent(duration=900, frame_rate=22050)
+            + _tone(2500, gain_db=-22.0).set_frame_rate(22050)
+            + AudioSegment.silent(duration=1800, frame_rate=22050)
+        ),
+    )
+    audio_path = Path(settings.OUTPUTS_PATH) / chapter.audio_path
+    monkeypatch.setattr("src.pipeline.book_mastering.measure_integrated_lufs", lambda *_args, **_kwargs: -20.0)
+
+    report = BookMasteringPipeline().master_book_sync(book.id, test_db, prefer_fast_chain=True)
+
+    mastered = AudioSegment.from_file(audio_path)
+    assert mastered.frame_rate == FRAME_RATE
+    assert mastered.channels == 1
+    assert mastered.sample_width == 2
+    assert report.notes[0] == "Using fast ffmpeg mastering chain for export-scale audio."
+    assert "Resampled 1 chapters" in " ".join(report.notes)
+    assert report.peak_limited_chapters == [1]
+
+
 def test_master_book_preserves_good_audio(test_db: Session, monkeypatch: pytest.MonkeyPatch) -> None:
     """Chapters already inside spec should be left untouched."""
 

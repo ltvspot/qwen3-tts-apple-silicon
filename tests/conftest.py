@@ -35,6 +35,9 @@ def isolated_generation_runtime() -> Generator[None, None, None]:
     """Reset process-local generation singletons around each test."""
 
     export_routes._export_tasks.clear()
+    for thread in list(export_routes._export_threads.values()):
+        thread.join(timeout=0.1)
+    export_routes._export_threads.clear()
     export_routes._batch_export_monitor_task = None
     export_routes._batch_export_progress = None
     generation_runtime.release_model_manager()
@@ -48,6 +51,9 @@ def isolated_generation_runtime() -> Generator[None, None, None]:
         for task in list(export_routes._export_tasks):
             task.cancel()
         export_routes._export_tasks.clear()
+        for thread in list(export_routes._export_threads.values()):
+            thread.join(timeout=0.5)
+        export_routes._export_threads.clear()
         if export_routes._batch_export_monitor_task is not None:
             export_routes._batch_export_monitor_task.cancel()
         export_routes._batch_export_monitor_task = None
@@ -122,6 +128,7 @@ def client(test_db: Session, monkeypatch: pytest.MonkeyPatch) -> Generator[TestC
 
     monkeypatch.setattr("src.main.init_db", lambda: None)
     monkeypatch.setattr("src.main.run_startup_cleanup", lambda: (0, 0))
+    monkeypatch.setattr("src.main.run_export_startup_cleanup", lambda: (0, 0))
     monkeypatch.setattr("src.main.run_startup_recovery", lambda: 0)
     monkeypatch.setattr("src.main.install_signal_handlers", lambda: None)
     monkeypatch.setattr("src.main.run_all_health_checks", fake_health_checks)

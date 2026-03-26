@@ -22,12 +22,16 @@ from src.pipeline.exporter import (
     _normalize_export_formats,
     estimate_export_seconds,
     get_export_output_path,
-    run_export_job,
+    reconcile_book_export_artifacts,
+    reconcile_export_job_state,
+    run_export_job_sync,
 )
 
 router = APIRouter(prefix="/api", tags=["export"])
 
 _export_tasks: set[asyncio.Task[None]] = set()
+_export_threads: dict[int, threading.Thread] = {}
+_export_threads_lock = threading.RLock()
 _batch_export_lock = threading.RLock()
 _batch_export_monitor_task: asyncio.Task[None] | None = None
 _batch_export_progress: "BatchExportProgressResponse | None" = None
@@ -67,6 +71,14 @@ class ExportStatusResponse(BaseModel):
     total_chapters: int | None = None
     started_at: datetime | None = None
     completed_at: datetime | None = None
+
+
+class ExportCancelResponse(BaseModel):
+    """Response returned when cancelling one export."""
+
+    book_id: int
+    export_status: str
+    message: str
 
 
 class BatchExportRequest(BaseModel):
@@ -181,6 +193,20 @@ def _serialize_status(book: Book, export_job: ExportJob | None) -> ExportStatusR
     )
 
 
+def _reconcile_export_job_if_needed(book: Book, export_job: ExportJob | None, db: Session) -> ExportJob | None:
+    """Repair stale export state before returning status or rejecting new work."""
+
+    if export_job is not None:
+        reconcile_export_job_state(db, book, export_job)
+        db.refresh(book)
+        db.refresh(export_job)
+        return export_job
+
+    if reconcile_book_export_artifacts(db, book):
+        return db.query(ExportJob).filter(ExportJob.book_id == book.id).first()
+    return None
+
+
 def _load_book_or_404(book_id: int, db: Session) -> Book:
     """Load a book or raise a 404."""
 
@@ -268,6 +294,7 @@ def _queue_export_for_book(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     existing_job = db.query(ExportJob).filter(ExportJob.book_id == book.id).first()
+    existing_job = _reconcile_export_job_if_needed(book, existing_job, db)
     if existing_job is not None and existing_job.export_status == BookExportStatus.PROCESSING:
         raise HTTPException(status_code=409, detail="An export is already in progress for this book.")
 
@@ -296,6 +323,7 @@ def _queue_export_for_book(
             created_at=started_at,
             started_at=started_at,
             completed_at=None,
+            updated_at=started_at,
             error_message=None,
             qa_report=None,
         )
@@ -315,6 +343,7 @@ def _queue_export_for_book(
         export_job.created_at = started_at
         export_job.started_at = started_at
         export_job.completed_at = None
+        export_job.updated_at = started_at
         export_job.error_message = None
         export_job.qa_report = None
 
@@ -332,11 +361,23 @@ def _launch_export_job(
     *,
     session_factory: sessionmaker[Session] | None = None,
 ) -> None:
-    """Schedule export execution in the background and retain the task reference."""
+    """Run one export job on a dedicated background thread."""
 
-    task = asyncio.create_task(run_export_job(export_job_id, session_factory=session_factory))
-    _export_tasks.add(task)
-    task.add_done_callback(_export_tasks.discard)
+    def worker() -> None:
+        try:
+            run_export_job_sync(export_job_id, session_factory=session_factory)
+        finally:
+            with _export_threads_lock:
+                _export_threads.pop(export_job_id, None)
+
+    thread = threading.Thread(
+        target=worker,
+        name=f"export-job-{export_job_id}",
+        daemon=True,
+    )
+    with _export_threads_lock:
+        _export_threads[export_job_id] = thread
+    thread.start()
 
 
 def _book_is_ready_for_batch_export(db: Session, book: Book, *, include_only_approved: bool) -> bool:
@@ -404,14 +445,12 @@ async def _monitor_batch_export(
                     return
 
             with session_factory() as db_session:
-                books = {
-                    book.id: book.title
-                    for book in (
-                        db_session.query(Book)
-                        .filter(Book.id.in_(book_ids))
-                        .all()
-                    )
-                }
+                book_rows = (
+                    db_session.query(Book)
+                    .filter(Book.id.in_(book_ids))
+                    .all()
+                )
+                books = {book.id: book.title for book in book_rows}
                 export_jobs = {
                     job.book_id: job
                     for job in (
@@ -420,6 +459,11 @@ async def _monitor_batch_export(
                         .all()
                     )
                 }
+                for book in book_rows:
+                    export_job = export_jobs.get(book.id)
+                    reconciled_job = _reconcile_export_job_if_needed(book, export_job, db_session)
+                    if reconciled_job is not None:
+                        export_jobs[book.id] = reconciled_job
 
             completed = 0
             failed = 0
@@ -515,7 +559,34 @@ async def get_export_status(book_id: int, db: Session = Depends(get_db)) -> Expo
 
     book = _load_book_or_404(book_id, db)
     export_job = db.query(ExportJob).filter(ExportJob.book_id == book_id).first()
+    export_job = _reconcile_export_job_if_needed(book, export_job, db)
     return _serialize_status(book, export_job)
+
+
+@router.post("/book/{book_id}/export/cancel", response_model=ExportCancelResponse)
+async def cancel_export(book_id: int, db: Session = Depends(get_db)) -> ExportCancelResponse:
+    """Force-cancel one in-flight export so a new export can be queued."""
+
+    book = _load_book_or_404(book_id, db)
+    export_job = db.query(ExportJob).filter(ExportJob.book_id == book_id).first()
+    export_job = _reconcile_export_job_if_needed(book, export_job, db)
+    if export_job is None or export_job.export_status != BookExportStatus.PROCESSING:
+        raise HTTPException(status_code=400, detail="No export is currently in progress for this book.")
+
+    cancelled_at = utc_now()
+    export_job.export_status = BookExportStatus.ERROR
+    export_job.completed_at = cancelled_at
+    export_job.updated_at = cancelled_at
+    export_job.current_stage = "Export cancelled"
+    export_job.error_message = "Export cancelled by operator."
+    book.export_status = BookExportStatus.ERROR
+    db.commit()
+    invalidate_library_cache()
+    return ExportCancelResponse(
+        book_id=book.id,
+        export_status=BookExportStatus.ERROR.value,
+        message="Export cancelled",
+    )
 
 
 @router.get("/book/{book_id}/export/download/{export_format}")

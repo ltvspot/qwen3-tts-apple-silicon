@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 from urllib.parse import unquote
 
 from sqlalchemy.orm import Session
@@ -129,6 +131,51 @@ def test_export_accepts_fully_generated_book(
     assert export_job.progress_percent == 0.0
     assert export_job.current_stage == "Queued"
     assert book.export_status == BookExportStatus.PROCESSING
+
+
+def test_export_endpoint_returns_quickly_and_health_stays_responsive(
+    client,
+    test_db: Session,
+    monkeypatch,
+) -> None:
+    """Queuing an export should not block unrelated API calls while the worker runs."""
+
+    book = _create_book(test_db, title="Quick Return Export")
+    _create_ready_chapter(test_db, book_id=book.id)
+    started = threading.Event()
+    release_worker = threading.Event()
+
+    def fake_run_export_job_sync(export_job_id: int, session_factory=None) -> None:
+        del export_job_id, session_factory
+        started.set()
+        release_worker.wait(timeout=2.0)
+
+    monkeypatch.setattr(export_routes, "estimate_export_seconds", lambda *args, **kwargs: 60)
+    monkeypatch.setattr(export_routes, "run_export_job_sync", fake_run_export_job_sync)
+
+    request_started = time.monotonic()
+    response = client.post(
+        f"/api/book/{book.id}/export",
+        json={
+            "formats": ["mp3"],
+            "include_only_approved": True,
+        },
+    )
+    queue_elapsed = time.monotonic() - request_started
+
+    health_started = time.monotonic()
+    health_response = client.get("/api/health")
+    health_elapsed = time.monotonic() - health_started
+
+    release_worker.set()
+    for thread in list(export_routes._export_threads.values()):
+        thread.join(timeout=1.0)
+
+    assert response.status_code == 200
+    assert started.wait(timeout=1.0)
+    assert queue_elapsed < 2.0
+    assert health_response.status_code == 200
+    assert health_elapsed < 1.0
 
 
 def test_export_rejects_partial_book(client, test_db: Session) -> None:
@@ -336,6 +383,43 @@ def test_get_export_status_returns_live_progress_fields(client, test_db: Session
     assert payload["current_format"] == "mp3"
     assert payload["current_chapter_n"] == 3
     assert payload["total_chapters"] == 10
+
+
+def test_cancel_export_marks_job_and_book_as_error(client, test_db: Session) -> None:
+    """Force-cancelling an export should release the book for a later retry."""
+
+    book = _create_book(test_db, title="Cancelable Export")
+    started_at = utc_now()
+    export_job = ExportJob(
+        book_id=book.id,
+        job_token=f"export_{book.id}_20260324_151500",
+        export_status=BookExportStatus.PROCESSING,
+        formats_requested=json.dumps(["mp3"]),
+        format_details=json.dumps({"mp3": {"status": "pending"}}),
+        progress_percent=15.0,
+        current_stage="Mastering chapters",
+        include_only_approved=True,
+        started_at=started_at,
+        updated_at=started_at,
+    )
+    test_db.add(export_job)
+    book.export_status = BookExportStatus.PROCESSING
+    test_db.commit()
+
+    response = client.post(f"/api/book/{book.id}/export/cancel")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "book_id": book.id,
+        "export_status": "error",
+        "message": "Export cancelled",
+    }
+    test_db.refresh(export_job)
+    test_db.refresh(book)
+    assert export_job.export_status == BookExportStatus.ERROR
+    assert export_job.current_stage == "Export cancelled"
+    assert export_job.error_message == "Export cancelled by operator."
+    assert book.export_status == BookExportStatus.ERROR
 
 
 def test_batch_export_queues_ready_books_and_exposes_progress(client, test_db: Session, monkeypatch) -> None:

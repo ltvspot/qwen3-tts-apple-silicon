@@ -12,16 +12,19 @@ from sqlalchemy.orm import Session
 from src.api.generation_runtime import peek_queue, shutdown_generation_runtime
 from src.database import (
     Book,
+    BookExportStatus,
     BookGenerationStatus,
     BookStatus,
     Chapter,
     ChapterStatus,
+    ExportJob,
     GenerationJob,
     GenerationJobStatus,
     SessionLocal,
     retry_on_locked,
     utc_now,
 )
+from src.pipeline.exporter import reconcile_book_export_artifacts, reconcile_export_job_state
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +173,49 @@ def run_startup_cleanup() -> tuple[int, int]:
     session = SessionLocal()
     try:
         return cleanup_startup_generation_state(session)
+    finally:
+        session.close()
+
+
+@retry_on_locked()
+def cleanup_startup_export_state(db_session: Session) -> tuple[int, int]:
+    """Repair stale export jobs and reconcile export files that already exist on disk."""
+
+    recovered = 0
+    timed_out = 0
+    processed_book_ids: set[int] = set()
+
+    export_jobs = db_session.query(ExportJob).all()
+    for export_job in export_jobs:
+        book = db_session.query(Book).filter(Book.id == export_job.book_id).first()
+        if book is None:
+            continue
+        processed_book_ids.add(book.id)
+        result = reconcile_export_job_state(db_session, book, export_job)
+        if result == "recovered":
+            recovered += 1
+        elif result == "timed_out":
+            timed_out += 1
+
+    books_without_jobs = db_session.query(Book).filter(~Book.id.in_(processed_book_ids)).all() if processed_book_ids else db_session.query(Book).all()
+    for book in books_without_jobs:
+        if reconcile_book_export_artifacts(db_session, book):
+            recovered += 1
+
+    logger.info(
+        "Reconciled %s export job(s) from disk and timed out %s stale export job(s) on startup",
+        recovered,
+        timed_out,
+    )
+    return (recovered, timed_out)
+
+
+def run_export_startup_cleanup() -> tuple[int, int]:
+    """Repair stale export state using the shared application session factory."""
+
+    session = SessionLocal()
+    try:
+        return cleanup_startup_export_state(session)
     finally:
         session.close()
 

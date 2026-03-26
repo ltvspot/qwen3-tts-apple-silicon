@@ -347,6 +347,12 @@ class ExportJob(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utc_now,
+        onupdate=utc_now,
+    )
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     qa_report: Mapped[str | None] = mapped_column(Text, nullable=True)
 
@@ -618,6 +624,7 @@ def _migrate_sqlite_schema() -> None:
             "current_format": "VARCHAR(32)",
             "current_chapter_n": "INTEGER",
             "total_chapters": "INTEGER",
+            "updated_at": "DATETIME",
         },
     }
 
@@ -635,6 +642,13 @@ def _migrate_sqlite_schema() -> None:
             text(
                 "UPDATE generation_jobs "
                 "SET updated_at = COALESCE(updated_at, created_at, CURRENT_TIMESTAMP) "
+                "WHERE updated_at IS NULL"
+            )
+        )
+        connection.execute(
+            text(
+                "UPDATE export_jobs "
+                "SET updated_at = COALESCE(updated_at, started_at, created_at, CURRENT_TIMESTAMP) "
                 "WHERE updated_at IS NULL"
             )
         )

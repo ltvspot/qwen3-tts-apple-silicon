@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
+import wave
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +17,7 @@ from sqlalchemy.orm import Session
 from src.database import Chapter, ChapterStatus
 from src.pipeline.book_qa import ACX_REQUIREMENTS, BookQAReport, measure_integrated_lufs, run_book_qa
 from src.pipeline.qa_checker import persist_qa_result, run_qa_checks_for_chapter
+from src.utils.subprocess_utils import run_ffmpeg
 
 logger = logging.getLogger(__name__)
 ACX_SAMPLE_RATE = ACX_REQUIREMENTS["sample_rate"]
@@ -53,29 +56,29 @@ class BookMasteringPipeline:
     COMPRESSION_THRESHOLD_DBFS = -20.0
     COMPRESSION_RATIO = 2.0
     EDGE_TOLERANCE_MS = 20
+    CHAPTER_MASTERING_TIMEOUT_SECONDS = 300
+    FAST_CHAIN_BOOK_DURATION_SECONDS = 1800.0
+    FAST_CHAIN_BOOK_BYTES = 250 * 1024 * 1024
+    FAST_CHAIN_LIMIT_LINEAR = 0.841
 
-    async def master_book(self, book_id: int, db_session: Session) -> MasteringReport:
+    async def master_book(
+        self,
+        book_id: int,
+        db_session: Session,
+        *,
+        prefer_fast_chain: bool | None = None,
+    ) -> MasteringReport:
         """Async entrypoint used by API routes."""
 
         chapters = self._generated_chapters(book_id, db_session)
         notes: list[str] = []
-        resampled = self._resample_chapters(chapters, db_session)
-        if resampled:
-            notes.append(f"Resampled {len(resampled)} chapters to {ACX_SAMPLE_RATE} Hz.")
-        gated = self._apply_noise_gate(chapters, db_session)
-        if gated:
-            notes.append(f"Noise-gated {len(gated)} chapters below {self.NOISE_GATE_THRESHOLD_DBFS:.0f} dBFS.")
-        filtered = self._apply_high_pass_filter(chapters, db_session)
-        if filtered:
-            notes.append(f"Applied an {self.HIGH_PASS_HZ} Hz high-pass filter to {len(filtered)} chapters.")
-        loudness_adjustments = self._normalize_loudness(chapters, db_session)
-        compressed = self._apply_compression(chapters, db_session)
-        if compressed:
-            notes.append(f"Compressed {len(compressed)} chapters for steadier narration dynamics.")
-        edge_normalized = self._normalize_chapter_edges(chapters, db_session)
-        peak_limited = self._apply_final_peak_limit(chapters, db_session)
-        notes.append("Sentence-boundary padding verified via chapter QA after mastering.")
-        blockers = self._final_verify(chapters, db_session)
+        loudness_adjustments, edge_normalized, peak_limited, blockers = self._master_with_selected_chain(
+            book_id,
+            chapters,
+            db_session,
+            notes,
+            prefer_fast_chain=prefer_fast_chain,
+        )
         book_report = await self._verify_mastered_quality_async(book_id, chapters, db_session)
         if blockers:
             book_report.export_blockers.extend(blocker for blocker in blockers if blocker not in book_report.export_blockers)
@@ -89,28 +92,24 @@ class BookMasteringPipeline:
             book_report,
         )
 
-    def master_book_sync(self, book_id: int, db_session: Session) -> MasteringReport:
+    def master_book_sync(
+        self,
+        book_id: int,
+        db_session: Session,
+        *,
+        prefer_fast_chain: bool | None = None,
+    ) -> MasteringReport:
         """Run all book-level auto-fixes and re-verify the mastered result."""
 
         chapters = self._generated_chapters(book_id, db_session)
         notes: list[str] = []
-        resampled = self._resample_chapters(chapters, db_session)
-        if resampled:
-            notes.append(f"Resampled {len(resampled)} chapters to {ACX_SAMPLE_RATE} Hz.")
-        gated = self._apply_noise_gate(chapters, db_session)
-        if gated:
-            notes.append(f"Noise-gated {len(gated)} chapters below {self.NOISE_GATE_THRESHOLD_DBFS:.0f} dBFS.")
-        filtered = self._apply_high_pass_filter(chapters, db_session)
-        if filtered:
-            notes.append(f"Applied an {self.HIGH_PASS_HZ} Hz high-pass filter to {len(filtered)} chapters.")
-        loudness_adjustments = self._normalize_loudness(chapters, db_session)
-        compressed = self._apply_compression(chapters, db_session)
-        if compressed:
-            notes.append(f"Compressed {len(compressed)} chapters for steadier narration dynamics.")
-        edge_normalized = self._normalize_chapter_edges(chapters, db_session)
-        peak_limited = self._apply_final_peak_limit(chapters, db_session)
-        notes.append("Sentence-boundary padding verified via chapter QA after mastering.")
-        blockers = self._final_verify(chapters, db_session)
+        loudness_adjustments, edge_normalized, peak_limited, blockers = self._master_with_selected_chain(
+            book_id,
+            chapters,
+            db_session,
+            notes,
+            prefer_fast_chain=prefer_fast_chain,
+        )
         book_report = asyncio.run(self._verify_mastered_quality_async(book_id, chapters, db_session))
         if blockers:
             book_report.export_blockers.extend(blocker for blocker in blockers if blocker not in book_report.export_blockers)
@@ -147,6 +146,60 @@ class BookMasteringPipeline:
             blockers=book_report.export_blockers,
             book_report=book_report,
         )
+
+    def _master_with_selected_chain(
+        self,
+        book_id: int,
+        chapters: list[Chapter],
+        db_session: Session,
+        notes: list[str],
+        *,
+        prefer_fast_chain: bool | None,
+    ) -> tuple[list[dict[str, Any]], list[int], list[int], list[str]]:
+        """Run the appropriate mastering chain and fall back when the rich chain fails."""
+
+        use_fast_chain = self._should_use_fast_chain(chapters) if prefer_fast_chain is None else prefer_fast_chain
+        if use_fast_chain:
+            notes.append("Using fast ffmpeg mastering chain for export-scale audio.")
+            return self._master_book_fast(book_id, chapters, db_session, notes)
+
+        try:
+            return self._master_book_rich(chapters, db_session, notes)
+        except Exception:
+            logger.warning(
+                "Rich mastering chain failed for book %s, switching to ffmpeg fallback",
+                book_id,
+                exc_info=True,
+            )
+            notes.append("Rich mastering failed; applied ffmpeg fallback chain.")
+            return self._master_book_fast(book_id, chapters, db_session, notes)
+
+    def _master_book_rich(
+        self,
+        chapters: list[Chapter],
+        db_session: Session,
+        notes: list[str],
+    ) -> tuple[list[dict[str, Any]], list[int], list[int], list[str]]:
+        """Run the original higher-touch mastering chain."""
+
+        resampled = self._resample_chapters(chapters, db_session)
+        if resampled:
+            notes.append(f"Resampled {len(resampled)} chapters to {ACX_SAMPLE_RATE} Hz.")
+        gated = self._apply_noise_gate(chapters, db_session)
+        if gated:
+            notes.append(f"Noise-gated {len(gated)} chapters below {self.NOISE_GATE_THRESHOLD_DBFS:.0f} dBFS.")
+        filtered = self._apply_high_pass_filter(chapters, db_session)
+        if filtered:
+            notes.append(f"Applied an {self.HIGH_PASS_HZ} Hz high-pass filter to {len(filtered)} chapters.")
+        loudness_adjustments = self._normalize_loudness(chapters, db_session)
+        compressed = self._apply_compression(chapters, db_session)
+        if compressed:
+            notes.append(f"Compressed {len(compressed)} chapters for steadier narration dynamics.")
+        edge_normalized = self._normalize_chapter_edges(chapters, db_session)
+        peak_limited = self._apply_final_peak_limit(chapters, db_session)
+        notes.append("Sentence-boundary padding verified via chapter QA after mastering.")
+        blockers = self._final_verify(chapters, db_session)
+        return loudness_adjustments, edge_normalized, peak_limited, blockers
 
     def _generated_chapters(self, book_id: int, db_session: Session) -> list[Chapter]:
         """Return generated chapters ready for mastering."""
@@ -200,6 +253,131 @@ class BookMasteringPipeline:
         chapter.duration_seconds = round(len(normalized) / 1000.0, 3)
         chapter.audio_file_size_bytes = audio_path.stat().st_size
         return True
+
+    def _should_use_fast_chain(self, chapters: list[Chapter]) -> bool:
+        """Return whether this book is large enough to prefer the ffmpeg-only path."""
+
+        total_duration_seconds = sum(chapter.duration_seconds or 0.0 for chapter in chapters)
+        total_bytes = 0
+        for chapter in chapters:
+            if chapter.audio_file_size_bytes:
+                total_bytes += chapter.audio_file_size_bytes
+                continue
+            audio_path = self._resolve_audio_path(chapter)
+            if audio_path.exists():
+                total_bytes += audio_path.stat().st_size
+
+        return (
+            total_duration_seconds >= self.FAST_CHAIN_BOOK_DURATION_SECONDS
+            or total_bytes >= self.FAST_CHAIN_BOOK_BYTES
+        )
+
+    @staticmethod
+    def _read_wav_metadata(audio_path: Path) -> tuple[int, int, int, float]:
+        """Return the WAV format metadata without decoding the full file."""
+
+        with wave.open(str(audio_path), "rb") as wav_file:
+            frame_rate = wav_file.getframerate()
+            channels = wav_file.getnchannels()
+            sample_width = wav_file.getsampwidth()
+            frame_count = wav_file.getnframes()
+        duration_seconds = frame_count / frame_rate if frame_rate else 0.0
+        return frame_rate, channels, sample_width, duration_seconds
+
+    def _refresh_chapter_file_metadata(self, chapter: Chapter, audio_path: Path) -> None:
+        """Refresh persisted chapter metadata after an ffmpeg rewrite."""
+
+        _, _, _, duration_seconds = self._read_wav_metadata(audio_path)
+        chapter.mastered = True
+        chapter.duration_seconds = round(duration_seconds, 3)
+        chapter.audio_file_size_bytes = audio_path.stat().st_size
+
+    def _master_chapter_fast(self, chapter: Chapter, audio_path: Path) -> bool:
+        """Master one chapter with ffmpeg so large WAVs do not bottleneck Python loops."""
+
+        ffmpeg_path = shutil.which("ffmpeg")
+        if ffmpeg_path is None:
+            raise RuntimeError("ffmpeg is required for mastering.")
+
+        temporary_output = audio_path.with_suffix(".mastered.tmp.wav")
+        filter_chain = ",".join(
+            [
+                f"loudnorm=I={self.TARGET_LUFS}:TP={self.PEAK_TARGET_DBFS}:LRA=11",
+                f"alimiter=limit={self.FAST_CHAIN_LIMIT_LINEAR}",
+            ]
+        )
+        try:
+            run_ffmpeg(
+                [
+                    ffmpeg_path,
+                    "-y",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    str(audio_path),
+                    "-af",
+                    filter_chain,
+                    "-ar",
+                    str(ACX_SAMPLE_RATE),
+                    "-ac",
+                    "1",
+                    "-c:a",
+                    "pcm_s16le",
+                    str(temporary_output),
+                ],
+                timeout=self.CHAPTER_MASTERING_TIMEOUT_SECONDS,
+            )
+            shutil.move(str(temporary_output), str(audio_path))
+            self._refresh_chapter_file_metadata(chapter, audio_path)
+            return True
+        finally:
+            if temporary_output.exists():
+                temporary_output.unlink()
+
+    def _master_book_fast(
+        self,
+        book_id: int,
+        chapters: list[Chapter],
+        db_session: Session,
+        notes: list[str],
+    ) -> tuple[list[dict[str, Any]], list[int], list[int], list[str]]:
+        """Run a bounded ffmpeg mastering chain suitable for large export jobs."""
+
+        resampled: list[int] = []
+        peak_limited: list[int] = []
+
+        for index, chapter in enumerate(chapters, start=1):
+            audio_path = self._resolve_audio_path(chapter)
+            original_rate, _, _, _ = self._read_wav_metadata(audio_path)
+            logger.info(
+                "Fast mastering chapter %s/%s for book %s (%s)",
+                index,
+                len(chapters),
+                book_id,
+                audio_path.name,
+            )
+            self._master_chapter_fast(chapter, audio_path)
+            peak_limited.append(chapter.number)
+            if original_rate != ACX_SAMPLE_RATE:
+                resampled.append(chapter.number)
+            logger.info(
+                "Fast mastering complete for chapter %s/%s for book %s",
+                index,
+                len(chapters),
+                book_id,
+            )
+
+        db_session.flush()
+        if resampled:
+            notes.append(f"Resampled {len(resampled)} chapters to {ACX_SAMPLE_RATE} Hz.")
+        notes.append(f"Applied fast ffmpeg loudness/peak mastering to {len(chapters)} chapters.")
+        edge_normalized = self._normalize_chapter_edges(chapters, db_session)
+        if edge_normalized:
+            notes.append(f"Normalized chapter edge silence for {len(edge_normalized)} chapters.")
+        notes.append("Sentence-boundary padding verified via chapter QA after mastering.")
+        blockers = self._final_verify(chapters, db_session)
+        return [], edge_normalized, peak_limited, blockers
 
     def _resample_chapters(self, chapters: list[Chapter], db_session: Session) -> list[int]:
         """Upsample all chapter masters to the ACX-required 44.1kHz."""
@@ -366,12 +544,12 @@ class BookMasteringPipeline:
         blockers: list[str] = []
         for chapter in chapters:
             audio_path = self._resolve_audio_path(chapter)
-            audio = AudioSegment.from_file(audio_path).set_channels(1)
-            if audio.frame_rate != ACX_SAMPLE_RATE:
-                blockers.append(f"Chapter {chapter.number} is {audio.frame_rate}Hz after mastering.")
-            if audio.channels != ACX_REQUIREMENTS["channels"]:
+            frame_rate, channels, sample_width, _ = self._read_wav_metadata(audio_path)
+            if frame_rate != ACX_SAMPLE_RATE:
+                blockers.append(f"Chapter {chapter.number} is {frame_rate}Hz after mastering.")
+            if channels != ACX_REQUIREMENTS["channels"]:
                 blockers.append(f"Chapter {chapter.number} is not mono after mastering.")
-            if audio.sample_width * 8 != ACX_REQUIREMENTS["bit_depth"]:
+            if sample_width * 8 != ACX_REQUIREMENTS["bit_depth"]:
                 blockers.append(f"Chapter {chapter.number} is not 16-bit PCM after mastering.")
 
         db_session.flush()

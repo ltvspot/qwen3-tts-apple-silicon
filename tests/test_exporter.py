@@ -15,20 +15,28 @@ from sqlalchemy.orm import Session, sessionmaker
 from src.config import settings
 from src.database import (
     Book,
+    BookExportStatus,
     BookStatus,
     Chapter,
     ChapterQARecord,
     ChapterStatus,
     ChapterType,
+    ExportJob,
     QAAutomaticStatus,
     QAManualStatus,
     QAStatus,
+    utc_now,
 )
 from src.pipeline.book_qa import BookQAReport
 from src.pipeline.exporter import (
+    QAChapterSummary,
+    QAReport,
     _build_export_paths,
     concatenate_chapters_sync,
     export_book_sync,
+    run_export_job_sync,
+    ExportFormatResult,
+    ExportResult,
 )
 from src.pipeline.qa_checker import QAResult
 
@@ -328,3 +336,110 @@ def test_export_book_sync_writes_mp3_m4b_and_qa_report(
         )
         chapters_payload = json.loads(probe.stdout)
         assert len(chapters_payload.get("chapters", [])) == 3
+
+
+def test_run_export_job_sync_persists_progress_updates(
+    test_db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Export worker progress callbacks should be persisted back into the DB."""
+
+    book = _create_book(test_db, title="Progress Persistence")
+    export_job = ExportJob(
+        book_id=book.id,
+        job_token=f"export_{book.id}_20260324_160000",
+        export_status=BookExportStatus.PROCESSING,
+        formats_requested=json.dumps(["mp3"]),
+        format_details=json.dumps({"mp3": {"status": "pending"}}),
+        include_only_approved=True,
+        started_at=utc_now(),
+        updated_at=utc_now(),
+    )
+    book.export_status = BookExportStatus.PROCESSING
+    test_db.add(export_job)
+    test_db.commit()
+    test_db.refresh(export_job)
+
+    session_factory = sessionmaker(
+        bind=test_db.get_bind(),
+        autoflush=False,
+        autocommit=False,
+        expire_on_commit=False,
+    )
+    snapshots: list[tuple[float, str | None, str | None]] = []
+
+    def fake_export_book_sync(
+        book_id: int,
+        *,
+        export_formats=None,
+        include_only_approved=True,
+        session_factory=None,
+        progress_callback=None,
+        should_abort=None,
+    ) -> ExportResult:
+        del book_id, export_formats, include_only_approved, should_abort
+        assert session_factory is not None
+        assert progress_callback is not None
+        progress_callback(20.0, "Mastering complete", None, None, 3)
+        with session_factory() as progress_session:
+            job = progress_session.query(ExportJob).filter(ExportJob.id == export_job.id).one()
+            snapshots.append((job.progress_percent, job.current_stage, job.current_format))
+        progress_callback(82.5, "Encoding MP3", "mp3", 3, 3)
+        with session_factory() as progress_session:
+            job = progress_session.query(ExportJob).filter(ExportJob.id == export_job.id).one()
+            snapshots.append((job.progress_percent, job.current_stage, job.current_format))
+        progress_callback(98.0, "Verifying MP3", "mp3", 3, 3)
+        with session_factory() as progress_session:
+            job = progress_session.query(ExportJob).filter(ExportJob.id == export_job.id).one()
+            snapshots.append((job.progress_percent, job.current_stage, job.current_format))
+        return ExportResult(
+            book_id=export_job.book_id,
+            export_status=BookExportStatus.COMPLETED.value,
+            formats={
+                "mp3": ExportFormatResult(
+                    status="completed",
+                    file_size_bytes=1234,
+                    file_name="Progress Persistence.mp3",
+                    download_url=f"/api/book/{export_job.book_id}/export/download/mp3",
+                    completed_at=utc_now(),
+                )
+            },
+            qa_report=QAReport(
+                book_id=export_job.book_id,
+                book_title="Progress Persistence",
+                export_date=utc_now(),
+                chapters_included=3,
+                chapters_approved=3,
+                chapters_flagged=0,
+                chapters_warnings=0,
+                export_approved=True,
+                notes="Synthetic progress test.",
+                chapter_summary=[
+                    QAChapterSummary(
+                        chapter_n=1,
+                        chapter_title="Chapter One",
+                        status="approved",
+                        file_size_bytes=1234,
+                        duration_seconds=10.0,
+                    )
+                ],
+            ),
+        )
+
+    monkeypatch.setattr("src.pipeline.exporter.export_book_sync", fake_export_book_sync)
+
+    run_export_job_sync(export_job.id, session_factory=session_factory)
+
+    test_db.refresh(export_job)
+    test_db.refresh(book)
+    assert snapshots == [
+        (20.0, "Mastering complete", None),
+        (82.5, "Encoding MP3", "mp3"),
+        (98.0, "Verifying MP3", "mp3"),
+    ]
+    assert export_job.export_status == BookExportStatus.COMPLETED
+    assert export_job.progress_percent == 100.0
+    assert export_job.current_stage == "Ready"
+    assert export_job.current_chapter_n == 3
+    assert export_job.total_chapters == 3
+    assert book.export_status == BookExportStatus.COMPLETED
