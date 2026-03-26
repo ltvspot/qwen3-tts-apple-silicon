@@ -334,6 +334,49 @@ describe("BookDetail page", () => {
     });
   });
 
+  test("renders an inline audio preview player for generated chapters", async () => {
+    const book = createBook({});
+    const chapters = [
+      createChapter({
+        audio_path: "7-the-test-chronicle/chapters/00-opening-credits.wav",
+        duration_seconds: 252,
+        status: "generated",
+      }),
+    ];
+
+    fetchMock
+      .mockResolvedValueOnce(createJsonResponse(book))
+      .mockResolvedValueOnce(createJsonResponse(chapters))
+      .mockResolvedValueOnce(createJsonResponse(createStatusSnapshot({
+        chapters: [
+          {
+            audio_duration_seconds: 252,
+            audio_file_size_bytes: 19000000,
+            chapter_n: 0,
+            error_message: null,
+            generated_at: "2026-03-24T00:00:47+00:00",
+            generation_seconds: 47.2,
+            progress_seconds: null,
+            started_at: "2026-03-24T00:00:00+00:00",
+            status: "completed",
+          },
+        ],
+      })))
+      .mockResolvedValueOnce(createJsonResponse(createExportSnapshot()))
+      .mockResolvedValueOnce(createJsonResponse(createVoiceListPayload()));
+
+    await renderBookDetail();
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("Audio Preview");
+      expect(container.textContent).toContain("Duration: 4m 12s");
+    });
+
+    const audioElement = container.querySelector("audio");
+    expect(audioElement).not.toBeNull();
+    expect(audioElement.getAttribute("src")).toBe("/api/book/7/chapter/0/preview");
+  });
+
   test("retries voice loading while the engine is still warming up", async () => {
     jest.useFakeTimers();
     const book = createBook({});

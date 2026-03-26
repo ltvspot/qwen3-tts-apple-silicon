@@ -699,4 +699,12 @@ async def get_chapter_audio(book_id: int, chapter_number: int, db: Session = Dep
     if not audio_file.exists():
         raise HTTPException(status_code=404, detail="Audio file not found")
 
-    return FileResponse(audio_file, media_type="audio/wav", filename=audio_file.name)
+    return FileResponse(
+        audio_file,
+        media_type="audio/wav",
+        filename=audio_file.name,
+        headers={
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "no-cache",
+        },
+    )

@@ -14,6 +14,7 @@ from src.api import export_routes
 from src.api import generation_runtime
 from src.config import reset_settings_manager
 from src.database import Base, get_db
+from src.health_checks import DiskSpaceSnapshot
 from src.main import app
 
 
@@ -63,6 +64,20 @@ def disable_sleep_prevention(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr("src.pipeline.queue_manager.prevent_sleep", lambda: None)
     monkeypatch.setattr("src.pipeline.queue_manager.allow_sleep", lambda: None)
+
+
+@pytest.fixture(autouse=True)
+def stable_disk_usage(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep app startup deterministic regardless of the host machine's free disk space."""
+
+    snapshot = DiskSpaceSnapshot(
+        total_bytes=100 * (1024**3),
+        used_bytes=50 * (1024**3),
+        free_bytes=50 * (1024**3),
+        percent_used=50.0,
+    )
+    monkeypatch.setattr("src.health_checks.get_disk_space_snapshot", lambda output_dir=None: snapshot)
+    monkeypatch.setattr("src.main.get_disk_space_snapshot", lambda output_dir=None: snapshot)
 
 
 @pytest.fixture(scope="function")

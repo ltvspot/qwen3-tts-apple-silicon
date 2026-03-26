@@ -25,6 +25,7 @@ from src.database import (
     utc_now,
 )
 from src.engines import AudioStitcher, ModelManager, TTSEngine, TextChunker
+from src.notifications import send_book_complete_notification, send_qa_failure_notification
 from src.pipeline.chunk_validator import (
     SEVERITY_ORDER,
     ChunkValidationReport,
@@ -190,6 +191,14 @@ class AudiobookGenerator:
             len(chapters),
             total_duration,
         )
+
+        if final_status == "success":
+            flagged_chapters = sum(chapter.qa_status == QAStatus.NEEDS_REVIEW for chapter in chapters)
+            send_book_complete_notification(
+                book_title=book.title,
+                ready_for_export=flagged_chapters == 0,
+                flagged_chapters=flagged_chapters,
+            )
 
         return {
             "status": final_status,
@@ -397,6 +406,20 @@ class AudiobookGenerator:
                 persist_qa_result(db_session, chapter, qa_result)
                 self._flag_manual_review(chapter, manual_review_notes)
                 db_session.commit()
+                if qa_result.has_failures:
+                    first_failure = next(
+                        (
+                            check.message
+                            for check in qa_result.checks
+                            if check.status == "fail" and check.message
+                        ),
+                        "Automatic QA flagged the chapter for review.",
+                    )
+                    send_qa_failure_notification(
+                        book_id=book_id,
+                        chapter_number=chapter.number,
+                        reason=first_failure,
+                    )
             except Exception:
                 db_session.rollback()
                 self._flag_manual_review(chapter, manual_review_notes)

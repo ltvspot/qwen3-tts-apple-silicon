@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import shutil
 import subprocess
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from sqlalchemy import text
@@ -12,12 +16,97 @@ from sqlalchemy import text
 from src.api.schemas import HealthCheckItem, StartupHealthSummary
 from src.config import get_application_settings, settings
 from src.database import engine, utc_now
+from src.notifications import send_disk_warning_notification
 
 logger = logging.getLogger(__name__)
 
 
 class HealthCheckError(RuntimeError):
     """Raised when a startup health check fails."""
+
+
+class HealthCheckWarning(HealthCheckError):
+    """Raised when a startup health check should degrade service without aborting startup."""
+
+
+@dataclass(slots=True)
+class DiskSpaceSnapshot:
+    """Point-in-time disk usage for the configured output volume."""
+
+    total_bytes: int
+    used_bytes: int
+    free_bytes: int
+    percent_used: float
+
+    @property
+    def total_gb(self) -> int:
+        """Return total space rounded down to whole GB."""
+
+        return self.total_bytes // (1024**3)
+
+    @property
+    def free_gb(self) -> int:
+        """Return free space rounded down to whole GB."""
+
+        return self.free_bytes // (1024**3)
+
+
+@dataclass(slots=True)
+class RegisteredHealthCheck:
+    """Configuration for one startup health check."""
+
+    name: str
+    check_func: Callable[[], Awaitable[None]]
+    fatal: bool
+    failure_status: str = "fail"
+
+
+def get_disk_space_snapshot(output_dir: str | Path | None = None) -> DiskSpaceSnapshot:
+    """Return disk usage for the configured output volume."""
+
+    target_dir = Path(output_dir or settings.OUTPUTS_PATH)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    disk_usage = shutil.disk_usage(target_dir)
+    percent_used = (disk_usage.used / disk_usage.total) * 100 if disk_usage.total else 0.0
+    return DiskSpaceSnapshot(
+        total_bytes=disk_usage.total,
+        used_bytes=disk_usage.used,
+        free_bytes=disk_usage.free,
+        percent_used=round(percent_used, 1),
+    )
+
+
+def find_empty_python_files(root_dir: str | Path | None = None) -> list[str]:
+    """Return repo-relative empty Python files outside virtualenvs and caches."""
+
+    project_root = Path(root_dir or Path(__file__).resolve().parent.parent)
+    empty_files: list[str] = []
+    excluded_dirs = {
+        ".git",
+        ".hg",
+        ".mypy_cache",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".venv",
+        ".venv-py314-backup",
+        "__pycache__",
+        "node_modules",
+    }
+
+    for current_root, dirs, files in os.walk(project_root):
+        dirs[:] = [
+            directory
+            for directory in dirs
+            if directory not in excluded_dirs and not directory.startswith(".venv")
+        ]
+        for filename in files:
+            if not filename.endswith(".py"):
+                continue
+            file_path = Path(current_root) / filename
+            if file_path.stat().st_size == 0:
+                empty_files.append(str(file_path.relative_to(project_root)))
+
+    return sorted(empty_files)
 
 
 async def check_database_connection() -> None:
@@ -91,6 +180,42 @@ async def check_output_directory_writable() -> None:
             pass
 
 
+async def check_disk_space() -> None:
+    """Verify that the output volume has enough remaining headroom."""
+
+    snapshot = get_disk_space_snapshot()
+    detail = f"{snapshot.percent_used:.1f}% used, {snapshot.free_gb}GB free"
+
+    if snapshot.percent_used > 95:
+        send_disk_warning_notification(
+            free_gb=float(snapshot.free_gb),
+            percent_used=snapshot.percent_used,
+            critical=True,
+        )
+        raise HealthCheckError(f"CRITICAL: {detail}")
+    if snapshot.percent_used > 90:
+        send_disk_warning_notification(
+            free_gb=float(snapshot.free_gb),
+            percent_used=snapshot.percent_used,
+            critical=False,
+        )
+        raise HealthCheckWarning(f"WARNING: {detail}")
+
+
+async def check_file_integrity() -> None:
+    """Detect empty Python files, which indicate the known repo corruption bug."""
+
+    empty_files = find_empty_python_files()
+    if not empty_files:
+        return
+
+    sample = ", ".join(empty_files[:5])
+    suffix = "" if len(empty_files) <= 5 else ", ..."
+    raise HealthCheckError(
+        f"CORRUPTED: {len(empty_files)} empty .py files detected: {sample}{suffix}"
+    )
+
+
 async def run_all_health_checks() -> StartupHealthSummary:
     """
     Run all startup health checks and return a structured summary.
@@ -100,11 +225,13 @@ async def run_all_health_checks() -> StartupHealthSummary:
     """
 
     checks = [
-        ("Database Connection", check_database_connection, True),
-        ("TTS Model Files", check_model_files_exist, True),
-        ("ffmpeg Installation", check_ffmpeg_installed, False),
-        ("Manuscript Folder", check_manuscript_folder_exists, False),
-        ("Output Directory", check_output_directory_writable, True),
+        RegisteredHealthCheck("Database Connection", check_database_connection, True),
+        RegisteredHealthCheck("TTS Model Files", check_model_files_exist, True),
+        RegisteredHealthCheck("ffmpeg Installation", check_ffmpeg_installed, False, "warn"),
+        RegisteredHealthCheck("Manuscript Folder", check_manuscript_folder_exists, False, "warn"),
+        RegisteredHealthCheck("Output Directory", check_output_directory_writable, True),
+        RegisteredHealthCheck("Disk Space", check_disk_space, False, "fail"),
+        RegisteredHealthCheck("File Integrity", check_file_integrity, True),
     ]
 
     results: list[HealthCheckItem] = []
@@ -113,21 +240,46 @@ async def run_all_health_checks() -> StartupHealthSummary:
 
     logger.info("Running startup health checks")
 
-    for name, check_func, critical in checks:
+    for registered_check in checks:
         try:
-            await check_func()
+            await registered_check.check_func()
+        except HealthCheckWarning as exc:
+            results.append(
+                HealthCheckItem(
+                    name=registered_check.name,
+                    status="warn",
+                    detail=str(exc),
+                    critical=False,
+                )
+            )
+            warnings.append(f"{registered_check.name}: {exc}")
+            logger.warning("Health check warning: %s", exc)
         except HealthCheckError as exc:
-            status = "fail" if critical else "warn"
-            results.append(HealthCheckItem(name=name, status=status, detail=str(exc), critical=critical))
-            if critical:
-                errors.append(f"{name}: {exc}")
+            status = registered_check.failure_status
+            results.append(
+                HealthCheckItem(
+                    name=registered_check.name,
+                    status=status,
+                    detail=str(exc),
+                    critical=registered_check.fatal and status == "fail",
+                )
+            )
+            if registered_check.fatal:
+                errors.append(f"{registered_check.name}: {exc}")
                 logger.error("Health check failed: %s", exc)
             else:
-                warnings.append(f"{name}: {exc}")
+                warnings.append(f"{registered_check.name}: {exc}")
                 logger.warning("Health check warning: %s", exc)
         else:
-            results.append(HealthCheckItem(name=name, status="pass", detail="OK", critical=critical))
-            logger.info("Health check passed: %s", name)
+            results.append(
+                HealthCheckItem(
+                    name=registered_check.name,
+                    status="pass",
+                    detail="OK",
+                    critical=registered_check.fatal,
+                )
+            )
+            logger.info("Health check passed: %s", registered_check.name)
 
     summary = StartupHealthSummary(
         checked_at=utc_now(),

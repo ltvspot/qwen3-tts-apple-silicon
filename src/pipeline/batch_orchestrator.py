@@ -21,6 +21,7 @@ from src.database import (
     GenerationJobType,
     utc_now,
 )
+from src.notifications import send_batch_complete_notification, send_batch_error_notification
 
 logger = logging.getLogger(__name__)
 
@@ -208,39 +209,51 @@ class BatchOrchestrator:
         if self._progress is None:
             return
 
-        self._progress.status = BatchStatus.RUNNING
-        self._persist_run()
         batch_started_at = datetime.now(timezone.utc)
         completed_durations: list[float] = []
+        try:
+            self._progress.status = BatchStatus.RUNNING
+            self._persist_run()
 
-        for index, book_id in enumerate(book_ids):
-            if self._cancel_event.is_set():
-                self._progress.status = BatchStatus.CANCELLED
-                self._persist_run()
-                return
+            for index, book_id in enumerate(book_ids):
+                if self._cancel_event.is_set():
+                    self._progress.status = BatchStatus.CANCELLED
+                    return
 
-            await self._pause_event.wait()
-            await self._wait_for_resources()
+                await self._pause_event.wait()
+                await self._wait_for_resources()
 
-            if self._cancel_event.is_set():
-                self._progress.status = BatchStatus.CANCELLED
-                self._persist_run()
-                return
+                if self._cancel_event.is_set():
+                    self._progress.status = BatchStatus.CANCELLED
+                    return
 
-            result = await self._process_book(book_id, skip_exported)
-            self._record_result(result)
+                result = await self._process_book(book_id, skip_exported)
+                self._record_result(result)
 
-            if result.status == "completed":
-                completed_durations.append(result.duration_seconds)
-            self._update_eta(index, len(book_ids), batch_started_at, completed_durations)
+                if result.status == "completed":
+                    completed_durations.append(result.duration_seconds)
+                self._update_eta(index, len(book_ids), batch_started_at, completed_durations)
 
-        if self._progress.status == BatchStatus.RUNNING:
-            self._progress.status = BatchStatus.COMPLETED
-        self._progress.current_book_id = None
-        self._progress.current_book_title = None
-        self._progress.books_in_progress = 0
-        self._progress.model_reloads = self.model_manager.stats.reload_count
-        self._persist_run()
+            if self._progress.status == BatchStatus.RUNNING:
+                self._progress.status = BatchStatus.COMPLETED
+        except Exception as exc:
+            logger.exception("Batch %s crashed", self._progress.batch_id)
+            self._progress.status = BatchStatus.FAILED
+            self._progress.pause_reason = str(exc)[:500]
+            send_batch_error_notification(f"Batch failed: {str(exc)[:180]}")
+        finally:
+            self._progress.current_book_id = None
+            self._progress.current_book_title = None
+            self._progress.books_in_progress = 0
+            self._progress.model_reloads = self.model_manager.stats.reload_count
+            self._persist_run()
+            if self._progress.status == BatchStatus.COMPLETED:
+                send_batch_complete_notification(
+                    completed_books=self._progress.books_completed,
+                    total_books=self._progress.total_books,
+                    failed_books=self._progress.books_failed,
+                    skipped_books=self._progress.books_skipped,
+                )
 
     async def _process_book(self, book_id: int, skip_exported: bool) -> BatchBookResult:
         """Process one book without letting failures abort the rest of the batch."""

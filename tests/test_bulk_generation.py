@@ -319,7 +319,7 @@ def test_batch_estimate_disk(client, test_db: Session, monkeypatch: pytest.Monke
     assert payload["total_chapters"] == 2
     assert payload["total_words"] == 300000
     assert payload["estimated_audio_hours"] == pytest.approx(33.3, rel=0.01)
-    assert payload["estimated_disk_gb"] == pytest.approx(5.9, rel=0.05)
+    assert payload["estimated_disk_gb"] == pytest.approx(12.0, rel=0.05)
     assert payload["can_proceed"] is True
 
 
@@ -341,6 +341,38 @@ def test_batch_estimate_warns_low_disk(client, test_db: Session, monkeypatch: py
     payload = response.json()
     assert payload["can_proceed"] is False
     assert any("Low disk headroom" in warning for warning in payload["warnings"])
+
+
+def test_batch_start_rejects_when_disk_headroom_is_insufficient(
+    client,
+    test_db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    book = _create_book(test_db, title="Tight Disk Book")
+    _create_chapter(test_db, book=book, number=1, word_count=300_000)
+
+    monkeypatch.setattr(
+        "src.api.batch_routes.shutil.disk_usage",
+        lambda _path: SimpleNamespace(free=5 * (1024**3), used=95 * (1024**3), total=100 * (1024**3)),
+    )
+    notified: list[str] = []
+    monkeypatch.setattr(
+        "src.api.batch_routes.send_batch_error_notification",
+        lambda message: notified.append(message),
+    )
+
+    response = client.post(
+        "/api/batch/start",
+        json={"book_ids": [book.id], "skip_already_exported": True},
+    )
+
+    assert response.status_code == 507
+    assert response.json()["detail"] == (
+        "Insufficient disk space for batch. Estimated 12.0GB needed, 5.0GB available."
+    )
+    assert notified == [
+        "Insufficient disk space for batch. Estimated 12.0GB needed, 5.0GB available."
+    ]
 
 
 @pytest.mark.asyncio

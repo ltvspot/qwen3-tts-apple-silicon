@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from src import health_checks
-from src.health_checks import HealthCheckError
+from src.health_checks import HealthCheckError, HealthCheckWarning
 
 
 @pytest.mark.asyncio
@@ -62,6 +62,76 @@ async def test_check_output_directory_writable_ignores_cleanup_failures(
 
 
 @pytest.mark.asyncio
+async def test_check_disk_space_warns_before_critical_threshold(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Disk usage above 90% should warn without aborting startup."""
+
+    notifications: list[tuple[float, float, bool]] = []
+    monkeypatch.setattr(
+        health_checks,
+        "get_disk_space_snapshot",
+        lambda output_dir=None: health_checks.DiskSpaceSnapshot(
+            total_bytes=100 * (1024**3),
+            used_bytes=91 * (1024**3),
+            free_bytes=9 * (1024**3),
+            percent_used=91.0,
+        ),
+    )
+    monkeypatch.setattr(
+        health_checks,
+        "send_disk_warning_notification",
+        lambda *, free_gb, percent_used, critical: notifications.append((free_gb, percent_used, critical)),
+    )
+
+    with pytest.raises(HealthCheckWarning, match="WARNING: 91.0% used, 9GB free"):
+        await health_checks.check_disk_space()
+
+    assert notifications == [(9.0, 91.0, False)]
+
+
+@pytest.mark.asyncio
+async def test_check_disk_space_fails_when_critically_full(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Disk usage above 95% should fail startup."""
+
+    notifications: list[tuple[float, float, bool]] = []
+    monkeypatch.setattr(
+        health_checks,
+        "get_disk_space_snapshot",
+        lambda output_dir=None: health_checks.DiskSpaceSnapshot(
+            total_bytes=100 * (1024**3),
+            used_bytes=96 * (1024**3),
+            free_bytes=4 * (1024**3),
+            percent_used=96.0,
+        ),
+    )
+    monkeypatch.setattr(
+        health_checks,
+        "send_disk_warning_notification",
+        lambda *, free_gb, percent_used, critical: notifications.append((free_gb, percent_used, critical)),
+    )
+
+    with pytest.raises(HealthCheckError, match="CRITICAL: 96.0% used, 4GB free"):
+        await health_checks.check_disk_space()
+
+    assert notifications == [(4.0, 96.0, True)]
+
+
+def test_find_empty_python_files_detects_zero_byte_corruption(tmp_path: Path) -> None:
+    """The file-integrity scan should surface empty Python files and ignore virtualenvs."""
+
+    src_dir = tmp_path / "src"
+    venv_dir = tmp_path / ".venv" / "lib"
+    src_dir.mkdir(parents=True)
+    venv_dir.mkdir(parents=True)
+    (src_dir / "healthy.py").write_text("print('ok')\n", encoding="utf-8")
+    (src_dir / "broken.py").write_text("", encoding="utf-8")
+    (venv_dir / "ignored.py").write_text("", encoding="utf-8")
+
+    empty_files = health_checks.find_empty_python_files(tmp_path)
+
+    assert empty_files == ["src/broken.py"]
+
+
+@pytest.mark.asyncio
 async def test_run_all_health_checks_returns_warning_summary_for_noncritical_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -81,6 +151,8 @@ async def test_run_all_health_checks_returns_warning_summary_for_noncritical_fai
     monkeypatch.setattr(health_checks, "check_ffmpeg_installed", ffmpeg_warning)
     monkeypatch.setattr(health_checks, "check_manuscript_folder_exists", manuscript_warning)
     monkeypatch.setattr(health_checks, "check_output_directory_writable", pass_check)
+    monkeypatch.setattr(health_checks, "check_disk_space", pass_check)
+    monkeypatch.setattr(health_checks, "check_file_integrity", pass_check)
 
     summary = await health_checks.run_all_health_checks()
 
@@ -89,7 +161,7 @@ async def test_run_all_health_checks_returns_warning_summary_for_noncritical_fai
         "ffmpeg Installation: ffmpeg missing",
         "Manuscript Folder: manuscripts missing",
     ]
-    assert [check.status for check in summary.checks] == ["pass", "pass", "warn", "warn", "pass"]
+    assert [check.status for check in summary.checks] == ["pass", "pass", "warn", "warn", "pass", "pass", "pass"]
 
 
 @pytest.mark.asyncio
@@ -107,6 +179,8 @@ async def test_run_all_health_checks_raises_on_critical_failures(monkeypatch: py
     monkeypatch.setattr(health_checks, "check_ffmpeg_installed", pass_check)
     monkeypatch.setattr(health_checks, "check_manuscript_folder_exists", pass_check)
     monkeypatch.setattr(health_checks, "check_output_directory_writable", pass_check)
+    monkeypatch.setattr(health_checks, "check_disk_space", pass_check)
+    monkeypatch.setattr(health_checks, "check_file_integrity", pass_check)
 
     with pytest.raises(HealthCheckError, match="Database Connection: database unavailable"):
         await health_checks.run_all_health_checks()

@@ -9,6 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session, selectinload
 
@@ -503,6 +504,42 @@ async def get_book_chapters(book_id: int, db: Session = Depends(get_db)) -> list
 
     chapters = db.query(Chapter).filter(Chapter.book_id == book_id).order_by(Chapter.number, Chapter.id).all()
     return [_serialize_chapter(chapter) for chapter in chapters]
+
+
+@router.get("/book/{book_id}/chapter/{chapter_number}/preview")
+async def preview_chapter_audio(
+    book_id: int,
+    chapter_number: int,
+    db: Session = Depends(get_db),
+) -> FileResponse:
+    """Stream generated chapter audio for the native in-browser preview player."""
+
+    chapter = (
+        db.query(Chapter)
+        .filter(Chapter.book_id == book_id, Chapter.number == chapter_number)
+        .first()
+    )
+    if chapter is None:
+        raise HTTPException(status_code=404, detail=f"Chapter {chapter_number} not found in book {book_id}")
+    if not chapter.audio_path:
+        raise HTTPException(status_code=404, detail="Audio not yet generated for this chapter")
+
+    outputs_root = Path(settings.OUTPUTS_PATH).resolve()
+    audio_file = (outputs_root / chapter.audio_path).resolve()
+    if outputs_root not in audio_file.parents:
+        raise HTTPException(status_code=400, detail="Invalid audio path")
+    if not audio_file.exists():
+        raise HTTPException(status_code=404, detail="Audio not yet generated for this chapter")
+
+    return FileResponse(
+        audio_file,
+        media_type="audio/wav",
+        filename=audio_file.name,
+        headers={
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "no-cache",
+        },
+    )
 
 
 @router.post("/book/{book_id}/parse", response_model=ParseBookResponse)

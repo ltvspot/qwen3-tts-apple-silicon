@@ -31,15 +31,22 @@ from src.api.queue_routes import router as queue_router
 from src.api.settings_routes import router as settings_router
 from src.api.voice_lab import release_engine, router as voice_lab_router
 from src.api.routes import router as api_router
-from src.api.schemas import HealthCheckResponse, StartupHealthSummary
+from src.api.schemas import HealthCheckResponse, HealthDiskPayload, StartupHealthSummary
 from src.config import get_application_settings, reset_settings_manager, settings
 from src.database import init_db, utc_now
-from src.health_checks import run_all_health_checks
+from src.health_checks import get_disk_space_snapshot, run_all_health_checks
 from src.logging_config import configure_logging
 from src.startup import graceful_shutdown, install_signal_handlers, run_startup_recovery
 
 configure_logging(level=settings.LOG_LEVEL)
 logger = logging.getLogger(__name__)
+
+ALLOWED_ORIGINS = [
+    "http://localhost:8080",
+    "http://127.0.0.1:8080",
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+]
 
 def ensure_runtime_directories() -> None:
     """Create mutable runtime directories and log missing source paths."""
@@ -79,10 +86,11 @@ app.add_middleware(
 )
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.allowed_origins,
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
+    max_age=3600,
 )
 app.middleware("http")(request_context_middleware)
 register_error_handlers(app)
@@ -105,6 +113,7 @@ async def health_check() -> HealthCheckResponse:
     startup_summary = getattr(app.state, "startup_health", None)
     if startup_summary is None:
         startup_summary = StartupHealthSummary(checked_at=utc_now(), checks=[], warnings=[], errors=[])
+    disk_snapshot = get_disk_space_snapshot()
 
     if startup_summary.errors:
         status = "error"
@@ -112,7 +121,22 @@ async def health_check() -> HealthCheckResponse:
         status = "degraded"
     else:
         status = "ok"
-    return HealthCheckResponse(status=status, version=__version__, startup=startup_summary)
+
+    if disk_snapshot.percent_used > 95:
+        status = "error"
+    elif disk_snapshot.percent_used > 90 and status != "error":
+        status = "degraded"
+
+    return HealthCheckResponse(
+        status=status,
+        version=__version__,
+        startup=startup_summary,
+        disk=HealthDiskPayload(
+            total_gb=disk_snapshot.total_gb,
+            free_gb=disk_snapshot.free_gb,
+            percent_used=disk_snapshot.percent_used,
+        ),
+    )
 
 
 # --- Frontend static file serving ---

@@ -61,7 +61,7 @@ export default function AudioPlayerPanel({
     return null;
   }
 
-  const audioUrl = `/api/book/${bookId}/chapter/${selectedChapter.number}/audio`;
+  const audioUrl = `/api/book/${bookId}/chapter/${selectedChapter.number}/preview`;
   const generationLabel = selectedChapter.generation_seconds
     ? `Generated in ${formatDetailedDuration(selectedChapter.generation_seconds)}`
     : "Generation time unavailable";

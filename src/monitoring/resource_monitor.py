@@ -7,6 +7,8 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
+from src.notifications import send_disk_warning_notification
+
 logger = logging.getLogger(__name__)
 
 
@@ -92,6 +94,20 @@ class ResourceMonitor:
                 f"(minimum: {self.thresholds.min_disk_free_gb:.1f} GB)"
             )
             can_proceed = False
+            send_disk_warning_notification(
+                free_gb=snapshot.disk_free_gb,
+                percent_used=snapshot.disk_used_percent,
+                critical=snapshot.disk_used_percent > 95,
+            )
+        elif snapshot.disk_used_percent > 90:
+            warnings.append(
+                f"HIGH DISK USAGE: {snapshot.disk_used_percent:.1f}% used"
+            )
+            send_disk_warning_notification(
+                free_gb=snapshot.disk_free_gb,
+                percent_used=snapshot.disk_used_percent,
+                critical=snapshot.disk_used_percent > 95,
+            )
 
         if snapshot.memory_used_percent > self.thresholds.max_memory_percent:
             warnings.append(

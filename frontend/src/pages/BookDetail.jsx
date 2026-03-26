@@ -8,7 +8,7 @@ import ExportProgressBar from "../components/ExportProgressBar";
 import GenerationProgress from "../components/GenerationProgress";
 import NarrationSettings from "../components/NarrationSettings";
 import TextPreview from "../components/TextPreview";
-import { mapChapterGenerationState } from "../components/generationStatus";
+import { formatDetailedDuration, mapChapterGenerationState } from "../components/generationStatus";
 
 const DEFAULT_NARRATION_SETTINGS = {
   voice: "Ethan",
@@ -161,6 +161,17 @@ export default function BookDetail() {
     [chapters, generationSnapshot],
   );
   const selectedChapter = mergedChapters.find((chapter) => chapter.id === selectedChapterId) ?? null;
+  const selectedChapterHasPreview = Boolean(
+    selectedChapter && (
+      selectedChapter.audio_path
+      || selectedChapter.generation_status === "completed"
+      || selectedChapter.audio_duration_seconds
+      || selectedChapter.duration_seconds
+    ),
+  );
+  const selectedChapterPreviewUrl = selectedChapter
+    ? `/api/book/${id}/chapter/${selectedChapter.number}/preview`
+    : null;
   const hasUnsavedChanges = chapterHasUnsavedChanges(selectedChapter, draftText, editMode);
   const completedChapters = mergedChapters.filter((chapter) => chapter.generation_status === "completed");
   const hasRemainingChapters = mergedChapters.some((chapter) => chapter.generation_status !== "completed");
@@ -943,6 +954,46 @@ export default function BookDetail() {
           />
 
           <div className="flex flex-col gap-6">
+            {selectedChapter ? (
+              <section className="rounded-[2rem] border border-white/10 bg-white/[0.05] p-5 text-white shadow-xl shadow-slate-950/20">
+                <div className="flex flex-col gap-4">
+                  <div>
+                    <div className="text-xs font-semibold uppercase tracking-[0.28em] text-sky-200/75">
+                      Audio Preview
+                    </div>
+                    <h2 className="mt-3 text-xl font-semibold">
+                      {selectedChapter.title || `Chapter ${selectedChapter.number}`}
+                    </h2>
+                    <p className="mt-3 text-sm leading-7 text-slate-300">
+                      Inspect the generated chapter directly in the browser before opening the full player panel.
+                    </p>
+                  </div>
+
+                  {selectedChapterHasPreview && selectedChapterPreviewUrl ? (
+                    <>
+                      <audio
+                        className="w-full"
+                        controls
+                        preload="metadata"
+                        src={selectedChapterPreviewUrl}
+                      >
+                        Your browser does not support audio playback.
+                      </audio>
+                      <div className="text-sm text-slate-300">
+                        Duration: {formatDetailedDuration(
+                          selectedChapter.audio_duration_seconds ?? selectedChapter.duration_seconds ?? 0,
+                        )}
+                      </div>
+                    </>
+                  ) : (
+                    <div className="rounded-3xl border border-white/10 bg-slate-950/45 px-4 py-4 text-sm leading-7 text-slate-300">
+                      Generate this chapter to unlock the in-browser preview player.
+                    </div>
+                  )}
+                </div>
+              </section>
+            ) : null}
+
             <NarrationSettings
               loadingMessage={voiceLoadingMessage}
               loadingVoices={loadingVoiceOptions}

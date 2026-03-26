@@ -11,9 +11,10 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session, selectinload
 
 from src.api.generation_runtime import ensure_batch_orchestrator
-from src.pipeline.batch_orchestrator import BatchSchedulingStrategy
 from src.config import settings
 from src.database import Book, BookStatus, GenerationJob, GenerationJobStatus, get_db
+from src.notifications import send_batch_error_notification, send_batch_started_notification
+from src.pipeline.batch_orchestrator import BatchSchedulingStrategy
 
 router = APIRouter(prefix="/api/batch", tags=["batch"])
 
@@ -214,6 +215,25 @@ def _generate_warnings(
     return warnings
 
 
+def _estimate_total_disk_needed_gb(books: list[Book]) -> float:
+    """Return a conservative disk estimate for the selected batch."""
+
+    total_chapters = sum(len(book.chapters) for book in books)
+    if total_chapters == 0:
+        return 0.0
+
+    total_words = sum(sum(chapter.word_count or 0 for chapter in book.chapters) for book in books)
+    estimated_audio_seconds = (total_words / 2.5) if total_words > 0 else (total_chapters * 1800.0)
+    avg_chapter_duration_seconds = estimated_audio_seconds / max(total_chapters, 1)
+    rough_wav_estimate_gb = total_chapters * avg_chapter_duration_seconds * 0.0001
+
+    precise_wav_bytes = estimated_audio_seconds * 48_000
+    precise_export_bytes = precise_wav_bytes * 0.1
+    precise_estimate_gb = (precise_wav_bytes + precise_export_bytes) / (1024**3)
+
+    return max(rough_wav_estimate_gb, precise_estimate_gb)
+
+
 @router.post("/estimate", response_model=BatchEstimatePayload)
 async def estimate_batch_resources(
     request: BatchEstimateRequest,
@@ -230,9 +250,7 @@ async def estimate_batch_resources(
     total_words = sum(sum(chapter.word_count or 0 for chapter in book.chapters) for book in books)
 
     estimated_audio_seconds = total_words / 2.5 if total_words > 0 else 0.0
-    estimated_wav_bytes = estimated_audio_seconds * 48_000
-    estimated_export_bytes = estimated_wav_bytes * 0.1
-    total_disk_needed_gb = (estimated_wav_bytes + estimated_export_bytes) / (1024**3)
+    total_disk_needed_gb = _estimate_total_disk_needed_gb(books)
 
     rtf = 1.5
     estimated_generation_hours = (estimated_audio_seconds * rtf) / 3600 if estimated_audio_seconds else 0.0
@@ -267,6 +285,25 @@ async def estimate_batch_resources(
 async def start_batch(request: BatchStartRequest, db: Session = Depends(get_db)) -> BatchProgressPayload:
     """Start a new batch generation run."""
 
+    books, _warnings = _resolve_batch_books(
+        db,
+        book_ids=request.book_ids,
+        skip_already_exported=request.skip_already_exported,
+    )
+    total_disk_needed_gb = _estimate_total_disk_needed_gb(books)
+    disk_target_path = Path(settings.OUTPUTS_PATH)
+    disk_usage_target = disk_target_path if disk_target_path.exists() else disk_target_path.resolve().parent
+    disk_target = shutil.disk_usage(disk_usage_target)
+    disk_free_gb = disk_target.free / (1024**3)
+
+    if total_disk_needed_gb > disk_free_gb * 0.8:
+        detail = (
+            "Insufficient disk space for batch. "
+            f"Estimated {total_disk_needed_gb:.1f}GB needed, {disk_free_gb:.1f}GB available."
+        )
+        send_batch_error_notification(detail)
+        raise HTTPException(status_code=507, detail=detail)
+
     orchestrator = await ensure_batch_orchestrator(db)
     book_ids = request.book_ids if request.book_ids is not None else _default_batch_book_ids(db)
     try:
@@ -277,10 +314,13 @@ async def start_batch(request: BatchStartRequest, db: Session = Depends(get_db))
             strategy=request.scheduling_strategy,
         )
     except RuntimeError as exc:
+        send_batch_error_notification(str(exc))
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    send_batch_started_notification(len(book_ids))
     payload = orchestrator.to_dict()
     if payload is None:
+        send_batch_error_notification("Failed to initialize batch progress.")
         raise HTTPException(status_code=500, detail="Failed to initialize batch progress.")
     return BatchProgressPayload.model_validate(payload)
 

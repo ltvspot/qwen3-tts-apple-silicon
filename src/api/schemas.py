@@ -26,9 +26,18 @@ class StartupHealthSummary(BaseModel):
     errors: list[str] = Field(default_factory=list)
 
 
+class HealthDiskPayload(BaseModel):
+    """Current disk usage for the output volume."""
+
+    total_gb: int
+    free_gb: int
+    percent_used: float
+
+
 class HealthCheckResponse(BaseModel):
     """Health check response payload."""
 
     status: str
     version: str
     startup: StartupHealthSummary | None = None
+    disk: HealthDiskPayload | None = None
