@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from "react";
 import AppShell from "../components/AppShell";
 import AudioPlayer from "../components/AudioPlayer";
 import ClonedVoicesList from "../components/ClonedVoicesList";
+import ConfirmDialog from "../components/ConfirmDialog";
 import ProgressHeartbeat from "../components/ProgressHeartbeat";
 import VoiceCloneForm from "../components/VoiceCloneForm";
 import VoicePresetManager from "../components/VoicePresetManager";
@@ -11,6 +12,7 @@ const DEFAULT_TEST_TEXT = "This is the Alexandria Audiobook Narrator. Test your 
 const EMOTION_PRESETS = ["neutral", "warm", "dramatic", "energetic", "contemplative", "authoritative"];
 const PRESET_STORAGE_KEY = "voicePresets";
 const VOICE_LOAD_MAX_RETRIES = 20;
+const CLOSED_CONFIRM_DIALOG = { data: null, open: false, type: null };
 
 function readStoredPresets() {
   try {
@@ -223,6 +225,7 @@ export default function VoiceLab() {
   const [compareEmotion, setCompareEmotion] = useState("neutral");
   const [compareSpeed, setCompareSpeed] = useState(1.0);
   const [compareVoice, setCompareVoice] = useState("Nova");
+  const [confirmDialog, setConfirmDialog] = useState(CLOSED_CONFIRM_DIALOG);
   const [deletingVoiceName, setDeletingVoiceName] = useState("");
   const [duration, setDuration] = useState(0);
   const [engineName, setEngineName] = useState("");
@@ -478,26 +481,11 @@ export default function VoiceLab() {
   }
 
   const handleSavePreset = () => {
-    const presetName = window.prompt("Preset name:");
-    const trimmedName = presetName?.trim();
-
-    if (!trimmedName) {
-      return;
-    }
-
-    const nextPresets = [
-      {
-        id: `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
-        name: trimmedName,
-        voice,
-        emotion,
-        speed,
-      },
-      ...presets,
-    ];
-
-    setPresets(nextPresets);
-    writeStoredPresets(nextPresets);
+    setConfirmDialog({
+      data: null,
+      open: true,
+      type: "save-preset",
+    });
   };
 
   const handleLoadPreset = (preset) => {
@@ -527,11 +515,7 @@ export default function VoiceLab() {
     setActiveTab("clone");
   }
 
-  async function handleDeleteClonedVoice(voiceName) {
-    if (!window.confirm(`Delete voice "${voiceName}"?`)) {
-      return;
-    }
-
+  async function deleteClonedVoice(voiceName) {
     setDeletingVoiceName(voiceName);
     setClonedVoicesError("");
 
@@ -553,6 +537,50 @@ export default function VoiceLab() {
     } finally {
       setDeletingVoiceName("");
     }
+  }
+
+  function handleConfirmDialogCancel() {
+    setConfirmDialog(CLOSED_CONFIRM_DIALOG);
+  }
+
+  function handleConfirmDialogConfirm(value) {
+    const activeDialog = confirmDialog;
+    setConfirmDialog(CLOSED_CONFIRM_DIALOG);
+
+    if (activeDialog.type === "save-preset") {
+      const trimmedName = value?.trim();
+
+      if (!trimmedName) {
+        return;
+      }
+
+      const nextPresets = [
+        {
+          id: `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`,
+          name: trimmedName,
+          voice,
+          emotion,
+          speed,
+        },
+        ...presets,
+      ];
+
+      setPresets(nextPresets);
+      writeStoredPresets(nextPresets);
+      return;
+    }
+
+    if (activeDialog.type === "delete-cloned-voice" && activeDialog.data?.voiceName) {
+      void deleteClonedVoice(activeDialog.data.voiceName);
+    }
+  }
+
+  function handleDeleteClonedVoice(voiceName) {
+    setConfirmDialog({
+      data: { voiceName },
+      open: true,
+      type: "delete-cloned-voice",
+    });
   }
 
   return (
@@ -836,6 +864,24 @@ export default function VoiceLab() {
           </div>
         )}
       </div>
+
+      <ConfirmDialog
+        confirmColor={confirmDialog.type === "delete-cloned-voice" ? "rose" : "amber"}
+        confirmLabel={confirmDialog.type === "delete-cloned-voice" ? "Delete Voice" : "Save Preset"}
+        message={
+          confirmDialog.type === "delete-cloned-voice"
+            ? `Are you sure you want to delete "${confirmDialog.data?.voiceName}"? This cannot be undone.`
+            : "Enter a name for this voice configuration preset."
+        }
+        onCancel={handleConfirmDialogCancel}
+        onConfirm={handleConfirmDialogConfirm}
+        open={confirmDialog.open}
+        promptDefault=""
+        promptLabel="Preset name"
+        promptMode={confirmDialog.type === "save-preset"}
+        theme="light"
+        title={confirmDialog.type === "delete-cloned-voice" ? "Delete Cloned Voice" : "Save Voice Preset"}
+      />
     </AppShell>
   );
 }

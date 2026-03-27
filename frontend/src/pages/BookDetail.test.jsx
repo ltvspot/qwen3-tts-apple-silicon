@@ -389,8 +389,12 @@ describe("BookDetail page", () => {
     global.fetch = fetchMock;
     mockNavigate.mockReset();
 
-    alertMock = jest.spyOn(window, "alert").mockImplementation(() => {});
-    confirmMock = jest.spyOn(window, "confirm").mockReturnValue(true);
+    alertMock = jest.spyOn(window, "alert").mockImplementation(() => {
+      throw new Error("Native alert should not be used.");
+    });
+    confirmMock = jest.spyOn(window, "confirm").mockImplementation(() => {
+      throw new Error("Native confirm should not be used.");
+    });
   });
 
   afterEach(async () => {
@@ -446,8 +450,8 @@ describe("BookDetail page", () => {
     });
   }
 
-  function getButtonByText(label) {
-    return Array.from(container.querySelectorAll("button")).find((button) =>
+  function getButtonByText(label, rootNode = document.body) {
+    return Array.from(rootNode.querySelectorAll("button")).find((button) =>
       button.textContent.includes(label),
     );
   }
@@ -911,24 +915,48 @@ describe("BookDetail page", () => {
       setFormValue(textarea, "Unsaved rewrite for opening credits.", "input");
     });
 
-    confirmMock.mockReturnValueOnce(false);
     await act(async () => {
       container
         .querySelector('[data-chapter-id="702"]')
         .dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
 
-    expect(window.confirm).toHaveBeenCalledWith(
-      "Discard unsaved chapter edits?",
-    );
+    await waitFor(() => {
+      expect(document.body.textContent).toContain("Unsaved Changes");
+      expect(document.body.textContent).toContain("Discard & Switch");
+    });
+
+    expect(window.confirm).not.toHaveBeenCalled();
     expect(container.textContent).toContain("Unsaved changes");
     expect(container.textContent).toContain("Opening Credits");
 
-    confirmMock.mockReturnValueOnce(true);
+    await act(async () => {
+      getButtonByText("Keep Editing").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+    });
+
+    await waitFor(() => {
+      expect(document.body.textContent).not.toContain(
+        "Discard & Switch",
+      );
+      expect(container.textContent).toContain("Opening Credits");
+    });
+
     await act(async () => {
       container
         .querySelector('[data-chapter-id="702"]')
         .dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    await waitFor(() => {
+      expect(document.body.textContent).toContain("Unsaved Changes");
+    });
+
+    await act(async () => {
+      getButtonByText("Discard & Switch").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
     });
 
     await waitFor(() => {
@@ -1031,15 +1059,13 @@ describe("BookDetail page", () => {
     });
 
     await waitFor(() => {
-      expect(container.textContent).toContain("Generate All Chapters");
-      expect(container.textContent).toContain(
+      expect(document.body.textContent).toContain("Generate All Chapters");
+      expect(document.body.textContent).toContain(
         "This will generate audio for all remaining 2 chapters. This may take a while.",
       );
     });
 
-    expect(window.confirm).not.toHaveBeenCalledWith(
-      "This will generate all remaining chapters. Continue?",
-    );
+    expect(window.confirm).not.toHaveBeenCalled();
 
     await act(async () => {
       getButtonByText("Start Generation").dispatchEvent(

@@ -1,5 +1,10 @@
 import React, { useEffect, useMemo, useState } from "react";
+import ConfirmDialog from "./ConfirmDialog";
+import Toast from "./Toast";
 import useAsyncData from "../hooks/useAsyncData";
+
+const CLOSED_CONFIRM_DIALOG = { data: null, open: false, type: null };
+const HIDDEN_TOAST = { message: "", type: "info", visible: false };
 
 function cloneSettings(payload) {
   return JSON.parse(JSON.stringify(payload));
@@ -109,6 +114,7 @@ function readValidationMessage(schema, path, value) {
 }
 
 export default function SettingsForm() {
+  const [confirmDialog, setConfirmDialog] = useState(CLOSED_CONFIRM_DIALOG);
   const [errorMessage, setErrorMessage] = useState("");
   const [formSettings, setFormSettings] = useState(null);
   const [initialSettings, setInitialSettings] = useState(null);
@@ -116,6 +122,7 @@ export default function SettingsForm() {
   const [schema, setSchema] = useState(null);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [successMessage, setSuccessMessage] = useState("");
+  const [toast, setToast] = useState(HIDDEN_TOAST);
   const [validationMessage, setValidationMessage] = useState("");
 
   const {
@@ -205,6 +212,14 @@ export default function SettingsForm() {
     setFormSettings((current) => deepSet(current, path, value));
   }
 
+  function showToast(message, type = "success") {
+    setToast({
+      message,
+      type,
+      visible: true,
+    });
+  }
+
   function discardChanges() {
     setFormSettings(cloneSettings(initialSettings));
     setErrorMessage("");
@@ -213,16 +228,11 @@ export default function SettingsForm() {
   }
 
   function resetToDefaults() {
-    const shouldReset = window.confirm("Reset all settings to defaults?");
-    if (!shouldReset) {
-      return;
-    }
-
-    const defaults = buildDefaultSettings(schema);
-    setFormSettings(defaults);
-    setSuccessMessage("");
-    setErrorMessage("");
-    setValidationMessage("");
+    setConfirmDialog({
+      data: null,
+      open: true,
+      type: "reset-defaults",
+    });
   }
 
   async function handleSave() {
@@ -252,10 +262,34 @@ export default function SettingsForm() {
       setInitialSettings(cloneSettings(payload.settings));
       setSuccessMessage("Settings saved successfully.");
       setValidationMessage("");
+      showToast("Settings saved");
     } catch (error) {
       setErrorMessage(error instanceof Error ? error.message : "Failed to save settings.");
     } finally {
       setIsSaving(false);
+    }
+  }
+
+  function handleConfirmDialogCancel() {
+    setConfirmDialog(CLOSED_CONFIRM_DIALOG);
+  }
+
+  function handleConfirmDialogConfirm(value) {
+    const activeDialog = confirmDialog;
+    setConfirmDialog(CLOSED_CONFIRM_DIALOG);
+
+    if (activeDialog.type === "reset-defaults") {
+      const defaults = buildDefaultSettings(schema);
+      setFormSettings(defaults);
+      setSuccessMessage("");
+      setErrorMessage("");
+      setValidationMessage("");
+      showToast("Settings reset to defaults");
+      return;
+    }
+
+    if (activeDialog.type === "manuscript-folder") {
+      handleChange("manuscript_source_folder", value ?? "");
     }
   }
 
@@ -337,13 +371,13 @@ export default function SettingsForm() {
               <button
                 className="rounded-full border border-slate-200 px-4 py-2 text-sm font-semibold text-slate-700 transition hover:border-slate-950 hover:text-slate-950"
                 onClick={() => {
-                  const nextPath = window.prompt(
-                    "Enter the formatted manuscripts folder path",
-                    formSettings.manuscript_source_folder,
-                  );
-                  if (nextPath !== null) {
-                    handleChange("manuscript_source_folder", nextPath);
-                  }
+                  setConfirmDialog({
+                    data: {
+                      promptDefault: formSettings.manuscript_source_folder,
+                    },
+                    open: true,
+                    type: "manuscript-folder",
+                  });
                 }}
                 type="button"
               >
@@ -580,6 +614,31 @@ export default function SettingsForm() {
           </button>
         </div>
       </section>
+
+      <ConfirmDialog
+        confirmColor={confirmDialog.type === "reset-defaults" ? "rose" : "amber"}
+        confirmLabel={confirmDialog.type === "reset-defaults" ? "Reset All" : "Set Path"}
+        message={
+          confirmDialog.type === "reset-defaults"
+            ? "This will revert all settings to their factory defaults. Any custom configuration will be lost."
+            : "Enter the full path to the folder containing formatted manuscripts."
+        }
+        onCancel={handleConfirmDialogCancel}
+        onConfirm={handleConfirmDialogConfirm}
+        open={confirmDialog.open}
+        promptDefault={confirmDialog.data?.promptDefault ?? ""}
+        promptLabel="Folder path"
+        promptMode={confirmDialog.type === "manuscript-folder"}
+        theme="light"
+        title={confirmDialog.type === "reset-defaults" ? "Reset to Defaults" : "Set Manuscript Folder"}
+      />
+
+      <Toast
+        message={toast.message}
+        onClose={() => setToast(HIDDEN_TOAST)}
+        type={toast.type}
+        visible={toast.visible}
+      />
     </div>
   );
 }

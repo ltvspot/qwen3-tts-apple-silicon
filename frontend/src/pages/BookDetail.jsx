@@ -2,12 +2,14 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import AudioPlayerPanel from "../components/AudioPlayerPanel";
 import ChapterList from "../components/ChapterList";
+import ConfirmDialog from "../components/ConfirmDialog";
 import DownloadCard from "../components/DownloadCard";
 import ExportDialog from "../components/ExportDialog";
 import ExportProgressBar from "../components/ExportProgressBar";
 import GenerationProgress from "../components/GenerationProgress";
 import NarrationSettings from "../components/NarrationSettings";
 import TextPreview from "../components/TextPreview";
+import Toast from "../components/Toast";
 import {
   formatDetailedDuration,
   mapChapterGenerationState,
@@ -25,6 +27,8 @@ const DEFAULT_VOICE_OPTIONS = [
   { name: "Nova", display_name: "Nova", is_cloned: false },
   { name: "Aria", display_name: "Aria", is_cloned: false },
 ];
+const CLOSED_CONFIRM_DIALOG = { data: null, open: false, type: null };
+const HIDDEN_TOAST = { message: "", type: "info", visible: false };
 const VOICE_LOAD_MAX_RETRIES = 20;
 const WORKFLOW_STEPS = [
   {
@@ -188,6 +192,10 @@ function formatIssueRange(issue) {
   return end ? `${start} - ${end}` : start;
 }
 
+function formatChapterCount(count) {
+  return `${count} chapter${count === 1 ? "" : "s"}`;
+}
+
 export default function BookDetail() {
   const navigate = useNavigate();
   const requestRef = useRef(0);
@@ -204,6 +212,7 @@ export default function BookDetail() {
   const [bookQualityLoading, setBookQualityLoading] = useState(false);
   const [bookQualityReport, setBookQualityReport] = useState(null);
   const [chapters, setChapters] = useState([]);
+  const [confirmDialog, setConfirmDialog] = useState(CLOSED_CONFIRM_DIALOG);
   const [draftText, setDraftText] = useState("");
   const [editMode, setEditMode] = useState(false);
   const [errorMessage, setErrorMessage] = useState("");
@@ -213,7 +222,6 @@ export default function BookDetail() {
     createIdleExportSnapshot(id),
   );
   const [exportSubmitting, setExportSubmitting] = useState(false);
-  const [generateAllModalOpen, setGenerateAllModalOpen] = useState(false);
   const [generationAction, setGenerationAction] = useState(null);
   const [generationErrorMessage, setGenerationErrorMessage] = useState("");
   const [generationSnapshot, setGenerationSnapshot] = useState(null);
@@ -231,6 +239,7 @@ export default function BookDetail() {
   const [saving, setSaving] = useState(false);
   const [selectedChapterId, setSelectedChapterId] = useState(null);
   const [showAllChapterIssues, setShowAllChapterIssues] = useState(false);
+  const [toast, setToast] = useState(HIDDEN_TOAST);
   const [voiceLoadingMessage, setVoiceLoadingMessage] = useState("");
   const [voiceOptions, setVoiceOptions] = useState(DEFAULT_VOICE_OPTIONS);
   const [voiceConsistencyChart, setVoiceConsistencyChart] = useState(null);
@@ -384,6 +393,14 @@ export default function BookDetail() {
     };
   }, [exportSnapshot?.export_status, id]);
 
+  function showToast(message, type = "info") {
+    setToast({
+      message,
+      type,
+      visible: true,
+    });
+  }
+
   async function fetchGenerationStatus(currentRequestId) {
     try {
       const statusResponse = await fetch(`/api/book/${id}/status`);
@@ -517,11 +534,11 @@ export default function BookDetail() {
     setAudioQaErrorMessage("");
     setAudioQaLoading(false);
     setAudioQaReport(null);
+    setConfirmDialog(CLOSED_CONFIRM_DIALOG);
     setExportDialogOpen(false);
     setExportErrorMessage("");
     setExportSnapshot(createIdleExportSnapshot(id));
     setExportSubmitting(false);
-    setGenerateAllModalOpen(false);
     setGenerationErrorMessage("");
     setBook(null);
     setBookQualityAction(null);
@@ -536,6 +553,7 @@ export default function BookDetail() {
     setLoadingVoiceOptions(true);
     setPlayerVisible(false);
     setPlayerChapterNumber(null);
+    setToast(HIDDEN_TOAST);
     setVoiceLoadingMessage("");
     setVoiceOptions(DEFAULT_VOICE_OPTIONS);
     setVoiceConsistencyChart(null);
@@ -636,6 +654,11 @@ export default function BookDetail() {
       }
 
       await fetchBookData();
+      const chapterCount = payload?.chapters_detected ?? payload?.chapter_count ?? 0;
+      showToast(
+        `Manuscript parsed — ${chapterCount} ${chapterCount === 1 ? "chapter" : "chapters"} found`,
+        "success",
+      );
     } catch (error) {
       setParseErrorMessage(
         error instanceof Error ? error.message : "Parse failed.",
@@ -850,12 +873,18 @@ export default function BookDetail() {
     }
 
     if (hasUnsavedChanges) {
-      const shouldDiscard = window.confirm("Discard unsaved chapter edits?");
-      if (!shouldDiscard) {
-        return;
-      }
+      setConfirmDialog({
+        data: { chapter },
+        open: true,
+        type: "discard-chapter-switch",
+      });
+      return;
     }
 
+    applyChapterSelection(chapter);
+  }
+
+  function applyChapterSelection(chapter) {
     setSaveErrorMessage("");
     setEditMode(false);
     setSelectedChapterId(chapter.id);
@@ -933,6 +962,7 @@ export default function BookDetail() {
       setSelectedChapterId(updatedChapter.id);
       setDraftText(updatedChapter.text_content ?? "");
       setEditMode(false);
+      showToast("Chapter saved successfully", "success");
     } catch (error) {
       setSaveErrorMessage(
         error instanceof Error ? error.message : "Failed to save chapter text.",
@@ -942,7 +972,7 @@ export default function BookDetail() {
     }
   }
 
-  async function queueGeneration(url, nextAction) {
+  async function queueGeneration(url, nextAction, chapterCount = 1) {
     setGenerationAction(nextAction);
     setGenerationErrorMessage("");
 
@@ -962,6 +992,10 @@ export default function BookDetail() {
 
       const requestId = requestRef.current;
       const nextSnapshot = await fetchGenerationStatus(requestId);
+      showToast(
+        `Audio generation queued for ${formatChapterCount(chapterCount)}`,
+        "success",
+      );
       if (nextSnapshot?.status !== "generating") {
         setGenerationAction(null);
       }
@@ -978,6 +1012,7 @@ export default function BookDetail() {
     void queueGeneration(
       `/api/book/${id}/chapter/${chapter.number}/generate${search}`,
       { chapterNumber: chapter.number, scope: "chapter" },
+      1,
     );
   }
 
@@ -986,16 +1021,45 @@ export default function BookDetail() {
       return;
     }
 
-    setGenerateAllModalOpen(true);
-  }
-
-  function handleConfirmGenerateAll() {
-    setGenerateAllModalOpen(false);
-    void queueGeneration(`/api/book/${id}/generate-all`, { scope: "all" });
+    setConfirmDialog({
+      data: { chapterCount: remainingChapterCount },
+      open: true,
+      type: "generate-all",
+    });
   }
 
   function handleNarrationSettingsChange(nextSettings) {
     setNarrationSettings(nextSettings);
+  }
+
+  function handleGenerateFromNarrationSettings() {
+    if (!selectedChapter) {
+      return;
+    }
+
+    handleGenerateChapter(selectedChapter, false);
+  }
+
+  function handleConfirmDialogCancel() {
+    setConfirmDialog(CLOSED_CONFIRM_DIALOG);
+  }
+
+  function handleConfirmDialogConfirm() {
+    const activeDialog = confirmDialog;
+    setConfirmDialog(CLOSED_CONFIRM_DIALOG);
+
+    if (activeDialog.type === "discard-chapter-switch" && activeDialog.data?.chapter) {
+      applyChapterSelection(activeDialog.data.chapter);
+      return;
+    }
+
+    if (activeDialog.type === "generate-all") {
+      void queueGeneration(
+        `/api/book/${id}/generate-all`,
+        { scope: "all" },
+        activeDialog.data?.chapterCount ?? remainingChapterCount,
+      );
+    }
   }
 
   async function handleExportSubmit(payload) {
@@ -1044,6 +1108,7 @@ export default function BookDetail() {
       }));
       setExportDialogOpen(false);
       await fetchExportStatus(requestRef.current);
+      showToast("Export started");
     } catch (error) {
       setExportErrorMessage(
         error instanceof Error ? error.message : "Failed to start export.",
@@ -1683,6 +1748,7 @@ export default function BookDetail() {
                 loadingMessage={voiceLoadingMessage}
                 loadingVoices={loadingVoiceOptions}
                 onChange={handleNarrationSettingsChange}
+                onGenerate={handleGenerateFromNarrationSettings}
                 selectedChapter={selectedChapter}
                 settings={narrationSettings}
                 voices={voiceOptions}
@@ -2259,44 +2325,30 @@ export default function BookDetail() {
         pending={exportSubmitting}
       />
 
-      {generateAllModalOpen ? (
-        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-950/80 px-4 backdrop-blur-sm">
-          <div
-            aria-labelledby="generate-all-modal-title"
-            aria-modal="true"
-            className="w-full max-w-lg rounded-[2rem] border border-white/10 bg-slate-950/95 p-6 text-white shadow-2xl shadow-slate-950/50"
-            role="dialog"
-          >
-            <div className="text-xs font-semibold uppercase tracking-[0.28em] text-amber-200/70">
-              Generation Queue
-            </div>
-            <h2 className="mt-3 text-2xl font-semibold" id="generate-all-modal-title">
-              Generate All Chapters
-            </h2>
-            <p className="mt-3 text-sm leading-7 text-slate-300">
-              This will generate audio for all remaining {remainingChapterCount} chapter
-              {remainingChapterCount === 1 ? "" : "s"}. This may take a while.
-            </p>
+      <ConfirmDialog
+        cancelLabel={confirmDialog.type === "discard-chapter-switch" ? "Keep Editing" : "Cancel"}
+        confirmColor={confirmDialog.type === "discard-chapter-switch" ? "rose" : "amber"}
+        confirmLabel={confirmDialog.type === "discard-chapter-switch" ? "Discard & Switch" : "Start Generation"}
+        message={
+          confirmDialog.type === "discard-chapter-switch"
+            ? "You have unsaved edits to this chapter. Discard changes and switch to the new chapter?"
+            : `This will generate audio for all remaining ${confirmDialog.data?.chapterCount ?? remainingChapterCount} chapter${
+                (confirmDialog.data?.chapterCount ?? remainingChapterCount) === 1 ? "" : "s"
+              }. This may take a while.`
+        }
+        onCancel={handleConfirmDialogCancel}
+        onConfirm={handleConfirmDialogConfirm}
+        open={confirmDialog.open}
+        theme="dark"
+        title={confirmDialog.type === "discard-chapter-switch" ? "Unsaved Changes" : "Generate All Chapters"}
+      />
 
-            <div className="mt-6 flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
-              <button
-                className="inline-flex items-center justify-center rounded-full border border-white/10 px-5 py-3 text-sm font-semibold text-slate-300 transition hover:border-white/20 hover:text-white"
-                onClick={() => setGenerateAllModalOpen(false)}
-                type="button"
-              >
-                Cancel
-              </button>
-              <button
-                className="inline-flex items-center justify-center rounded-full border border-amber-300/25 bg-amber-400/10 px-5 py-3 text-sm font-semibold text-amber-100 transition hover:bg-amber-400/20"
-                onClick={handleConfirmGenerateAll}
-                type="button"
-              >
-                Start Generation
-              </button>
-            </div>
-          </div>
-        </div>
-      ) : null}
+      <Toast
+        message={toast.message}
+        onClose={() => setToast(HIDDEN_TOAST)}
+        type={toast.type}
+        visible={toast.visible}
+      />
     </div>
   );
 }

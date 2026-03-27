@@ -129,8 +129,12 @@ describe("VoiceLab page", () => {
     originalXHR = global.XMLHttpRequest;
 
     window.localStorage.clear();
-    confirmMock = jest.spyOn(window, "confirm").mockReturnValue(true);
-    promptMock = jest.spyOn(window, "prompt").mockReturnValue(null);
+    confirmMock = jest.spyOn(window, "confirm").mockImplementation(() => {
+      throw new Error("Native confirm should not be used.");
+    });
+    promptMock = jest.spyOn(window, "prompt").mockImplementation(() => {
+      throw new Error("Native prompt should not be used.");
+    });
   });
 
   afterEach(async () => {
@@ -204,8 +208,6 @@ describe("VoiceLab page", () => {
       throw new Error(`Unhandled fetch: ${url}`);
     });
 
-    promptMock.mockReturnValue("Evening Read");
-
     await renderVoiceLab();
 
     await waitFor(() => {
@@ -257,8 +259,28 @@ describe("VoiceLab page", () => {
     });
 
     await waitFor(() => {
+      expect(document.body.textContent).toContain("Save Voice Preset");
+    });
+
+    const presetDialog = document.body.querySelector('[role="dialog"]');
+    const presetNameInput = document.body.querySelector(
+      'input[aria-label="Preset name"]',
+    );
+    await act(async () => {
+      setFormValue(presetNameInput, "Evening Read", "input");
+    });
+
+    await act(async () => {
+      getButtonByText(presetDialog, "Save Preset").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+    });
+
+    await waitFor(() => {
       expect(container.textContent).toContain("Evening Read");
     });
+
+    expect(window.prompt).not.toHaveBeenCalled();
 
     const storedPresets = JSON.parse(window.localStorage.getItem("voicePresets"));
     expect(storedPresets).toHaveLength(2);
@@ -530,11 +552,24 @@ describe("VoiceLab page", () => {
     });
 
     await waitFor(() => {
+      expect(document.body.textContent).toContain("Delete Cloned Voice");
+      expect(document.body.textContent).toContain(
+        'Are you sure you want to delete "kent-zimering"? This cannot be undone.',
+      );
+    });
+
+    expect(window.confirm).not.toHaveBeenCalled();
+
+    await act(async () => {
+      getButtonByText(document.body, "Delete Voice").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+    });
+
+    await waitFor(() => {
       expect(container.textContent).not.toContain("Kent Zimering Clone");
       expect(container.textContent).toContain("No cloned voices yet");
     });
-
-    expect(window.confirm).toHaveBeenCalledWith('Delete voice "kent-zimering"?');
     MockXMLHttpRequest.onSend = null;
   });
 

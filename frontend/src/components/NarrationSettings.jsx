@@ -1,4 +1,5 @@
 import React, { useEffect, useState } from "react";
+import ConfirmDialog from "./ConfirmDialog";
 import VoiceSelector from "./VoiceSelector";
 
 const EMOTION_PRESETS = [
@@ -73,10 +74,12 @@ export default function NarrationSettings({
   loadingVoices = false,
   loadingMessage = "",
   onChange,
+  onGenerate = null,
   selectedChapter,
   settings,
   voices = [],
 }) {
+  const [alertDialogOpen, setAlertDialogOpen] = useState(false);
   const [customEmotion, setCustomEmotion] = useState(settings.emotion ?? "");
 
   const availableVoices = voices.length > 0
@@ -124,11 +127,13 @@ export default function NarrationSettings({
 
   function handleGenerateChapter() {
     if (!selectedChapter) {
-      window.alert("Please select a chapter first.");
+      setAlertDialogOpen(true);
       return;
     }
 
-    window.alert("Audio generation arrives in a later prompt.");
+    if (typeof onGenerate === "function") {
+      onGenerate(selectedChapter);
+    }
   }
 
   return (
@@ -261,13 +266,25 @@ export default function NarrationSettings({
       <div className="border-t border-white/10 bg-slate-950/35 p-5">
         <button
           className="w-full rounded-full bg-amber-300 px-4 py-3 text-sm font-semibold text-slate-950 transition hover:bg-amber-200 disabled:cursor-not-allowed disabled:bg-slate-700 disabled:text-slate-400"
-          disabled={!selectedChapter}
+          disabled={typeof onGenerate !== "function"}
           onClick={handleGenerateChapter}
+          title={typeof onGenerate !== "function" ? "Generation not yet available." : undefined}
           type="button"
         >
           Generate Audio
         </button>
       </div>
+
+      <ConfirmDialog
+        alertMode
+        confirmLabel="OK"
+        message="Please select a chapter from the list before generating audio."
+        onCancel={() => setAlertDialogOpen(false)}
+        onConfirm={() => setAlertDialogOpen(false)}
+        open={alertDialogOpen}
+        theme="dark"
+        title="No Chapter Selected"
+      />
     </section>
   );
 }

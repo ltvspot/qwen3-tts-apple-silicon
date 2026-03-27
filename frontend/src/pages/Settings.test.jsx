@@ -182,8 +182,12 @@ describe("Settings page", () => {
     fetchMock = jest.fn();
     global.fetch = fetchMock;
 
-    confirmMock = jest.spyOn(window, "confirm").mockReturnValue(true);
-    promptMock = jest.spyOn(window, "prompt").mockReturnValue(null);
+    confirmMock = jest.spyOn(window, "confirm").mockImplementation(() => {
+      throw new Error("Native confirm should not be used.");
+    });
+    promptMock = jest.spyOn(window, "prompt").mockImplementation(() => {
+      throw new Error("Native prompt should not be used.");
+    });
   });
 
   afterEach(async () => {
@@ -340,7 +344,21 @@ describe("Settings page", () => {
     });
 
     await waitFor(() => {
-      expect(confirmMock).toHaveBeenCalledWith("Reset all settings to defaults?");
+      expect(document.body.textContent).toContain("Reset to Defaults");
+      expect(document.body.textContent).toContain(
+        "This will revert all settings to their factory defaults. Any custom configuration will be lost.",
+      );
+    });
+
+    expect(window.confirm).not.toHaveBeenCalled();
+
+    await act(async () => {
+      getButtonByText(document.body, "Reset All").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+    });
+
+    await waitFor(() => {
       expect(container.querySelector("#narrator-name").value).toBe("Kent Zimering");
       expect(container.querySelector("#manuscript-folder").value).toBe("./Formatted Manuscripts/");
       expect(container.querySelector("#default-voice").value).toBe("Ethan");
