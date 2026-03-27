@@ -324,6 +324,38 @@ class QualitySnapshot(Base):
     book: Mapped["Book"] = relationship()
 
 
+class AudioQAResult(Base):
+    """Persisted deep-audio-QA report for one generated chapter."""
+
+    __tablename__ = "audio_qa_results"
+    __table_args__ = (
+        UniqueConstraint("book_id", "chapter_n", name="uq_audio_qa_results_book_chapter"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    book_id: Mapped[int] = mapped_column(ForeignKey("books.id"), nullable=False, index=True)
+    chapter_id: Mapped[int | None] = mapped_column(ForeignKey("chapters.id"), nullable=True, index=True)
+    chapter_n: Mapped[int] = mapped_column(Integer, nullable=False)
+    transcription_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    timing_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    quality_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    overall_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    overall_grade: Mapped[str | None] = mapped_column(String(8), nullable=True)
+    overall_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    report_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    issues_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    checked_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=utc_now, index=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=utc_now,
+        onupdate=utc_now,
+    )
+
+    book: Mapped["Book"] = relationship()
+    chapter: Mapped["Chapter | None"] = relationship()
+
+
 class ExportJob(Base):
     """Persistent export status for the most recent book export."""
 

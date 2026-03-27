@@ -10,6 +10,11 @@ ffmpeg-python==0.2.0
 ebooklib==0.20
 pdfplumber==0.11.9
 numpy==2.3.5
+mlx-whisper>=0.4.0
+librosa>=0.10.0
+pyloudnorm>=0.1.0
+editdistance>=0.6.0
+soundfile>=0.12.0
 # Optional: enables speech-to-text alignment validation
 # openai-whisper>=20231117
 pytest==9.0.2

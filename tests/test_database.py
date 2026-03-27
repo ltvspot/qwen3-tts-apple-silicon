@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 
 from src.database import (
     AppSetting,
+    AudioQAResult,
     Book,
     Chapter,
     ChapterStatus,
@@ -28,6 +29,7 @@ def test_database_schema_and_basic_crud(test_db: Session) -> None:
 
     inspector = inspect(test_db.get_bind())
     assert set(inspector.get_table_names()) == {
+        "audio_qa_results",
         "batch_book_status",
         "batch_runs",
         "books",
@@ -93,6 +95,7 @@ def test_database_schema_and_basic_crud(test_db: Session) -> None:
 
     stored_book = test_db.query(Book).one()
     stored_chapter = test_db.query(Chapter).one()
+    stored_audio_qa = test_db.query(AudioQAResult).count()
     stored_cloned_voices = test_db.query(ClonedVoice).count()
     stored_export_jobs = test_db.query(ExportJob).count()
     stored_app_settings = test_db.query(AppSetting).count()
@@ -103,6 +106,7 @@ def test_database_schema_and_basic_crud(test_db: Session) -> None:
     assert stored_book.narrator == "Kent Zimering"
     assert stored_book.status == "not_started"
     assert stored_book.export_status == "idle"
+    assert stored_audio_qa == 0
     assert stored_cloned_voices == 0
     assert stored_export_jobs == 0
     assert stored_app_settings == 0

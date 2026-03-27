@@ -108,6 +108,18 @@ function getStatusTone(status) {
   return "text-rose-200";
 }
 
+function getDeepQaStatusBadge(status) {
+  if (status === "pass") {
+    return "border-emerald-300/30 bg-emerald-400/10 text-emerald-100";
+  }
+
+  if (status === "warning") {
+    return "border-amber-300/30 bg-amber-400/10 text-amber-100";
+  }
+
+  return "border-rose-300/30 bg-rose-500/10 text-rose-100";
+}
+
 function formatTimestamp(value) {
   if (!value) {
     return null;
@@ -121,6 +133,16 @@ function formatTimestamp(value) {
   return timestamp.toLocaleString();
 }
 
+function formatIssueRange(issue) {
+  if (typeof issue?.start_time_seconds !== "number" && typeof issue?.end_time_seconds !== "number") {
+    return null;
+  }
+
+  const start = typeof issue?.start_time_seconds === "number" ? `${issue.start_time_seconds.toFixed(2)}s` : "0.00s";
+  const end = typeof issue?.end_time_seconds === "number" ? `${issue.end_time_seconds.toFixed(2)}s` : null;
+  return end ? `${start} - ${end}` : start;
+}
+
 export default function BookDetail() {
   const navigate = useNavigate();
   const requestRef = useRef(0);
@@ -128,6 +150,10 @@ export default function BookDetail() {
   const { id } = useParams();
 
   const [book, setBook] = useState(null);
+  const [audioQaAction, setAudioQaAction] = useState(null);
+  const [audioQaErrorMessage, setAudioQaErrorMessage] = useState("");
+  const [audioQaLoading, setAudioQaLoading] = useState(false);
+  const [audioQaReport, setAudioQaReport] = useState(null);
   const [bookQualityAction, setBookQualityAction] = useState(null);
   const [bookQualityErrorMessage, setBookQualityErrorMessage] = useState("");
   const [bookQualityLoading, setBookQualityLoading] = useState(false);
@@ -203,6 +229,14 @@ export default function BookDetail() {
           : "Not exported";
   const bookQualityEligible = chapters.length > 0 && chapters.every((chapter) => chapter.status === "generated");
   const bookQualityBusy = bookQualityLoading || bookQualityAction !== null;
+  const audioQaEligible = mergedChapters.some((chapter) => chapter.status === "generated");
+  const audioQaBusy = audioQaLoading || audioQaAction !== null;
+  const selectedChapterAudioQa = selectedChapter
+    ? audioQaReport?.chapters?.find((chapterReport) =>
+      (chapterReport.chapter_id && chapterReport.chapter_id === selectedChapter.id)
+        || chapterReport.chapter_n === selectedChapter.number,
+    ) ?? null
+    : null;
 
   useEffect(() => {
     if (!editMode) {
@@ -376,6 +410,10 @@ export default function BookDetail() {
     setLoading(true);
     setNotFound(false);
     setErrorMessage("");
+    setAudioQaAction(null);
+    setAudioQaErrorMessage("");
+    setAudioQaLoading(false);
+    setAudioQaReport(null);
     setExportDialogOpen(false);
     setExportErrorMessage("");
     setExportSnapshot(createIdleExportSnapshot(id));
@@ -492,6 +530,27 @@ export default function BookDetail() {
     return payload;
   }
 
+  async function fetchDeepQaReport(currentRequestId) {
+    const response = await fetch(`/api/books/${id}/qa-report`);
+    const payload = await response.json().catch(() => null);
+
+    if (requestRef.current !== currentRequestId) {
+      return null;
+    }
+
+    if (response.status === 404) {
+      setAudioQaReport(null);
+      return null;
+    }
+
+    if (!response.ok) {
+      throw new Error(payload?.detail ?? "Failed to load deep audio QA.");
+    }
+
+    setAudioQaReport(payload);
+    return payload;
+  }
+
   async function handleRunBookQa() {
     const currentRequestId = requestRef.current;
     setBookQualityAction("run");
@@ -545,6 +604,78 @@ export default function BookDetail() {
       if (requestRef.current === currentRequestId) {
         setBookQualityLoading(false);
         setBookQualityAction(null);
+      }
+    }
+  }
+
+  async function handleRunAudioQa() {
+    const currentRequestId = requestRef.current;
+    setAudioQaAction("book");
+    setAudioQaLoading(true);
+    setAudioQaErrorMessage("");
+
+    try {
+      const response = await fetch(`/api/books/${id}/deep-qa`, { method: "POST" });
+      const payload = await response.json().catch(() => null);
+
+      if (requestRef.current !== currentRequestId) {
+        return;
+      }
+
+      if (!response.ok) {
+        throw new Error(payload?.detail ?? "Failed to run audio QA.");
+      }
+
+      setAudioQaReport(payload);
+    } catch (error) {
+      if (requestRef.current === currentRequestId) {
+        setAudioQaErrorMessage(
+          error instanceof Error ? error.message : "Failed to run audio QA.",
+        );
+      }
+    } finally {
+      if (requestRef.current === currentRequestId) {
+        setAudioQaLoading(false);
+        setAudioQaAction(null);
+      }
+    }
+  }
+
+  async function handleRunChapterDeepQa() {
+    if (!selectedChapter) {
+      return;
+    }
+
+    const currentRequestId = requestRef.current;
+    setAudioQaAction(`chapter-${selectedChapter.id}`);
+    setAudioQaLoading(true);
+    setAudioQaErrorMessage("");
+
+    try {
+      const response = await fetch(`/api/books/${id}/chapters/${selectedChapter.id}/deep-qa`, {
+        method: "POST",
+      });
+      const payload = await response.json().catch(() => null);
+
+      if (requestRef.current !== currentRequestId) {
+        return;
+      }
+
+      if (!response.ok) {
+        throw new Error(payload?.detail ?? "Failed to run deep QA for this chapter.");
+      }
+
+      await fetchDeepQaReport(currentRequestId);
+    } catch (error) {
+      if (requestRef.current === currentRequestId) {
+        setAudioQaErrorMessage(
+          error instanceof Error ? error.message : "Failed to run deep QA for this chapter.",
+        );
+      }
+    } finally {
+      if (requestRef.current === currentRequestId) {
+        setAudioQaLoading(false);
+        setAudioQaAction(null);
       }
     }
   }
@@ -995,6 +1126,173 @@ export default function BookDetail() {
               </section>
             ) : null}
 
+            {selectedChapter ? (
+              <section className="rounded-[2rem] border border-white/10 bg-white/[0.05] p-5 text-white shadow-xl shadow-slate-950/20">
+                <div className="flex flex-col gap-5">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <div className="text-xs font-semibold uppercase tracking-[0.28em] text-fuchsia-200/75">
+                        Chapter Audio QA
+                      </div>
+                      <h2 className="mt-3 text-xl font-semibold">Deep QA</h2>
+                      <p className="mt-3 text-sm leading-7 text-slate-300">
+                        Inspect transcription drift, pacing, loudness, and artifact issues for the selected chapter.
+                      </p>
+                    </div>
+                    <div
+                      className={`inline-flex items-center rounded-full border px-4 py-2 text-[11px] font-semibold uppercase tracking-[0.18em] ${
+                        selectedChapterAudioQa
+                          ? getDeepQaStatusBadge(selectedChapterAudioQa.scoring.status)
+                          : "border-white/10 bg-slate-950/45 text-slate-300"
+                      }`}
+                    >
+                      {selectedChapterAudioQa
+                        ? `${selectedChapterAudioQa.scoring.grade} · ${selectedChapterAudioQa.scoring.overall.toFixed(1)}`
+                        : "Not run"}
+                    </div>
+                  </div>
+
+                  {selectedChapter.status !== "generated" ? (
+                    <div className="rounded-3xl border border-white/10 bg-slate-950/45 px-4 py-4 text-sm leading-7 text-slate-300">
+                      Generate this chapter before running deep audio QA.
+                    </div>
+                  ) : (
+                    <div className="flex flex-wrap gap-3">
+                      <button
+                        className="inline-flex items-center justify-center rounded-full border border-fuchsia-300/25 bg-fuchsia-400/10 px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-fuchsia-100 transition hover:bg-fuchsia-400/20 disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/[0.04] disabled:text-slate-500"
+                        disabled={audioQaBusy}
+                        onClick={() => {
+                          void handleRunChapterDeepQa();
+                        }}
+                        type="button"
+                      >
+                        {audioQaLoading && audioQaAction === `chapter-${selectedChapter.id}` ? "Running Deep QA..." : "Deep QA"}
+                      </button>
+                      {selectedChapterAudioQa?.checked_at ? (
+                        <div className="inline-flex items-center rounded-full border border-white/10 bg-slate-950/45 px-4 py-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-300">
+                          Checked {formatTimestamp(selectedChapterAudioQa.checked_at) ?? "recently"}
+                        </div>
+                      ) : null}
+                    </div>
+                  )}
+
+                  {audioQaErrorMessage ? (
+                    <div className="rounded-3xl border border-rose-400/30 bg-rose-500/10 px-4 py-4 text-sm text-rose-100">
+                      {audioQaErrorMessage}
+                    </div>
+                  ) : null}
+
+                  {selectedChapterAudioQa ? (
+                    <>
+                      <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                        <div className="rounded-3xl border border-white/10 bg-slate-950/45 px-4 py-4">
+                          <div className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">
+                            Transcription
+                          </div>
+                          <div className="mt-2 text-lg font-semibold text-white">
+                            {selectedChapterAudioQa.scoring.transcription.toFixed(1)}
+                          </div>
+                          <div className="mt-1 text-xs text-slate-400">
+                            WER {selectedChapterAudioQa.transcription.word_error_rate?.toFixed(3) ?? "n/a"}
+                          </div>
+                        </div>
+                        <div className="rounded-3xl border border-white/10 bg-slate-950/45 px-4 py-4">
+                          <div className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">
+                            Timing
+                          </div>
+                          <div className="mt-2 text-lg font-semibold text-white">
+                            {selectedChapterAudioQa.scoring.timing.toFixed(1)}
+                          </div>
+                          <div className="mt-1 text-xs text-slate-400">
+                            {selectedChapterAudioQa.timing.speech_rate_wpm
+                              ? `${selectedChapterAudioQa.timing.speech_rate_wpm.toFixed(1)} WPM`
+                              : "No pace data"}
+                          </div>
+                        </div>
+                        <div className="rounded-3xl border border-white/10 bg-slate-950/45 px-4 py-4">
+                          <div className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">
+                            Quality
+                          </div>
+                          <div className="mt-2 text-lg font-semibold text-white">
+                            {selectedChapterAudioQa.scoring.quality.toFixed(1)}
+                          </div>
+                          <div className="mt-1 text-xs text-slate-400">
+                            {selectedChapterAudioQa.quality.integrated_lufs
+                              ? `${selectedChapterAudioQa.quality.integrated_lufs.toFixed(1)} LUFS`
+                              : "No loudness data"}
+                          </div>
+                        </div>
+                        <div className="rounded-3xl border border-white/10 bg-slate-950/45 px-4 py-4">
+                          <div className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">
+                            Export Readiness
+                          </div>
+                          <div className="mt-2 text-lg font-semibold text-white">
+                            {selectedChapterAudioQa.ready_for_export ? "Ready" : "Review Needed"}
+                          </div>
+                          <div className="mt-1 text-xs text-slate-400">
+                            {selectedChapterAudioQa.issues.length} issue(s)
+                          </div>
+                        </div>
+                      </div>
+
+                      {selectedChapterAudioQa.issues.length > 0 ? (
+                        <div className="rounded-3xl border border-white/10 bg-slate-950/45 px-4 py-4">
+                          <div className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">
+                            Issues
+                          </div>
+                          <div className="mt-4 space-y-3">
+                            {selectedChapterAudioQa.issues.slice(0, 8).map((issue, index) => (
+                              <div className="rounded-2xl border border-white/10 bg-slate-900/60 px-4 py-3" key={`${issue.code}-${index}`}>
+                                <div className="flex flex-wrap items-center justify-between gap-2">
+                                  <div className="text-sm font-semibold text-white">
+                                    {issue.message}
+                                  </div>
+                                  <div className={`text-xs font-semibold uppercase tracking-[0.18em] ${getStatusTone(issue.severity === "error" ? "fail" : "warning")}`}>
+                                    {issue.severity}
+                                  </div>
+                                </div>
+                                <div className="mt-2 text-xs text-slate-400">
+                                  {issue.category}
+                                  {formatIssueRange(issue) ? ` · ${formatIssueRange(issue)}` : ""}
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      ) : (
+                        <div className="rounded-3xl border border-emerald-300/20 bg-emerald-400/10 px-4 py-4 text-sm text-emerald-100">
+                          No deep audio QA issues were detected for this chapter.
+                        </div>
+                      )}
+
+                      {selectedChapterAudioQa.transcription.diff?.length > 0 ? (
+                        <div className="rounded-3xl border border-white/10 bg-slate-950/45 px-4 py-4">
+                          <div className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">
+                            Transcript Diff
+                          </div>
+                          <div className="mt-4 space-y-2 text-sm text-slate-300">
+                            {selectedChapterAudioQa.transcription.diff.slice(0, 6).map((entry, index) => (
+                              <div className="rounded-2xl border border-white/10 bg-slate-900/60 px-4 py-3" key={`${entry.operation}-${index}`}>
+                                <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
+                                  {entry.operation}
+                                </div>
+                                <div className="mt-2">
+                                  Expected: <span className="text-white">{entry.expected ?? "∅"}</span>
+                                </div>
+                                <div className="mt-1">
+                                  Heard: <span className="text-white">{entry.actual ?? "∅"}</span>
+                                </div>
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      ) : null}
+                    </>
+                  ) : null}
+                </div>
+              </section>
+            ) : null}
+
             <NarrationSettings
               loadingMessage={voiceLoadingMessage}
               loadingVoices={loadingVoiceOptions}
@@ -1173,6 +1471,118 @@ export default function BookDetail() {
                   >
                     {bookQualityLoading && bookQualityAction === "master" ? "Auto-Mastering..." : "Auto-Master"}
                   </button>
+                </div>
+
+                <div className="border-t border-white/10 pt-5">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <div className="text-xs font-semibold uppercase tracking-[0.28em] text-fuchsia-200/75">
+                        Deep Audio QA
+                      </div>
+                      <h3 className="mt-3 text-lg font-semibold">Automated Audio QA Pipeline</h3>
+                      <p className="mt-3 text-sm leading-7 text-slate-300">
+                        Run transcription, pacing, and audio-quality scoring across generated chapters and inspect the persisted report.
+                      </p>
+                    </div>
+                    <div
+                      className={`inline-flex items-center rounded-full border px-4 py-2 text-[11px] font-semibold uppercase tracking-[0.18em] ${
+                        audioQaReport
+                          ? getDeepQaStatusBadge(audioQaReport.ready_for_export ? "pass" : "warning")
+                          : "border-white/10 bg-slate-950/45 text-slate-300"
+                      }`}
+                    >
+                      {audioQaReport
+                        ? `${audioQaReport.average_score.toFixed(1)} Avg`
+                        : "Not run"}
+                    </div>
+                  </div>
+
+                  {!audioQaEligible ? (
+                    <div className="mt-4 rounded-3xl border border-white/10 bg-slate-950/45 px-4 py-4 text-sm leading-7 text-slate-300">
+                      Generate at least one chapter before running automated audio QA.
+                    </div>
+                  ) : null}
+
+                  {audioQaErrorMessage ? (
+                    <div className="mt-4 rounded-3xl border border-rose-400/30 bg-rose-500/10 px-4 py-4 text-sm text-rose-100">
+                      {audioQaErrorMessage}
+                    </div>
+                  ) : null}
+
+                  {audioQaReport ? (
+                    <>
+                      <div className="mt-4 grid gap-3 sm:grid-cols-3">
+                        <div className="rounded-3xl border border-white/10 bg-slate-950/45 px-4 py-4">
+                          <div className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">
+                            Chapters Analyzed
+                          </div>
+                          <div className="mt-2 text-lg font-semibold text-white">
+                            {audioQaReport.chapter_count}
+                          </div>
+                        </div>
+                        <div className="rounded-3xl border border-white/10 bg-slate-950/45 px-4 py-4">
+                          <div className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">
+                            Issue Count
+                          </div>
+                          <div className="mt-2 text-lg font-semibold text-white">
+                            {audioQaReport.issue_count}
+                          </div>
+                        </div>
+                        <div className="rounded-3xl border border-white/10 bg-slate-950/45 px-4 py-4">
+                          <div className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">
+                            Export Readiness
+                          </div>
+                          <div className="mt-2 text-lg font-semibold text-white">
+                            {audioQaReport.ready_for_export ? "Ready" : "Review Needed"}
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="mt-4 rounded-3xl border border-white/10 bg-slate-950/45 px-4 py-4">
+                        <div className="text-xs font-semibold uppercase tracking-[0.22em] text-slate-500">
+                          Chapter Scores
+                        </div>
+                        <div className="mt-4 grid gap-3 md:grid-cols-2">
+                          {audioQaReport.chapters.map((chapterReport) => (
+                            <div className="rounded-2xl border border-white/10 bg-slate-900/60 px-4 py-3" key={chapterReport.chapter_n}>
+                              <div className="flex flex-wrap items-center justify-between gap-2">
+                                <div className="text-sm font-semibold text-white">
+                                  {chapterReport.chapter_title || `Chapter ${chapterReport.chapter_n}`}
+                                </div>
+                                <div className={`inline-flex items-center rounded-full border px-3 py-1 text-[11px] font-semibold uppercase tracking-[0.18em] ${getDeepQaStatusBadge(chapterReport.scoring.status)}`}>
+                                  {chapterReport.scoring.grade} · {chapterReport.scoring.overall.toFixed(1)}
+                                </div>
+                              </div>
+                              <div className="mt-3 grid gap-2 text-sm text-slate-300 sm:grid-cols-3">
+                                <div>TX {chapterReport.scoring.transcription.toFixed(1)}</div>
+                                <div>TM {chapterReport.scoring.timing.toFixed(1)}</div>
+                                <div>QL {chapterReport.scoring.quality.toFixed(1)}</div>
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    </>
+                  ) : null}
+
+                  {!audioQaReport && audioQaEligible ? (
+                    <div className="mt-4 rounded-3xl border border-white/10 bg-slate-950/45 px-4 py-4 text-sm leading-7 text-slate-300">
+                      Run Audio QA to compute transcription accuracy, pacing, loudness, and artifact checks for generated chapters.
+                    </div>
+                  ) : null}
+
+                  <div className="mt-4 flex flex-wrap gap-3">
+                    <button
+                      className="inline-flex items-center justify-center rounded-full border border-fuchsia-300/25 bg-fuchsia-400/10 px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-fuchsia-100 transition hover:bg-fuchsia-400/20 disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/[0.04] disabled:text-slate-500"
+                      disabled={!audioQaEligible || audioQaBusy}
+                      onClick={() => {
+                        void handleRunAudioQa();
+                      }}
+                      type="button"
+                    >
+                      {audioQaLoading && audioQaAction === "book" ? "Running Audio QA..." : "Run Audio QA"}
+                    </button>
+                  </div>
                 </div>
               </div>
             </section>

@@ -19,6 +19,13 @@ from src.database import (
     get_db,
     utc_now,
 )
+from src.pipeline.audio_qa.models import BookDeepQAReport, ChapterDeepQAResult
+from src.pipeline.audio_qa.qa_scorer import (
+    load_book_audio_qa_report,
+    persist_chapter_audio_qa_result,
+    run_book_audio_qa,
+    run_chapter_audio_qa,
+)
 from src.pipeline.book_mastering import BookMasteringPipeline, MasteringReport
 from src.pipeline.book_qa import BookQAReport, VoiceConsistencyChart, get_voice_consistency_chart, run_book_qa
 from src.pipeline.qa_checker import apply_manual_review, build_qa_record_response
@@ -169,6 +176,14 @@ class BookMasteringResponse(MasteringReport):
     """Serialized mastering report payload."""
 
 
+class ChapterDeepQAResponse(ChapterDeepQAResult):
+    """Serialized deep audio QA payload for one chapter."""
+
+
+class BookDeepQAReportResponse(BookDeepQAReport):
+    """Serialized deep audio QA payload for one book."""
+
+
 def _load_chapter_or_404(book_id: int, chapter_n: int, db: Session) -> Chapter:
     """Load a chapter row or raise a 404."""
 
@@ -179,6 +194,19 @@ def _load_chapter_or_404(book_id: int, chapter_n: int, db: Session) -> Chapter:
     )
     if chapter is None:
         raise HTTPException(status_code=404, detail=f"Chapter {chapter_n} not found in book {book_id}")
+    return chapter
+
+
+def _load_chapter_by_id_or_404(book_id: int, chapter_id: int, db: Session) -> Chapter:
+    """Load a chapter row by primary key while enforcing the owning book."""
+
+    chapter = (
+        db.query(Chapter)
+        .filter(Chapter.id == chapter_id, Chapter.book_id == book_id)
+        .first()
+    )
+    if chapter is None:
+        raise HTTPException(status_code=404, detail=f"Chapter {chapter_id} not found in book {book_id}")
     return chapter
 
 
@@ -304,6 +332,54 @@ def _group_dashboard_books(
         )
 
     return books
+
+
+@router.post("/books/{book_id}/chapters/{chapter_id}/deep-qa", response_model=ChapterDeepQAResponse)
+async def run_chapter_deep_qa(
+    book_id: int,
+    chapter_id: int,
+    db: Session = Depends(get_db),
+) -> ChapterDeepQAResponse:
+    """Run and persist deep audio QA for one generated chapter."""
+
+    chapter = _load_chapter_by_id_or_404(book_id, chapter_id, db)
+    try:
+        result = run_chapter_audio_qa(chapter, db)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    persist_chapter_audio_qa_result(db, chapter, result)
+    db.commit()
+    return ChapterDeepQAResponse(**result.model_dump(mode="json"))
+
+
+@router.post("/books/{book_id}/deep-qa", response_model=BookDeepQAReportResponse)
+async def run_book_deep_qa(
+    book_id: int,
+    db: Session = Depends(get_db),
+) -> BookDeepQAReportResponse:
+    """Run and persist deep audio QA across every generated chapter in a book."""
+
+    book = _load_book_or_404(book_id, db)
+    try:
+        report = run_book_audio_qa(book, db)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    db.commit()
+    return BookDeepQAReportResponse(**report.model_dump(mode="json"))
+
+
+@router.get("/books/{book_id}/qa-report", response_model=BookDeepQAReportResponse)
+async def get_book_deep_qa_report(book_id: int, db: Session = Depends(get_db)) -> BookDeepQAReportResponse:
+    """Return the stored deep audio QA report for one book."""
+
+    _load_book_or_404(book_id, db)
+    try:
+        report = load_book_audio_qa_report(book_id, db)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return BookDeepQAReportResponse(**report.model_dump(mode="json"))
 
 
 @router.get("/book/{book_id}/chapter/{chapter_n}/qa", response_model=ChapterQAResponse)

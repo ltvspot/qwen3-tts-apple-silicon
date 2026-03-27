@@ -174,6 +174,159 @@ function createVoiceConsistencyChart(overrides = {}) {
   };
 }
 
+function createDeepQaReport(overrides = {}) {
+  return {
+    average_quality_score: 94.0,
+    average_score: 97.1,
+    average_timing_score: 96.0,
+    average_transcription_score: 100.0,
+    book_id: 7,
+    chapter_count: 2,
+    chapters: [
+      {
+        audio_path: "/tmp/chapter-1.wav",
+        book_id: 7,
+        chapter_id: 701,
+        chapter_n: 1,
+        chapter_title: "Chapter One",
+        checked_at: "2026-03-24T10:00:00+00:00",
+        issues: [
+          {
+            category: "transcription",
+            code: "segment_mismatch",
+            details: {},
+            end_time_seconds: 2.2,
+            message: "Transcript segment drift detected.",
+            severity: "warning",
+            start_time_seconds: 1.5,
+          },
+        ],
+        quality: {
+          artifact_events: [],
+          clipping_ratio: 0.0,
+          dependency: { available: true, dependency: "pyloudnorm", message: null },
+          integrated_lufs: -20.0,
+          issues: [],
+          loudness_range_lu: 4.0,
+          peak_dbfs: -6.0,
+          score: 94.0,
+          snr_db: 28.0,
+          status: "pass",
+        },
+        ready_for_export: true,
+        scoring: {
+          grade: "A",
+          overall: 97.1,
+          quality: 94.0,
+          reasoning: [],
+          status: "pass",
+          timing: 96.0,
+          transcription: 100.0,
+        },
+        summary: "Deep audio QA passed with grade A.",
+        timing: {
+          actual_duration_seconds: 6.0,
+          dependency: { available: true, dependency: "librosa", message: null },
+          estimated_duration_seconds: 5.8,
+          issues: [],
+          pause_ratio: 0.05,
+          pauses: [],
+          score: 96.0,
+          speech_rate_wpm: 140.0,
+          status: "pass",
+        },
+        transcription: {
+          dependency: { available: true, dependency: "mlx-whisper", message: null },
+          diff: [
+            {
+              actual: "chapter two",
+              end_time_seconds: null,
+              expected: "chapter one",
+              operation: "replace",
+              start_time_seconds: null,
+            },
+          ],
+          issues: [],
+          model_name: "mlx-community/whisper-tiny",
+          normalized_reference: "hello world from chapter one",
+          normalized_transcript: "hello world from chapter two",
+          provider: "mlx-whisper",
+          reference_word_count: 5,
+          score: 100.0,
+          status: "pass",
+          transcript: "hello world from chapter two",
+          transcript_word_count: 5,
+          word_error_rate: 0.0,
+        },
+      },
+      {
+        audio_path: "/tmp/chapter-2.wav",
+        book_id: 7,
+        chapter_id: 702,
+        chapter_n: 2,
+        chapter_title: "Chapter Two",
+        checked_at: "2026-03-24T10:02:00+00:00",
+        issues: [],
+        quality: {
+          artifact_events: [],
+          clipping_ratio: 0.0,
+          dependency: { available: true, dependency: "pyloudnorm", message: null },
+          integrated_lufs: -20.2,
+          issues: [],
+          loudness_range_lu: 4.0,
+          peak_dbfs: -6.2,
+          score: 94.0,
+          snr_db: 27.0,
+          status: "pass",
+        },
+        ready_for_export: true,
+        scoring: {
+          grade: "A",
+          overall: 97.1,
+          quality: 94.0,
+          reasoning: [],
+          status: "pass",
+          timing: 96.0,
+          transcription: 100.0,
+        },
+        summary: "Deep audio QA passed with grade A.",
+        timing: {
+          actual_duration_seconds: 5.8,
+          dependency: { available: true, dependency: "librosa", message: null },
+          estimated_duration_seconds: 5.7,
+          issues: [],
+          pause_ratio: 0.04,
+          pauses: [],
+          score: 96.0,
+          speech_rate_wpm: 142.0,
+          status: "pass",
+        },
+        transcription: {
+          dependency: { available: true, dependency: "mlx-whisper", message: null },
+          diff: [],
+          issues: [],
+          model_name: "mlx-community/whisper-tiny",
+          normalized_reference: "chapter two body text",
+          normalized_transcript: "chapter two body text",
+          provider: "mlx-whisper",
+          reference_word_count: 4,
+          score: 100.0,
+          status: "pass",
+          transcript: "chapter two body text",
+          transcript_word_count: 4,
+          word_error_rate: 0.0,
+        },
+      },
+    ],
+    generated_at: "2026-03-24T10:05:00+00:00",
+    grade_counts: { A: 2 },
+    issue_count: 1,
+    ready_for_export: true,
+    status_counts: { pass: 2 },
+    ...overrides,
+  };
+}
+
 async function waitFor(assertion, timeout = 2000) {
   const startTime = Date.now();
 
@@ -1112,5 +1265,107 @@ describe("BookDetail page", () => {
 
     expect(fetchMock).toHaveBeenCalledWith("/api/book/7/qa/book-report");
     expect(fetchMock).toHaveBeenCalledWith("/api/book/7/qa/voice-consistency-chart");
+  });
+
+  test("runs book-level audio QA and renders the persisted deep audio report", async () => {
+    const book = createBook({ status: "generated" });
+    const chapters = [
+      createChapter({
+        audio_path: "/tmp/chapter-1.wav",
+        duration_seconds: 120,
+        id: 701,
+        number: 1,
+        qa_status: "approved",
+        status: "generated",
+        title: "Chapter One",
+        type: "chapter",
+      }),
+      createChapter({
+        audio_path: "/tmp/chapter-2.wav",
+        duration_seconds: 118,
+        id: 702,
+        number: 2,
+        qa_status: "approved",
+        status: "generated",
+        text_content: "Chapter two body text.",
+        title: "Chapter Two",
+        type: "chapter",
+      }),
+    ];
+
+    fetchMock
+      .mockResolvedValueOnce(createJsonResponse(book))
+      .mockResolvedValueOnce(createJsonResponse(chapters))
+      .mockResolvedValueOnce(createJsonResponse(createStatusSnapshot()))
+      .mockResolvedValueOnce(createJsonResponse(createExportSnapshot()))
+      .mockResolvedValueOnce(createJsonResponse(createVoiceListPayload()))
+      .mockResolvedValueOnce(createJsonResponse(createDeepQaReport()));
+
+    await renderBookDetail();
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("Run Audio QA");
+    });
+
+    await act(async () => {
+      getButtonByText("Run Audio QA").dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("Automated Audio QA Pipeline");
+      expect(container.textContent).toContain("97.1 Avg");
+      expect(container.textContent).toContain("Chapters Analyzed");
+      expect(container.textContent).toContain("Chapter Scores");
+      expect(container.textContent).toContain("TX 100.0");
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith("/api/books/7/deep-qa", { method: "POST" });
+  });
+
+  test("runs chapter deep QA and renders issue + diff details for the selected chapter", async () => {
+    const book = createBook({ status: "generated" });
+    const chapters = [
+      createChapter({
+        audio_path: "/tmp/chapter-1.wav",
+        duration_seconds: 120,
+        id: 701,
+        number: 1,
+        qa_status: "approved",
+        status: "generated",
+        title: "Chapter One",
+        type: "chapter",
+      }),
+    ];
+
+    fetchMock
+      .mockResolvedValueOnce(createJsonResponse(book))
+      .mockResolvedValueOnce(createJsonResponse(chapters))
+      .mockResolvedValueOnce(createJsonResponse(createStatusSnapshot()))
+      .mockResolvedValueOnce(createJsonResponse(createExportSnapshot()))
+      .mockResolvedValueOnce(createJsonResponse(createVoiceListPayload()))
+      .mockResolvedValueOnce(createJsonResponse({ ok: true }))
+      .mockResolvedValueOnce(createJsonResponse(createDeepQaReport({ chapter_count: 1, chapters: [createDeepQaReport().chapters[0]] })));
+
+    await renderBookDetail();
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("Deep QA");
+    });
+
+    await act(async () => {
+      getButtonByText("Deep QA").dispatchEvent(new MouseEvent("click", { bubbles: true }));
+    });
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("Transcript Diff");
+      expect(container.textContent).toContain("Transcript segment drift detected.");
+      expect(container.textContent).toContain("1.50s - 2.20s");
+      expect(container.textContent).toContain("Expected:");
+      expect(container.textContent).toContain("chapter one");
+      expect(container.textContent).toContain("chapter two");
+    });
+
+    expect(fetchMock).toHaveBeenCalledWith("/api/books/7/chapters/701/deep-qa", { method: "POST" });
+    expect(fetchMock).toHaveBeenCalledWith("/api/books/7/qa-report");
   });
 });
