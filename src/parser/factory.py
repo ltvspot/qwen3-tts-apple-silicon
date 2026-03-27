@@ -62,7 +62,12 @@ class ManuscriptParserFactory:
         if parser is None or manuscript_path is None:
             folder_name = Path(manuscript_folder).name or str(manuscript_folder)
             raise ValueError(f"No supported manuscript format in {folder_name}")
-        metadata, chapters = parser.parse(manuscript_path)
+
+        folder_name = Path(manuscript_folder).name
+        if isinstance(parser, DocxParser):
+            metadata, chapters = parser.parse_with_folder_hint(manuscript_path, folder_name)
+        else:
+            metadata, chapters = parser.parse(manuscript_path)
         return metadata, chapters, manuscript_path
 
     @staticmethod

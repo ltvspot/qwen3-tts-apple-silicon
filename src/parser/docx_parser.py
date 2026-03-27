@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +49,101 @@ class _ParagraphInfo:
 
 class DocxParser:
     """Parse DOCX manuscripts into metadata and narratable chapters."""
+
+    NON_AUTHOR_PHRASES: set[str] = {
+        "a modern translation",
+        "a new translation",
+        "a contemporary translation",
+        "a fresh translation",
+        "modern translation",
+        "new translation",
+        "complete works",
+        "selected works",
+        "selected writings",
+        "collected works",
+        "collected writings",
+        "essential writings",
+        "classic edition",
+        "modern edition",
+        "revised edition",
+        "new edition",
+        "first edition",
+        "second edition",
+        "third edition",
+        "annotated edition",
+        "unabridged edition",
+        "definitive edition",
+        "library of alexandria",
+        "table of contents",
+        "introduction",
+        "foreword",
+        "preface",
+        "prologue",
+        "volume one",
+        "volume two",
+        "volume three",
+        "volume i",
+        "volume ii",
+        "volume iii",
+        "part one",
+        "part two",
+        "part three",
+    }
+    KNOWN_AUTHORS: dict[str, str] = {
+        "sun tzu": "Sun Tzu",
+        "marcus aurelius": "Marcus Aurelius",
+        "lao tzu": "Lao Tzu",
+        "miyamoto musashi": "Miyamoto Musashi",
+        "james allen": "James Allen",
+        "ralph waldo emerson": "Ralph Waldo Emerson",
+        "emerson": "Ralph Waldo Emerson",
+        "seneca": "Seneca",
+        "senaca": "Seneca",
+        "henry david thoreau": "Henry David Thoreau",
+        "friedrich nietzsche": "Friedrich Nietzsche",
+        "leo tolstoy": "Leo Tolstoy",
+        "fyodor dostoevsky": "Fyodor Dostoevsky",
+        "aristotle": "Aristotle",
+        "epictetus": "Epictetus",
+        "julius caesar": "Julius Caesar",
+        "plato": "Plato",
+        "homer": "Homer",
+        "virgil": "Virgil",
+        "ovid": "Ovid",
+        "cicero": "Cicero",
+        "thucydides": "Thucydides",
+        "herodotus": "Herodotus",
+        "confucius": "Confucius",
+        "kierkegaard": "Søren Kierkegaard",
+        "lucretius": "Lucretius",
+        "paracelsus": "Paracelsus",
+        "hermes trismegistus": "Hermes Trismegistus",
+        "thoth hermes trismegistus": "Hermes Trismegistus",
+        "napoleon": "Napoleon Bonaparte",
+        "machiavelli": "Niccolò Machiavelli",
+        "kant": "Immanuel Kant",
+        "schopenhauer": "Arthur Schopenhauer",
+        "voltaire": "Voltaire",
+        "montaigne": "Michel de Montaigne",
+        "thoreau": "Henry David Thoreau",
+        "william walker atkinson": "William Walker Atkinson",
+        "h g wells": "H.G. Wells",
+        "jules verne": "Jules Verne",
+        "edgar allan poe": "Edgar Allan Poe",
+        "mary shelley": "Mary Shelley",
+        "oscar wilde": "Oscar Wilde",
+        "mark twain": "Mark Twain",
+        "charles dickens": "Charles Dickens",
+        "jane austen": "Jane Austen",
+        "edgar rice burroughs": "Edgar Rice Burroughs",
+        "arthur conan doyle": "Arthur Conan Doyle",
+        "jack london": "Jack London",
+        "robert louis stevenson": "Robert Louis Stevenson",
+        "bram stoker": "Bram Stoker",
+        "george macdonald": "George MacDonald",
+        "samuel butler": "Samuel Butler",
+        "charlotte perkins gilman": "Charlotte Perkins Gilman",
+    }
 
     def __init__(self) -> None:
         """Initialize chapter detection and skip rules."""
@@ -136,9 +231,32 @@ class DocxParser:
         metadata = self._extract_metadata(document)
         chapters = self._extract_chapters(document)
         if not chapters:
-            raise ValueError(f"No narratable chapters detected in {path}")
+            total_paragraphs = len(document.paragraphs)
+            non_empty_paragraphs = sum(1 for paragraph in document.paragraphs if paragraph.text.strip())
+            raise ValueError(
+                f"No narratable chapters detected in {path.name}. "
+                f"The document has {total_paragraphs} paragraphs ({non_empty_paragraphs} non-empty). "
+                "The parser requires chapter headings with 'Chapter N' format or Heading-styled paragraphs."
+            )
 
         logger.info("Extracted %s narratable chapters from %s", len(chapters), path)
+        return metadata, chapters
+
+    def parse_with_folder_hint(
+        self,
+        docx_path: str | Path,
+        folder_name: str | None = None,
+    ) -> tuple[BookMetadata, list[Chapter]]:
+        """Parse a DOCX file, using the folder name as an author hint if needed."""
+
+        metadata, chapters = self.parse(docx_path)
+
+        if metadata.author == "Unknown Author" and folder_name:
+            folder_author = self._extract_author_from_folder(folder_name)
+            if folder_author:
+                logger.info("Using folder-name author hint: %s", folder_author)
+                metadata = replace(metadata, author=folder_author)
+
         return metadata, chapters
 
     def _extract_metadata(self, doc: DocxDocument) -> BookMetadata:
@@ -220,7 +338,9 @@ class DocxParser:
                     current_heading = parsed_heading
                     current_body = []
                 else:
-                    chapters.append(self._build_chapter(current_heading, current_body))
+                    built = self._build_chapter(current_heading, current_body)
+                    if built is not None:
+                        chapters.append(built)
                     current_heading = parsed_heading
                     current_body = []
                 saw_numbered_chapter = True
@@ -243,7 +363,9 @@ class DocxParser:
                 current_body.append(text)
 
         if current_heading is not None:
-            chapters.append(self._build_chapter(current_heading, current_body))
+            built = self._build_chapter(current_heading, current_body)
+            if built is not None:
+                chapters.append(built)
 
         if saw_numbered_chapter:
             self._validate_toc(chapters)
@@ -356,13 +478,18 @@ class DocxParser:
             for pattern in self.author_patterns:
                 match = pattern.match(paragraph.text)
                 if match:
-                    return offset, self._normalize_text(match.group("author"))
+                    author_text = self._normalize_text(match.group("author"))
+                    if author_text.casefold() in self.NON_AUTHOR_PHRASES:
+                        logger.debug("Rejecting 'by' match as non-author phrase: %s", author_text)
+                        continue
+                    return offset, author_text
 
         for offset, paragraph in enumerate(search_window, start=title_position + 1):
             if self._looks_like_author_name(paragraph.text):
                 return offset, paragraph.text
 
-        raise ValueError("Unable to determine the author from the opening paragraphs.")
+        logger.warning("Could not determine author from front matter; using 'Unknown Author'.")
+        return title_position, "Unknown Author"
 
     def _find_subtitle(
         self,
@@ -393,12 +520,35 @@ class DocxParser:
                     return self._normalize_text(match.group("publisher"))
         return None
 
-    def _build_chapter(self, heading: dict[str, Any], body_paragraphs: list[str]) -> Chapter:
+    def _extract_author_from_folder(self, folder_name: str) -> str | None:
+        """Attempt to extract an author name from a manuscript folder name."""
+
+        cleaned = re.sub(r"^\d+[\s\-]+", "", folder_name)
+        cleaned = re.sub(r"-EN-v-\d+.*$", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"-?\d+\.?\d*x\d+\.?\d*[-\s]*\d*\s*\d*$", "", cleaned)
+        cleaned = cleaned.replace("-", " ").strip()
+        cleaned_lower = cleaned.casefold()
+
+        best_match: str | None = None
+        best_length = 0
+        for key, canonical_name in self.KNOWN_AUTHORS.items():
+            if key in cleaned_lower and len(key) > best_length:
+                best_match = canonical_name
+                best_length = len(key)
+
+        return best_match
+
+    def _build_chapter(self, heading: dict[str, Any], body_paragraphs: list[str]) -> Chapter | None:
         """Build a chapter object from a heading plus collected body paragraphs."""
 
         raw_text = "\n\n".join(paragraph for paragraph in body_paragraphs if paragraph).strip()
         if not raw_text:
-            raise ValueError(f"Detected {heading['type']} '{heading['title']}' without body text.")
+            logger.warning(
+                "Skipping %s '%s' — heading found but no body text.",
+                heading["type"],
+                heading["title"],
+            )
+            return None
 
         return Chapter(
             number=heading["number"],
@@ -427,12 +577,23 @@ class DocxParser:
     def _looks_like_author_name(self, text: str) -> bool:
         """Return whether text looks like a plain author name."""
 
-        if self._looks_like_credit_or_note(text):
+        normalized_text = self._normalize_text(text)
+        if normalized_text.casefold() in self.NON_AUTHOR_PHRASES:
             return False
-        if re.search(r"\d", text):
+        if re.match(
+            r"^(a |the )?(modern|new|contemporary|fresh|complete|selected|collected|essential)\b",
+            normalized_text,
+            re.IGNORECASE,
+        ):
+            return False
+        if self._is_chapter_heading(normalized_text, None)[0]:
+            return False
+        if self._looks_like_credit_or_note(normalized_text):
+            return False
+        if re.search(r"\d", normalized_text):
             return False
 
-        words = text.split()
+        words = normalized_text.split()
         if not 2 <= len(words) <= 6:
             return False
 
@@ -446,6 +607,18 @@ class DocxParser:
             re.match(r"^(translated|adapted|edited|illustrated)\s+by\b", normalized_text, re.IGNORECASE)
             or re.match(r"^(visit|www\.|https?://)", normalized_text, re.IGNORECASE)
             or "libraryofalexandria.com" in normalized_text.lower()
+            or re.match(
+                r"^(a |the )?(modern|new|contemporary|fresh|complete|selected|collected|essential)\s+"
+                r"(translation|edition|works|writings)\b",
+                normalized_text,
+                re.IGNORECASE,
+            )
+            or re.match(r"^(volume|part)\s+[ivxlcdm\d]+\b", normalized_text, re.IGNORECASE)
+            or re.match(
+                r"^(first|second|third|revised|annotated|unabridged|definitive)\s+edition\b",
+                normalized_text,
+                re.IGNORECASE,
+            )
         )
 
     def _looks_like_toc_entry(self, text: str, style: str | None) -> bool:
