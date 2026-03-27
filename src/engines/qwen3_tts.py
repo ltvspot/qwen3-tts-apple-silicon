@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 import os
 import re
+import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -99,6 +102,9 @@ class Qwen3TTS(TTSEngine):
         self.sample_rate = DEFAULT_SAMPLE_RATE
         self._resolved_backend: str | None = None
         self._supported_speakers: set[str] = set()
+        self._generation_attempts = 0
+        self._timeout_count = 0
+        self._min_timeout_samples_before_restart = 10
         self.voice_cloner = VoiceCloner(settings.VOICES_PATH)
 
     @property
@@ -515,26 +521,41 @@ class Qwen3TTS(TTSEngine):
         voice: str,
         emotion: str | None = None,
         speed: float = 1.0,
-    ) -> AudioSegment:
+    ) -> AudioSegment | None:
         """Generate one chunk with best-effort timeout protection."""
 
         timeout_seconds = compute_adaptive_timeout(text, speed)
         configured_timeout = getattr(get_application_settings().engine_config, "chunk_timeout_seconds", None)
         if configured_timeout is not None:
             timeout_seconds = min(timeout_seconds, float(configured_timeout))
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="qwen3-tts")
         try:
-            return await asyncio.wait_for(
-                asyncio.to_thread(self._generate_chunk_sync, text, voice, emotion, speed),
+            future = asyncio.get_running_loop().run_in_executor(
+                executor,
+                self._generate_chunk_sync,
+                text,
+                voice,
+                emotion,
+                speed,
+            )
+            result = await asyncio.wait_for(
+                future,
                 timeout=timeout_seconds,
             )
-        except asyncio.TimeoutError as exc:
+            self._record_generation_attempt(timed_out=False)
+            return result
+        except asyncio.TimeoutError:
             snippet = text.strip().replace("\n", " ")[:50]
-            logger.error(
+            future.cancel()
+            logger.warning(
                 "Chunk generation timed out after %ss for text: %s...",
                 timeout_seconds,
                 snippet,
             )
-            raise TimeoutError(f"Generation timed out after {timeout_seconds}s") from exc
+            self._record_generation_attempt(timed_out=True)
+            return None
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     def _generate_chunk_sync(
         self,
@@ -645,10 +666,96 @@ class Qwen3TTS(TTSEngine):
         return f"[{instruction}] {text}"
 
     def _apply_speed_preserving_pitch(self, audio: AudioSegment, speed: float) -> AudioSegment:
-        """Fallback helper that preserves pitch when a backend lacks native speed control."""
+        """Apply a pitch-preserving speed change via ffmpeg when native speed control is unavailable."""
 
-        del speed
-        return audio
+        if abs(speed - 1.0) < 0.01:
+            return audio
+        if not 0.5 <= speed <= 2.0:
+            raise ValueError("Speed must be between 0.5 and 2.0.")
+
+        ffmpeg_path = shutil.which("ffmpeg")
+        if ffmpeg_path is None:
+            logger.warning("ffmpeg unavailable; leaving audio speed unchanged for fallback processing")
+            return audio
+
+        with tempfile.TemporaryDirectory(prefix="qwen3-speed-") as temp_dir:
+            temp_root = Path(temp_dir)
+            input_path = temp_root / "input.wav"
+            output_path = temp_root / "output.wav"
+            audio.export(input_path, format="wav")
+            completed = subprocess.run(
+                [
+                    ffmpeg_path,
+                    "-y",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    str(input_path),
+                    "-filter:a",
+                    self._ffmpeg_atempo_filter(speed),
+                    str(output_path),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if completed.returncode != 0:
+                stderr = completed.stderr.strip() or "unknown ffmpeg failure"
+                raise RuntimeError(f"ffmpeg speed adjustment failed: {stderr}")
+            return AudioSegment.from_file(output_path, format="wav")
+
+    @staticmethod
+    def _ffmpeg_atempo_filter(speed: float) -> str:
+        """Build an ffmpeg ``atempo`` chain for a requested speed multiplier."""
+
+        remaining_speed = speed
+        filters: list[str] = []
+        while remaining_speed < 0.5 or remaining_speed > 2.0:
+            if remaining_speed < 0.5:
+                filters.append("atempo=0.5")
+                remaining_speed /= 0.5
+            else:
+                filters.append("atempo=2.0")
+                remaining_speed /= 2.0
+        filters.append(f"atempo={remaining_speed:.5f}".rstrip("0").rstrip("."))
+        return ",".join(filters)
+
+    def _record_generation_attempt(self, *, timed_out: bool) -> None:
+        """Track timeout health and restart the model when the timeout rate stays too high."""
+
+        self._generation_attempts += 1
+        if timed_out:
+            self._timeout_count += 1
+
+        if (
+            timed_out
+            and self._generation_attempts >= self._min_timeout_samples_before_restart
+            and (self._timeout_count / self._generation_attempts) > 0.10
+        ):
+            logger.warning(
+                "Qwen3-TTS timeout rate %.1f%% exceeded 10%% (%s/%s); restarting model",
+                (self._timeout_count / self._generation_attempts) * 100.0,
+                self._timeout_count,
+                self._generation_attempts,
+            )
+            self._restart_model()
+
+    def _restart_model(self) -> None:
+        """Best-effort restart of the loaded model after repeated timeout instability."""
+
+        if not self.loaded or self._resolved_backend == "synthetic":
+            self._generation_attempts = 0
+            self._timeout_count = 0
+            return
+
+        try:
+            self.unload()
+            self.load()
+        except Exception:
+            logger.exception("Failed to restart Qwen3-TTS model after repeated timeouts")
+        finally:
+            self._generation_attempts = 0
+            self._timeout_count = 0
 
     def _normalize_audio(self, audio: AudioSegment) -> AudioSegment:
         """Normalize audio toward a consistent output level with peak limiting."""
@@ -656,6 +763,8 @@ class Qwen3TTS(TTSEngine):
         if audio.dBFS == float("-inf"):
             return audio
         target_dbfs = -18.0
+        if abs(audio.dBFS - target_dbfs) <= 0.25 and audio.max_dBFS <= -0.5:
+            return audio
         normalized = audio.apply_gain(target_dbfs - audio.dBFS)
         # Peak limiter: if normalization pushed peaks above -0.5 dBFS,
         # reduce gain to prevent hard clipping / digital distortion.

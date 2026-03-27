@@ -318,7 +318,7 @@ def _chapter_breakdown_status(job: GenerationJob, chapter: Chapter) -> str:
 
     if chapter.status == ChapterStatus.GENERATED:
         return "completed"
-    if chapter.status == ChapterStatus.FAILED:
+    if chapter.status in {ChapterStatus.FAILED, ChapterStatus.GENERATED_NO_QA}:
         return "error"
     if job.current_chapter_n == chapter.number and job.status == GenerationJobStatus.RUNNING:
         return "generating"

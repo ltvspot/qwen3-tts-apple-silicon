@@ -102,6 +102,7 @@ class ChapterStatus(str, Enum):
     PENDING = "pending"
     GENERATING = "generating"
     GENERATED = "generated"
+    GENERATED_NO_QA = "generated_no_qa"
     FAILED = "failed"
 
 

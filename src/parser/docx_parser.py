@@ -299,7 +299,7 @@ class DocxParser:
     def _is_skip_section(self, text: str) -> bool:
         """Return whether a section should be skipped for narration."""
 
-        normalized_text = self._normalize_text(text)
+        normalized_text = self._normalize_heading_for_skip_rules(text)
         return any(pattern.match(normalized_text) for pattern in self.front_matter_patterns + self.back_matter_patterns)
 
     def _count_words(self, text: str) -> int:
@@ -465,7 +465,7 @@ class DocxParser:
     def _is_back_matter_section(self, text: str) -> bool:
         """Return whether text marks terminal back matter."""
 
-        normalized_text = self._normalize_text(text)
+        normalized_text = self._normalize_heading_for_skip_rules(text)
         return any(pattern.match(normalized_text) for pattern in self.back_matter_patterns)
 
     def _looks_like_chapter_style(self, style: str | None) -> bool:
@@ -492,6 +492,13 @@ class DocxParser:
         """Collapse internal whitespace while preserving characters."""
 
         return " ".join(text.replace("\xa0", " ").split())
+
+    def _normalize_heading_for_skip_rules(self, text: str) -> str:
+        """Normalize heading text for punctuation-insensitive skip comparisons."""
+
+        normalized = self._normalize_text(text).casefold()
+        normalized = re.sub(r"[^\w\s]", " ", normalized)
+        return re.sub(r"\s+", " ", normalized).strip()
 
     def _comparison_key(self, text: str) -> str:
         """Normalize heading text for loose comparisons."""

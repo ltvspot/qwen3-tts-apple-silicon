@@ -109,6 +109,76 @@ class CountingEngine:
         return _tone(900)
 
 
+def test_validate_chunk_passes_valid_audio() -> None:
+    """Balanced narration audio should pass the baseline chunk sanity gate."""
+
+    generator = AudiobookGenerator(CountingEngine())
+
+    valid, reason = generator._validate_chunk(
+        _tone(1200, gain_db=-6.0),
+        "This chunk contains enough words to look like valid narration output.",
+    )
+
+    assert valid is True
+    assert reason == "OK"
+
+
+def test_validate_chunk_rejects_silence() -> None:
+    """Silent chunks should fail before stitching."""
+
+    generator = AudiobookGenerator(CountingEngine())
+
+    valid, reason = generator._validate_chunk(
+        AudioSegment.silent(duration=500, frame_rate=22050),
+        "This should not be silent audio.",
+    )
+
+    assert valid is False
+    assert "Silent chunk" in reason
+
+
+def test_validate_chunk_rejects_clipping() -> None:
+    """Near-0 dBFS chunks should be rejected before stitching."""
+
+    generator = AudiobookGenerator(CountingEngine())
+
+    valid, reason = generator._validate_chunk(
+        _tone(900, gain_db=0.0),
+        "This chunk should fail because the peak is clipped.",
+    )
+
+    assert valid is False
+    assert "Clipping detected" in reason
+
+
+def test_validate_chunk_rejects_too_short_audio() -> None:
+    """Sub-100ms chunks for real text should fail fast."""
+
+    generator = AudiobookGenerator(CountingEngine())
+
+    valid, reason = generator._validate_chunk(
+        _tone(50, gain_db=-6.0),
+        "This chunk is intentionally far too short for the amount of text provided.",
+    )
+
+    assert valid is False
+    assert "Too short" in reason
+
+
+def test_validate_chunk_rejects_hallucination_duration() -> None:
+    """Implausibly slow speech should be treated as a looping hallucination."""
+
+    generator = AudiobookGenerator(CountingEngine())
+
+    valid, reason = generator._validate_chunk(
+        _tone(25_000, gain_db=-6.0),
+        "one two three four five six seven eight nine ten",
+    )
+
+    assert valid is False
+    assert "Suspected hallucination" in reason
+
+
 def test_text_alignment_pass() -> None:
     """Matching transcript text should pass STT alignment."""
 

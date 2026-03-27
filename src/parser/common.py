@@ -74,6 +74,14 @@ def normalize_text(text: str) -> str:
     return " ".join(text.replace("\xa0", " ").split())
 
 
+def normalize_heading_for_skip_rules(text: str) -> str:
+    """Normalize heading text for punctuation-insensitive skip-rule matching."""
+
+    normalized = normalize_text(text).casefold()
+    normalized = re.sub(r"[^\w\s]", " ", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
 def normalize_multiline_text(lines: list[str]) -> str:
     """Normalize a sequence of body lines into paragraph-safe text."""
 
@@ -97,14 +105,14 @@ def count_words(text: str) -> int:
 def is_front_matter_heading(text: str) -> bool:
     """Return whether text is non-narrated front matter."""
 
-    normalized_text = normalize_text(text)
+    normalized_text = normalize_heading_for_skip_rules(text)
     return any(pattern.match(normalized_text) for pattern in FRONT_MATTER_PATTERNS)
 
 
 def is_back_matter_heading(text: str) -> bool:
     """Return whether text marks terminal back matter."""
 
-    normalized_text = normalize_text(text)
+    normalized_text = normalize_heading_for_skip_rules(text)
     return any(pattern.match(normalized_text) for pattern in BACK_MATTER_PATTERNS)
 
 

@@ -19,6 +19,7 @@ from src.database import (
     BookGenerationStatus,
     BookStatus,
     Chapter,
+    ChapterQARecord,
     ChapterStatus,
     GenerationJob,
     GenerationJobStatus,
@@ -104,6 +105,17 @@ class BookResetResponse(BaseModel):
     reset_chapters: int
     cancelled_jobs: list[int]
     message: str
+
+
+class MissingQAChapterResponse(BaseModel):
+    """Recovery payload for generated chapters missing persisted QA records."""
+
+    chapter_n: int
+    title: str | None
+    status: str
+    audio_path: str | None
+    generated_at: datetime | None = None
+    reason: str
 
 def _serialize_job(job: JobInfo) -> JobStatusResponse:
     """Convert in-memory queue job state into an API response model."""
@@ -317,6 +329,8 @@ def _chapter_api_status(chapter: Chapter) -> str:
 
     if chapter.status == ChapterStatus.GENERATED:
         return "completed"
+    if chapter.status == ChapterStatus.GENERATED_NO_QA:
+        return "error"
     if chapter.status == ChapterStatus.FAILED:
         return "error"
     return chapter.status.value
@@ -407,8 +421,16 @@ def _serialize_chapter_generation_status(
         status=_chapter_api_status(chapter),
         progress_seconds=progress_seconds,
         expected_total_seconds=expected_total_seconds,
-        generated_at=chapter.completed_at if chapter.status == ChapterStatus.GENERATED else None,
-        audio_duration_seconds=chapter.duration_seconds if chapter.status == ChapterStatus.GENERATED else None,
+        generated_at=(
+            chapter.completed_at
+            if chapter.status in {ChapterStatus.GENERATED, ChapterStatus.GENERATED_NO_QA}
+            else None
+        ),
+        audio_duration_seconds=(
+            chapter.duration_seconds
+            if chapter.status in {ChapterStatus.GENERATED, ChapterStatus.GENERATED_NO_QA}
+            else None
+        ),
         error_message=chapter.error_message,
         started_at=chapter.started_at,
         audio_file_size_bytes=chapter.audio_file_size_bytes,
@@ -484,7 +506,10 @@ def _build_book_status(book: Book, db: Session) -> BookGenerationStatusResponse:
                 break
 
     is_generating = bool(active_jobs or generating_chapter is not None)
-    has_error = any(chapter.status == ChapterStatus.FAILED for chapter in chapters)
+    has_error = any(
+        chapter.status in {ChapterStatus.FAILED, ChapterStatus.GENERATED_NO_QA}
+        for chapter in chapters
+    )
 
     if is_generating:
         status = "generating"
@@ -718,6 +743,40 @@ async def resume_chapter_generation(
         chapter_number=chapter_number,
         message=f"Chapter {chapter_number} resumed from saved chunk checkpoints",
     )
+
+
+@router.get("/books/{book_id}/chapters/missing-qa", response_model=list[MissingQAChapterResponse])
+def get_missing_qa_chapters(book_id: int, db: Session = Depends(get_db)) -> list[MissingQAChapterResponse]:
+    """Return generated chapters whose QA rows are missing and need recovery."""
+
+    _load_book_or_404(book_id, db)
+    chapters = _get_book_chapters(book_id, db)
+    qa_numbers = {
+        chapter_n
+        for (chapter_n,) in (
+            db.query(ChapterQARecord.chapter_n)
+            .filter(ChapterQARecord.book_id == book_id)
+            .all()
+        )
+    }
+
+    missing: list[MissingQAChapterResponse] = []
+    for chapter in chapters:
+        if chapter.status not in {ChapterStatus.GENERATED, ChapterStatus.GENERATED_NO_QA}:
+            continue
+        if chapter.number in qa_numbers:
+            continue
+        missing.append(
+            MissingQAChapterResponse(
+                chapter_n=chapter.number,
+                title=chapter.title,
+                status=chapter.status.value,
+                audio_path=chapter.audio_path,
+                generated_at=chapter.completed_at,
+                reason="Generated chapter has no QA record.",
+            )
+        )
+    return missing
 
 
 @router.post("/book/{book_id}/reset", response_model=BookResetResponse)

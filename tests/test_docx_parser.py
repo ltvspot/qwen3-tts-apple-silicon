@@ -7,6 +7,7 @@ from pathlib import Path
 from docx import Document
 
 from src.parser import CreditsGenerator, DocxParser, TextCleaner
+from src.parser.common import should_skip_heading
 
 
 def _find_sherlock_docx() -> Path | None:
@@ -84,6 +85,13 @@ def test_parse_synthetic_docx_skip_rules_and_intro(tmp_path: Path) -> None:
     assert chapters[1].title == "The Beginning"
     assert "A subsection should remain inside chapter one." in chapters[1].raw_text
     assert "Thank You for Reading" not in chapters[1].raw_text
+
+
+def test_skip_rules_ignore_case_and_punctuation_variants() -> None:
+    """Skip rules should match front and back matter despite punctuation changes."""
+
+    assert should_skip_heading("PREFACE - Message to the Reader")
+    assert should_skip_heading("Thank You For Reading!!!")
 
 
 def test_text_cleaning() -> None:

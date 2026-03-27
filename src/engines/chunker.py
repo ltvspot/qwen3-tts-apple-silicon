@@ -5,12 +5,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 import logging
 import re
+import unicodedata
 
 import numpy as np
 from pydub.audio_segment import AudioSegment
 
 logger = logging.getLogger(__name__)
 _DFT_MATRIX_CACHE: dict[int, np.ndarray] = {}
+try:
+    import grapheme  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover - optional dependency
+    grapheme = None
 
 
 class TextChunker:
@@ -40,6 +45,7 @@ class TextChunker:
         "fig",
         "gen",
         "gov",
+        "govt",
         "inc",
         "ltd",
         "corp",
@@ -61,6 +67,8 @@ class TextChunker:
         "col",
         "no",
         "nos",
+        "p",
+        "pp",
         "op",
         "ed",
         "trans",
@@ -283,9 +291,9 @@ class TextChunker:
 
     @staticmethod
     def _split_oversized_segment(segment: str, max_chars: int) -> list[str]:
-        """Split a long segment on whitespace and finally on raw character boundaries."""
+        """Split a long segment on whitespace and finally on grapheme-safe character boundaries."""
 
-        if len(segment) <= max_chars:
+        if TextChunker._text_length(segment) <= max_chars:
             return [segment]
 
         pieces: list[str] = []
@@ -293,15 +301,14 @@ class TextChunker:
         tokens = re.findall(r"\S+\s*|\s+", segment)
 
         for token in tokens:
-            if len(token) > max_chars:
+            if TextChunker._text_length(token) > max_chars:
                 if current:
                     pieces.append(current)
                     current = ""
-                for start in range(0, len(token), max_chars):
-                    pieces.append(token[start : start + max_chars])
+                pieces.extend(TextChunker._split_token_grapheme_safe(token, max_chars))
                 continue
 
-            if len(current) + len(token) <= max_chars:
+            if TextChunker._text_length(current) + TextChunker._text_length(token) <= max_chars:
                 current += token
                 continue
 
@@ -313,6 +320,28 @@ class TextChunker:
             pieces.append(current)
 
         return pieces
+
+    @staticmethod
+    def _text_length(text: str) -> int:
+        """Return the effective character length, preferring grapheme clusters when available."""
+
+        if grapheme is not None:
+            return int(grapheme.length(text))
+        return len(unicodedata.normalize("NFC", text))
+
+    @staticmethod
+    def _split_token_grapheme_safe(token: str, max_chars: int) -> list[str]:
+        """Split a token without breaking grapheme clusters or decomposed accent sequences."""
+
+        if grapheme is not None:
+            graphemes = list(grapheme.graphemes(token))
+            return [
+                "".join(graphemes[start:start + max_chars])
+                for start in range(0, len(graphemes), max_chars)
+            ]
+
+        normalized = unicodedata.normalize("NFC", token)
+        return [normalized[start:start + max_chars] for start in range(0, len(normalized), max_chars)]
 
 
 class AudioStitcher:

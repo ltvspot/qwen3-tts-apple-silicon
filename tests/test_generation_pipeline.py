@@ -21,6 +21,7 @@ from src.database import (
     BookStatus,
     Chapter,
     ChapterQARecord,
+    QAAutomaticStatus,
     ChapterStatus,
     ChapterType,
     GenerationJob,
@@ -29,7 +30,7 @@ from src.database import (
 )
 from src.engines.qwen3_tts import Qwen3TTS
 from src.engines.voice_cloner import VoiceCloner
-from src.pipeline.generator import AudiobookGenerator, ChunkGenerationExhaustedError, GenerationCancelled
+from src.pipeline.generator import AudiobookGenerator, GenerationCancelled
 from src.pipeline.queue_manager import GenerationQueue, JobStatus
 
 
@@ -152,7 +153,7 @@ class FlakyEngine:
         self.calls += 1
         if self.calls < 3:
             raise TimeoutError("temporary timeout")
-        return Sine(220).to_audio_segment(duration=250, volume=-6.0)
+        return Sine(220).to_audio_segment(duration=3000, volume=-6.0)
 
 
 class ValidationFailureEngine:
@@ -217,6 +218,62 @@ class RecordingCheckpointEngine:
         del voice, emotion, speed
         self.calls.append(text)
         return Sine(220).to_audio_segment(duration=700, volume=-6.0).set_frame_rate(22050)
+
+
+class TimeoutSplitEngine:
+    """Engine stub that times out on a large chunk and succeeds after sentence splitting."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.loaded = False
+        self.max_chunk_chars = 500
+        self.sample_rate = 22050
+
+    def load(self) -> None:
+        self.loaded = True
+
+    def unload(self) -> None:
+        self.loaded = False
+
+    async def generate_chunk_with_timeout(
+        self,
+        text: str,
+        voice: str,
+        emotion: str | None = None,
+        speed: float = 1.0,
+    ) -> AudioSegment | None:
+        del voice, emotion, speed
+        self.calls.append(text)
+        if "Alpha sentence." in text and "Beta sentence." in text:
+            return None
+        return Sine(220).to_audio_segment(duration=900, volume=-6.0).set_frame_rate(22050)
+
+
+class TimeoutAlwaysEngine:
+    """Engine stub that times out on every chunk request."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.loaded = False
+        self.max_chunk_chars = 500
+        self.sample_rate = 22050
+
+    def load(self) -> None:
+        self.loaded = True
+
+    def unload(self) -> None:
+        self.loaded = False
+
+    async def generate_chunk_with_timeout(
+        self,
+        text: str,
+        voice: str,
+        emotion: str | None = None,
+        speed: float = 1.0,
+    ) -> AudioSegment | None:
+        del voice, emotion, speed
+        self.calls.append(text)
+        return None
 
 
 class ConsecutiveFailureGenerator:
@@ -424,14 +481,151 @@ async def test_generate_chapter_retries_transient_failures_before_succeeding(tes
     duration = await generator.generate_chapter(book.id, chapter, test_db)
 
     test_db.refresh(chapter)
-    assert duration == 0.25
+    assert duration == 3.0
     assert generator.engine.calls == 3
     assert chapter.status == ChapterStatus.GENERATED
 
 
 @pytest.mark.asyncio
-async def test_generate_chapter_fails_when_chunk_exhaustion_is_unrecoverable(test_db: Session) -> None:
-    """Repeated hard validation failures should fail the chapter instead of skipping audio."""
+async def test_generate_chapter_sets_generated_no_qa_and_persists_error_record_on_qa_crash(
+    test_db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """QA crashes should preserve the audio, record the QA failure, and avoid GENERATED state."""
+
+    engine = Qwen3TTS(backend="synthetic")
+    generator = AudiobookGenerator(engine)
+    book = create_book(test_db, title="QA Crash Book")
+    chapter = create_chapter(
+        test_db,
+        book_id=book.id,
+        number=1,
+        title="QA Crash Chapter",
+        chapter_type=ChapterType.CHAPTER,
+        text="This chapter should keep its audio even if QA crashes.",
+    )
+
+    async def fail_qa(_: Chapter):
+        raise RuntimeError("qa boom")
+
+    monkeypatch.setattr("src.pipeline.generator.run_qa_checks_for_chapter", fail_qa)
+
+    duration = await generator.generate_chapter(book.id, chapter, test_db)
+
+    test_db.refresh(chapter)
+    qa_record = (
+        test_db.query(ChapterQARecord)
+        .filter(ChapterQARecord.book_id == book.id, ChapterQARecord.chapter_n == chapter.number)
+        .one()
+    )
+
+    assert duration > 0
+    assert chapter.status == ChapterStatus.GENERATED_NO_QA
+    assert chapter.audio_path is not None
+    assert chapter.error_message == "Automatic QA crashed: qa boom"
+    assert chapter.qa_status == "needs_review"
+    assert qa_record.overall_status == QAAutomaticStatus.FAIL
+    assert "Automatic QA crashed: qa boom" in qa_record.qa_details
+
+
+@pytest.mark.asyncio
+async def test_generate_book_marks_result_partial_when_qa_crashes(
+    test_db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A chapter that finishes without QA should prevent book-level success."""
+
+    engine = Qwen3TTS(backend="synthetic")
+    generator = AudiobookGenerator(engine)
+    book = create_book(test_db, title="Book QA Crash")
+    chapter = create_chapter(
+        test_db,
+        book_id=book.id,
+        number=1,
+        title="Only Chapter",
+        chapter_type=ChapterType.CHAPTER,
+        text="This book should not report success if QA never completes.",
+    )
+
+    async def fail_qa(_: Chapter):
+        raise RuntimeError("qa explosion")
+
+    monkeypatch.setattr("src.pipeline.generator.run_qa_checks_for_chapter", fail_qa)
+
+    result = await generator.generate_book(book.id, test_db)
+
+    test_db.refresh(book)
+    test_db.refresh(chapter)
+
+    assert result["status"] == "failed"
+    assert result["generated_chapters"] == 0
+    assert result["failed_chapters"] == [chapter.number]
+    assert "Automatic QA crashed: qa explosion" in result["errors"][0]
+    assert chapter.status == ChapterStatus.GENERATED_NO_QA
+    assert book.status == BookStatus.PARSED
+
+
+def test_missing_qa_endpoint_returns_generated_chapters_without_records(client, test_db: Session) -> None:
+    """The recovery endpoint should find legacy generated chapters missing QA rows."""
+
+    book = create_book(test_db, title="Missing QA API Book")
+    missing_generated = create_chapter(
+        test_db,
+        book_id=book.id,
+        number=1,
+        title="Missing Generated",
+        chapter_type=ChapterType.CHAPTER,
+        text="Legacy generated chapter without QA.",
+    )
+    covered = create_chapter(
+        test_db,
+        book_id=book.id,
+        number=2,
+        title="Covered",
+        chapter_type=ChapterType.CHAPTER,
+        text="Generated chapter with QA.",
+    )
+    missing_generated_no_qa = create_chapter(
+        test_db,
+        book_id=book.id,
+        number=3,
+        title="Missing Generated No QA",
+        chapter_type=ChapterType.CHAPTER,
+        text="Generated-no-qa chapter without QA record.",
+    )
+
+    missing_generated.status = ChapterStatus.GENERATED
+    missing_generated.audio_path = "book/chapters/01.wav"
+    covered.status = ChapterStatus.GENERATED
+    covered.audio_path = "book/chapters/02.wav"
+    missing_generated_no_qa.status = ChapterStatus.GENERATED_NO_QA
+    missing_generated_no_qa.audio_path = "book/chapters/03.wav"
+    test_db.add(
+        ChapterQARecord(
+            book_id=book.id,
+            chapter_n=covered.number,
+            overall_status=QAAutomaticStatus.PASS,
+            qa_details=(
+                f'{{"chapter_n":{covered.number},"book_id":{book.id},'
+                '"timestamp":"2026-03-27T00:00:00Z","checks":[],"overall_status":"pass",'
+                '"notes":"","chapter_report":null}}'
+            ),
+            checked_at=utc_now(),
+        )
+    )
+    test_db.commit()
+
+    response = client.get(f"/api/books/{book.id}/chapters/missing-qa")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [chapter["chapter_n"] for chapter in payload] == [1, 3]
+    assert {chapter["status"] for chapter in payload} == {"generated", "generated_no_qa"}
+
+
+@pytest.mark.asyncio
+async def test_generate_chapter_inserts_placeholder_after_repeated_validation_failure(test_db: Session) -> None:
+    """Repeated hard validation failures should insert silence and flag the chapter for review."""
 
     generator = AudiobookGenerator(ValidationFailureEngine())
     book = create_book(test_db, title="Manual Review Book")
@@ -444,15 +638,15 @@ async def test_generate_chapter_fails_when_chunk_exhaustion_is_unrecoverable(tes
         text="Valid chunk. Invalid chunk.",
     )
 
-    with pytest.raises(ChunkGenerationExhaustedError, match="Chapter cannot be completed with missing audio"):
-        await generator.generate_chapter(book.id, chapter, test_db)
+    duration = await generator.generate_chapter(book.id, chapter, test_db)
 
     test_db.refresh(chapter)
-    assert chapter.status == ChapterStatus.FAILED
-    assert chapter.audio_path is None
-    assert chapter.error_message is not None
-    assert "Chunk 2 failed after 3 attempts" in chapter.error_message
-    assert "Chapter cannot be completed with missing audio" in chapter.error_message
+    assert duration > 0
+    assert chapter.status == ChapterStatus.GENERATED
+    assert chapter.audio_path is not None
+    assert chapter.qa_status == "needs_review"
+    assert chapter.qa_notes is not None
+    assert "chunk_placeholder" in chapter.qa_notes
     assert generator.engine.calls == 4
 
 
@@ -480,6 +674,58 @@ async def test_generate_chapter_retries_by_splitting_failed_chunk(test_db: Sessi
     assert len([call for call in engine.calls if "Alpha sentence." in call and "Beta sentence." in call]) == 3
     assert any(call == "Alpha sentence." for call in engine.calls)
     assert any(call == "Beta sentence." for call in engine.calls)
+
+
+@pytest.mark.asyncio
+async def test_generate_chapter_retries_timeout_with_smaller_chunks(test_db: Session) -> None:
+    """Timeouts should fall back to smaller sentence-level chunks before giving up."""
+
+    engine = TimeoutSplitEngine()
+    generator = AudiobookGenerator(engine)
+    book = create_book(test_db, title="Timeout Split Book")
+    chapter = create_chapter(
+        test_db,
+        book_id=book.id,
+        number=1,
+        title="Timeout Split Chapter",
+        chapter_type=ChapterType.CHAPTER,
+        text="Alpha sentence. Beta sentence.",
+    )
+
+    duration = await generator.generate_chapter(book.id, chapter, test_db)
+
+    test_db.refresh(chapter)
+    assert duration > 1.5
+    assert chapter.status == ChapterStatus.GENERATED
+    assert engine.calls[0] == "Alpha sentence. Beta sentence."
+    assert any(call == "Alpha sentence." for call in engine.calls)
+    assert any(call == "Beta sentence." for call in engine.calls)
+
+
+@pytest.mark.asyncio
+async def test_generate_chapter_uses_placeholder_after_timeout_exhaustion(test_db: Session) -> None:
+    """Persistent timeouts should insert silence and flag the chapter instead of aborting generation."""
+
+    engine = TimeoutAlwaysEngine()
+    generator = AudiobookGenerator(engine)
+    book = create_book(test_db, title="Timeout Placeholder Book")
+    chapter = create_chapter(
+        test_db,
+        book_id=book.id,
+        number=1,
+        title="Timeout Placeholder Chapter",
+        chapter_type=ChapterType.CHAPTER,
+        text="A single sentence that always times out.",
+    )
+
+    duration = await generator.generate_chapter(book.id, chapter, test_db)
+
+    test_db.refresh(chapter)
+    assert duration > 0
+    assert chapter.status == ChapterStatus.GENERATED
+    assert chapter.qa_status == "needs_review"
+    assert chapter.qa_notes is not None
+    assert "Chunk generation timed out" in chapter.qa_notes
 
 
 @pytest.mark.asyncio

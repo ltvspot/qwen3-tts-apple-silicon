@@ -1010,6 +1010,34 @@ class GenerationQueue:
                     )
                     return
             else:
+                if chapter.status != ChapterStatus.GENERATED:
+                    logger.error(
+                        "Job %s chapter %s completed with non-ready status %s",
+                        db_job.id,
+                        chapter.number,
+                        chapter.status.value,
+                    )
+                    failure_stats.record_failure(self._estimated_chunk_count(chapter))
+                    self._sync_full_book_metrics(db_job, chapters, force=db_job.force)
+                    db_job.error_message = (
+                        chapter.error_message
+                        or f"Chapter {chapter.number} completed with status {chapter.status.value}"
+                    )
+                    db_job.current_chapter_progress = 0.0
+                    db_job.progress = self._overall_progress(db_job.chapters_completed, db_job.chapters_total, 0.0)
+                    db_session.commit()
+                    self._store_job_snapshot(db_job)
+                    should_stop, failure_message = self._should_stop_batch(failure_stats)
+                    if should_stop:
+                        self._mark_failed(
+                            db_job,
+                            job_info,
+                            db_session,
+                            failure_message,
+                        )
+                        return
+                    continue
+
                 failure_stats.record_success(self._estimated_chunk_count(chapter))
                 self._sync_full_book_metrics(db_job, chapters, force=db_job.force)
                 db_job.last_completed_chapter = chapter.number
@@ -1117,6 +1145,16 @@ class GenerationQueue:
             return
         except Exception as exc:
             self._mark_failed(db_job, job_info, db_session, str(exc))
+            return
+
+        if chapter.status != ChapterStatus.GENERATED:
+            self._mark_failed(
+                db_job,
+                job_info,
+                db_session,
+                chapter.error_message
+                or f"Chapter {chapter.number} completed with status {chapter.status.value}",
+            )
             return
 
         db_job.chapters_completed = 1
@@ -1432,7 +1470,7 @@ class GenerationQueue:
         for chapter in chapters:
             if chapter.status == ChapterStatus.GENERATED:
                 stats.record_success(self._estimated_chunk_count(chapter))
-            elif chapter.status == ChapterStatus.FAILED:
+            elif chapter.status in {ChapterStatus.FAILED, ChapterStatus.GENERATED_NO_QA}:
                 stats.record_failure(self._estimated_chunk_count(chapter))
         stats.consecutive_failures = 0
         return stats
@@ -1459,7 +1497,11 @@ class GenerationQueue:
         """Return completed count, failed count, and observed average generation time."""
 
         completed_chapters = [] if force else [chapter for chapter in chapters if chapter.status == ChapterStatus.GENERATED]
-        failed_count = 0 if force else sum(chapter.status == ChapterStatus.FAILED for chapter in chapters)
+        failed_count = (
+            0
+            if force
+            else sum(chapter.status in {ChapterStatus.FAILED, ChapterStatus.GENERATED_NO_QA} for chapter in chapters)
+        )
         observed_times = [
             observed_seconds
             for chapter in completed_chapters

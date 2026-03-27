@@ -34,7 +34,7 @@ export function mapChapterGenerationState(status) {
     return "completed";
   }
 
-  if (status === "failed") {
+  if (status === "failed" || status === "generated_no_qa") {
     return "error";
   }
 

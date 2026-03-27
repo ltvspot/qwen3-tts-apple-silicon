@@ -31,11 +31,12 @@ from src.pipeline.chunk_validator import (
     SEVERITY_ORDER,
     ChunkValidationReport,
     ChunkValidator,
+    ValidationResult,
     ValidationSeverity,
 )
 from src.pipeline.pause_trimmer import PauseTrimmer
 from src.pipeline.pronunciation_watchlist import PronunciationWatchlist
-from src.pipeline.qa_checker import persist_qa_result, run_qa_checks_for_chapter
+from src.pipeline.qa_checker import QACheckResult, QAResult, persist_qa_result, run_qa_checks_for_chapter
 
 logger = logging.getLogger(__name__)
 
@@ -144,7 +145,7 @@ class AudiobookGenerator:
                 await progress_callback(chapter.number, overall_progress)
 
             try:
-                total_duration += await self.generate_chapter(
+                chapter_duration = await self.generate_chapter(
                     book_id,
                     chapter,
                     db_session,
@@ -155,7 +156,18 @@ class AudiobookGenerator:
                     emotion=emotion,
                     speed=speed,
                 )
-                generated_chapters += 1
+                total_duration += chapter_duration
+                if chapter.status == ChapterStatus.GENERATED:
+                    generated_chapters += 1
+                else:
+                    qa_gap_message = (
+                        chapter.error_message
+                        or "Automatic QA did not complete for this generated chapter."
+                    )
+                    error_message = f"Chapter {chapter.number}: {qa_gap_message}"
+                    logger.error(error_message)
+                    errors.append(error_message)
+                    failed_chapters.append(chapter.number)
                 if chapter_completed_callback is not None:
                     await chapter_completed_callback(chapter)
 
@@ -453,15 +465,13 @@ class AudiobookGenerator:
             )
             chapter.completed_at = utc_now()
             chapter.audio_file_size_bytes = audio_path.stat().st_size
-            db_session.commit()
 
+            qa_notification_reason: str | None = None
             try:
                 qa_result = await run_qa_checks_for_chapter(chapter)
-                persist_qa_result(db_session, chapter, qa_result)
-                self._flag_manual_review(chapter, manual_review_notes)
-                db_session.commit()
+                chapter.status = ChapterStatus.GENERATED
                 if qa_result.has_failures:
-                    first_failure = next(
+                    qa_notification_reason = next(
                         (
                             check.message
                             for check in qa_result.checks
@@ -469,19 +479,26 @@ class AudiobookGenerator:
                         ),
                         "Automatic QA flagged the chapter for review.",
                     )
-                    send_qa_failure_notification(
-                        book_id=book_id,
-                        chapter_number=chapter.number,
-                        reason=first_failure,
-                    )
-            except Exception:
-                db_session.rollback()
-                self._flag_manual_review(chapter, manual_review_notes)
-                db_session.commit()
+            except Exception as exc:
+                qa_notification_reason = self._format_qa_exception(exc)
+                manual_review_notes.append(qa_notification_reason)
+                chapter.status = ChapterStatus.GENERATED_NO_QA
+                chapter.error_message = qa_notification_reason
                 logger.exception(
                     "Automatic QA failed for book %s chapter %s after successful generation",
                     book_id,
                     chapter.number,
+                )
+                qa_result = self._build_qa_error_result(chapter, qa_notification_reason)
+
+            persist_qa_result(db_session, chapter, qa_result)
+            self._flag_manual_review(chapter, manual_review_notes)
+            db_session.commit()
+            if qa_notification_reason is not None:
+                send_qa_failure_notification(
+                    book_id=book_id,
+                    chapter_number=chapter.number,
+                    reason=qa_notification_reason,
                 )
 
             logger.info(
@@ -573,6 +590,16 @@ class AudiobookGenerator:
                 await asyncio.sleep(backoff)
                 continue
 
+            if audio is None:
+                terminal_error = ChunkGenerationExhaustedError("Chunk generation timed out")
+                logger.warning(
+                    "Chunk %s for book %s chapter %s timed out; retrying with smaller text if possible",
+                    chunk_index,
+                    book_id,
+                    chapter_number,
+                )
+                break
+
             validation_report = self.chunk_validator.validate(
                 audio,
                 validation_text,
@@ -580,6 +607,17 @@ class AudiobookGenerator:
                 speed,
                 chunk_index=chunk_index,
                 expected_sample_rate=expected_sample_rate,
+            )
+            validation_report = self._with_chunk_sanity_validation(
+                audio,
+                validation_text,
+                validation_report,
+            )
+            self._log_chunk_validation(
+                validation_report,
+                book_id=book_id,
+                chapter_number=chapter_number,
+                attempt=attempt,
             )
             if validation_report.needs_regeneration and attempt < max_attempts:
                 logger.warning(
@@ -630,7 +668,7 @@ class AudiobookGenerator:
                     chunk_index,
                 )
                 left_text, right_text = split
-                left_audio, _, _, left_attempts = await self._generate_chunk_with_retry(
+                left_audio, _, left_failed_validation, left_attempts = await self._generate_chunk_with_retry(
                     self.pronunciation_watchlist.inject_phonetic_hints(
                         left_text,
                         custom_entries=custom_watchlist,
@@ -647,7 +685,7 @@ class AudiobookGenerator:
                     custom_watchlist=custom_watchlist,
                     allow_split_retry=False,
                 )
-                right_audio, _, _, right_attempts = await self._generate_chunk_with_retry(
+                right_audio, _, right_failed_validation, right_attempts = await self._generate_chunk_with_retry(
                     self.pronunciation_watchlist.inject_phonetic_hints(
                         right_text,
                         custom_entries=custom_watchlist,
@@ -676,14 +714,38 @@ class AudiobookGenerator:
                     chunk_index=chunk_index,
                     expected_sample_rate=expected_sample_rate,
                 )
+                stitched_report = self._with_chunk_sanity_validation(
+                    stitched_audio,
+                    validation_text,
+                    stitched_report,
+                )
+                if left_failed_validation or right_failed_validation:
+                    stitched_report = ChunkValidationReport(
+                        chunk_index=stitched_report.chunk_index,
+                        text=stitched_report.text,
+                        duration_ms=stitched_report.duration_ms,
+                        results=[
+                            ValidationResult(
+                                check="chunk_placeholder",
+                                severity=ValidationSeverity.FAIL,
+                                message="Split retry required a silence placeholder for part of the chunk",
+                            ),
+                            *stitched_report.results,
+                        ],
+                    )
                 if stitched_report.needs_regeneration and not self._is_noncritical_validation_failure(stitched_report):
-                    raise ChunkGenerationExhaustedError(
-                        "; ".join(
+                    return self._placeholder_chunk_response(
+                        validation_text=validation_text,
+                        chunk_index=chunk_index,
+                        speed=speed,
+                        expected_sample_rate=expected_sample_rate,
+                        reason="; ".join(
                             self._validation_messages(
                                 stitched_report,
                                 minimum_severity=ValidationSeverity.FAIL,
                             )
-                        )
+                        ),
+                        attempts_used=max(max_attempts + 1, left_attempts + right_attempts),
                     )
                 return (
                     stitched_audio,
@@ -693,7 +755,14 @@ class AudiobookGenerator:
                 )
 
         if terminal_error is not None:
-            raise terminal_error
+            return self._placeholder_chunk_response(
+                validation_text=validation_text,
+                chunk_index=chunk_index,
+                speed=speed,
+                expected_sample_rate=expected_sample_rate,
+                reason=str(terminal_error),
+                attempts_used=max_attempts,
+            )
         raise RuntimeError("Chunk generation retry loop exited unexpectedly.")
 
     async def _generate_chunk(
@@ -703,7 +772,7 @@ class AudiobookGenerator:
         voice_name: str,
         emotion: str | None,
         speed: float,
-    ) -> AudioSegment:
+    ) -> AudioSegment | None:
         """Generate a single audio chunk, using engine-level timeouts when available."""
 
         engine = await self._get_engine()
@@ -720,7 +789,7 @@ class AudiobookGenerator:
                 speed,
             )
 
-        if self.model_manager is not None:
+        if audio is not None and self.model_manager is not None:
             self.model_manager.record_chunk(asyncio.get_running_loop().time() - started_at)
         return audio
 
@@ -734,6 +803,152 @@ class AudiobookGenerator:
         existing_notes = (chapter.qa_notes or "").strip()
         next_notes = "\n".join(notes)
         chapter.qa_notes = next_notes if not existing_notes else f"{existing_notes}\n{next_notes}"
+
+    def _validate_chunk(self, chunk: AudioSegment, expected_text: str) -> tuple[bool, str]:
+        """Validate a generated chunk against baseline production audio thresholds."""
+
+        stripped_text = expected_text.strip()
+        if len(chunk) < 100 and len(stripped_text) > 5:
+            return (False, f"Too short: {len(chunk)}ms for {len(stripped_text)} chars")
+
+        if chunk.rms < 10:
+            return (False, f"Silent chunk: RMS={chunk.rms}")
+
+        peak_dbfs = chunk.max_dBFS if chunk.max_dBFS != float("-inf") else -100.0
+        if peak_dbfs > -0.3:
+            return (False, f"Clipping detected: peak={peak_dbfs:.1f} dBFS")
+
+        word_count = len(stripped_text.split())
+        if word_count > 0:
+            ms_per_word = len(chunk) / word_count
+            if ms_per_word > 2000:
+                return (False, f"Suspected hallucination: {ms_per_word:.0f}ms/word")
+            if ms_per_word < 50:
+                return (False, f"Impossibly fast: {ms_per_word:.0f}ms/word")
+
+        return (True, "OK")
+
+    def _with_chunk_sanity_validation(
+        self,
+        audio: AudioSegment,
+        expected_text: str,
+        report: ChunkValidationReport,
+    ) -> ChunkValidationReport:
+        """Merge basic chunk sanity validation into the richer chunk-quality report."""
+
+        is_valid, reason = self._validate_chunk(audio, expected_text)
+        if is_valid:
+            return report
+
+        return ChunkValidationReport(
+            chunk_index=report.chunk_index,
+            text=report.text,
+            duration_ms=report.duration_ms,
+            results=[
+                ValidationResult(
+                    check="baseline_audio_sanity",
+                    severity=ValidationSeverity.FAIL,
+                    message=reason,
+                ),
+                *report.results,
+            ],
+        )
+
+    def _placeholder_chunk_response(
+        self,
+        *,
+        validation_text: str,
+        chunk_index: int,
+        speed: float,
+        expected_sample_rate: int | None,
+        reason: str,
+        attempts_used: int,
+    ) -> tuple[AudioSegment, ChunkValidationReport, bool, int]:
+        """Insert a short silence placeholder when a chunk never yields valid audio."""
+
+        placeholder = self._build_placeholder_chunk(
+            validation_text,
+            speed=speed,
+            frame_rate=expected_sample_rate,
+        )
+        logger.error(
+            "Skipping chunk %s after %s failed attempts; inserting silence placeholder: %s",
+            chunk_index,
+            attempts_used,
+            reason,
+        )
+        report = ChunkValidationReport(
+            chunk_index=chunk_index + 1,
+            text=validation_text,
+            duration_ms=len(placeholder),
+            results=[
+                ValidationResult(
+                    check="chunk_placeholder",
+                    severity=ValidationSeverity.FAIL,
+                    message=reason,
+                )
+            ],
+        )
+        return (placeholder, report, True, attempts_used)
+
+    def _build_placeholder_chunk(
+        self,
+        expected_text: str,
+        *,
+        speed: float,
+        frame_rate: int | None,
+    ) -> AudioSegment:
+        """Build a silence placeholder sized to a short snippet of missing narration."""
+
+        resolved_speed = max(speed, 0.1)
+        word_count = max(len(expected_text.split()), 1)
+        duration_ms = int(max(400, min(3000, (word_count * 150) / resolved_speed)))
+        resolved_frame_rate = frame_rate or getattr(self.engine, "sample_rate", 22050) or 22050
+        return AudioSegment.silent(duration=duration_ms, frame_rate=resolved_frame_rate).set_channels(1)
+
+    def _log_chunk_validation(
+        self,
+        report: ChunkValidationReport,
+        *,
+        book_id: int,
+        chapter_number: int,
+        attempt: int,
+    ) -> None:
+        """Emit one structured log line for every chunk validation attempt."""
+
+        logger.info(
+            "Chunk validation for book %s chapter %s chunk %s attempt %s: %s",
+            book_id,
+            chapter_number,
+            report.chunk_index,
+            attempt,
+            "; ".join(report.issues or ["OK"]),
+        )
+
+    def _build_qa_error_result(self, chapter: Chapter, message: str) -> QAResult:
+        """Persist a synthetic QA failure record when automatic QA crashes outright."""
+
+        return QAResult(
+            chapter_n=chapter.number,
+            book_id=chapter.book_id,
+            timestamp=utc_now(),
+            checks=[
+                QACheckResult(
+                    name="automatic_qa_runtime",
+                    status="fail",
+                    message=message,
+                )
+            ],
+            overall_status="fail",
+            notes=message,
+        )
+
+    @staticmethod
+    def _format_qa_exception(exc: Exception) -> str:
+        """Return a stable operator-facing message for QA runtime failures."""
+
+        detail = str(exc).strip() or exc.__class__.__name__
+        return f"Automatic QA crashed: {detail}"
 
     def _validation_messages(
         self,
