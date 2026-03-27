@@ -14,12 +14,12 @@ import threading
 import uuid
 import wave
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, Field, ValidationError
 from pydub import AudioSegment
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -50,11 +50,14 @@ logger = logging.getLogger(__name__)
 DEFAULT_EXPORT_FORMATS = ("mp3", "m4b")
 VALID_EXPORT_FORMATS = frozenset(DEFAULT_EXPORT_FORMATS)
 ExportProgressCallback = Callable[[float, str | None, str | None, int | None, int | None], None]
-EXPORT_VERIFY_TIMEOUT_SECONDS = 30
+EXPORT_VERIFY_TIMEOUT_SECONDS = 60
+EXPORT_UNKNOWN_DURATION_TIMEOUT_SECONDS = 300.0
 EXPORT_STALE_TIMEOUT = timedelta(minutes=15)
 FORMAT_DETAILS_ARTIFACTS_KEY = "_artifacts"
 EXPORT_LUFS_MAX_ATTEMPTS = 3
 EXPORT_STATE_FILE_NAME = "export_state.json"
+SOFT_FAIL_CHECKS = frozenset({"pacing_detailed", "spectral_quality", "volume_consistency", "duration_check"})
+HARD_FAIL_CHECKS = frozenset({"clipping_detection", "file_exists", "lufs_compliance"})
 _active_export_temp_files: dict[int, set[Path]] = {}
 _active_export_temp_files_lock = threading.RLock()
 _atomic_json_write_lock = threading.RLock()
@@ -76,6 +79,7 @@ class ExportFormatResult(BaseModel):
     lufs_warning: str | None = None
     noise_floor_dbfs: float | None = None
     noise_floor_compliant: bool | None = None
+    noise_floor_warning: str | None = None
 
 
 class QAChapterSummary(BaseModel):
@@ -86,6 +90,8 @@ class QAChapterSummary(BaseModel):
     status: str
     file_size_bytes: int
     duration_seconds: float
+    qa_soft_pass: bool = False
+    qa_warnings: list[str] = Field(default_factory=list)
 
 
 class QAReport(BaseModel):
@@ -130,6 +136,15 @@ class ChapterMarker:
 
 
 @dataclass(slots=True)
+class ChapterApprovalDecision:
+    """Resolved QA export decision for one chapter."""
+
+    approved: bool
+    soft_pass: bool = False
+    warnings: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
 class SelectedChapter:
     """Resolved chapter selected for export."""
 
@@ -141,6 +156,8 @@ class SelectedChapter:
     duration_seconds: float
     qa_status: str
     export_approved: bool
+    qa_soft_pass: bool = False
+    qa_warnings: list[str] = field(default_factory=list)
     loudness_adjustment_db: float = 0.0
 
 
@@ -385,12 +402,8 @@ def _chapter_effective_qa_status(chapter: Chapter, qa_record: ChapterQARecord | 
 def _chapter_report_ready_for_export(qa_record: ChapterQARecord | None) -> bool | None:
     """Return the stored chapter export-readiness flag when present."""
 
-    if qa_record is None or not qa_record.qa_details:
-        return None
-
-    try:
-        qa_details = json.loads(qa_record.qa_details)
-    except json.JSONDecodeError:
+    qa_details = _load_qa_details_payload(qa_record)
+    if not qa_details:
         return None
 
     chapter_report = qa_details.get("chapter_report")
@@ -409,20 +422,85 @@ def _chapter_report_ready_for_export(qa_record: ChapterQARecord | None) -> bool 
     return None
 
 
+def _load_qa_details_payload(qa_record: ChapterQARecord | None) -> dict[str, Any]:
+    """Return the parsed QA details payload when available."""
+
+    if qa_record is None or not qa_record.qa_details:
+        return {}
+
+    try:
+        payload = json.loads(qa_record.qa_details)
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _failed_qa_checks(qa_record: ChapterQARecord | None) -> list[tuple[str, str]]:
+    """Return the failed QA checks captured for one chapter."""
+
+    qa_details = _load_qa_details_payload(qa_record)
+    raw_checks = qa_details.get("checks")
+    if not isinstance(raw_checks, list):
+        return []
+
+    failures: list[tuple[str, str]] = []
+    for raw_check in raw_checks:
+        if not isinstance(raw_check, dict):
+            continue
+        if raw_check.get("status") != QAAutomaticStatus.FAIL.value:
+            continue
+        name = raw_check.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        message = raw_check.get("message")
+        if not isinstance(message, str) or not message.strip():
+            message = "Automatic QA failure."
+        failures.append((name, message))
+    return failures
+
+
+def _chapter_approval_decision(chapter: Chapter, qa_record: ChapterQARecord | None) -> ChapterApprovalDecision:
+    """Return whether a chapter is eligible for approval-only exports."""
+
+    if qa_record is None:
+        return ChapterApprovalDecision(approved=True)
+
+    if qa_record.manual_status == QAManualStatus.FLAGGED:
+        return ChapterApprovalDecision(approved=False)
+    if qa_record.manual_status == QAManualStatus.APPROVED:
+        return ChapterApprovalDecision(approved=True)
+    if qa_record.overall_status == QAAutomaticStatus.PASS:
+        return ChapterApprovalDecision(approved=True)
+
+    failed_checks = _failed_qa_checks(qa_record)
+    if failed_checks:
+        hard_failures = [name for name, _message in failed_checks if name in HARD_FAIL_CHECKS]
+        if hard_failures:
+            return ChapterApprovalDecision(approved=False)
+
+        if all(name in SOFT_FAIL_CHECKS for name, _message in failed_checks):
+            return ChapterApprovalDecision(
+                approved=True,
+                soft_pass=True,
+                warnings=[f"{name}: {message}" for name, message in failed_checks],
+            )
+
+        return ChapterApprovalDecision(approved=False)
+
+    report_ready = _chapter_report_ready_for_export(qa_record)
+    if report_ready is not None:
+        return ChapterApprovalDecision(approved=report_ready)
+
+    if qa_record.overall_status == QAAutomaticStatus.WARNING:
+        return ChapterApprovalDecision(approved=True)
+
+    return ChapterApprovalDecision(approved=chapter.qa_status == QAStatus.APPROVED)
+
+
 def _chapter_is_approved(chapter: Chapter, qa_record: ChapterQARecord | None) -> bool:
     """Return True when a chapter is eligible for approval-only exports."""
 
-    if qa_record is not None:
-        if qa_record.manual_status == QAManualStatus.FLAGGED:
-            return False
-        if qa_record.manual_status == QAManualStatus.APPROVED:
-            return True
-        report_ready = _chapter_report_ready_for_export(qa_record)
-        if report_ready is not None:
-            return report_ready
-        return qa_record.overall_status == QAAutomaticStatus.PASS
-
-    return chapter.qa_status == QAStatus.APPROVED
+    return _chapter_approval_decision(chapter, qa_record).approved
 
 
 def _should_include_chapter(
@@ -492,6 +570,7 @@ def _load_selected_chapters(
 
     for chapter in chapters:
         qa_record = qa_records.get(chapter.number)
+        approval_decision = _chapter_approval_decision(chapter, qa_record)
         include_chapter, skipped_note = _should_include_chapter(
             chapter,
             qa_record,
@@ -533,7 +612,9 @@ def _load_selected_chapters(
                 file_size_bytes=audio_path.stat().st_size,
                 duration_seconds=round(len(audio_segment) / 1000.0, 3),
                 qa_status=_chapter_effective_qa_status(chapter, qa_record),
-                export_approved=_chapter_is_approved(chapter, qa_record),
+                export_approved=approval_decision.approved,
+                qa_soft_pass=approval_decision.soft_pass,
+                qa_warnings=list(approval_decision.warnings),
                 loudness_adjustment_db=loudness_adjustment_db,
             )
         )
@@ -692,16 +773,42 @@ def _parse_loudnorm_metrics(output: str) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _ffmpeg_timeout(duration_seconds: float, *, minimum: float = 60.0, multiplier: float = 0.5) -> float:
+    """Return a timeout in seconds that scales with audio duration."""
+
+    return max(minimum, duration_seconds * multiplier)
+
+
+def _resolve_ffmpeg_timeout(duration_seconds: float | None) -> float:
+    """Return the timeout used for duration-aware ffmpeg measurements."""
+
+    if duration_seconds is None:
+        return EXPORT_UNKNOWN_DURATION_TIMEOUT_SECONDS
+    return _ffmpeg_timeout(duration_seconds, minimum=float(EXPORT_VERIFY_TIMEOUT_SECONDS))
+
+
+def _format_timeout_seconds(timeout_seconds: float) -> str:
+    """Return a compact timeout string for user-facing warnings."""
+
+    return f"{int(timeout_seconds)}s" if float(timeout_seconds).is_integer() else f"{timeout_seconds:.1f}s"
+
+
 def _escape_filter_path(path: Path) -> str:
     """Escape one filesystem path for ffmpeg filter arguments."""
 
     return str(path).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
 
 
-def _measure_loudness(audio_path: Path, *, target_lufs: float) -> float | None:
+def _measure_loudness(
+    audio_path: Path,
+    *,
+    target_lufs: float,
+    duration_seconds: float | None = None,
+) -> float | None:
     """Measure integrated LUFS for one audio file using ffmpeg loudnorm."""
 
     ffmpeg_path = _require_ffmpeg()
+    timeout_seconds = _resolve_ffmpeg_timeout(duration_seconds)
     command = [
         ffmpeg_path,
         "-hide_banner",
@@ -716,13 +823,21 @@ def _measure_loudness(audio_path: Path, *, target_lufs: float) -> float | None:
         "null",
         "-",
     ]
-    completed = subprocess.run(
-        command,
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=EXPORT_VERIFY_TIMEOUT_SECONDS,
-    )
+    try:
+        completed = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            "LUFS measurement timed out for %s after %s.",
+            audio_path,
+            _format_timeout_seconds(timeout_seconds),
+        )
+        return None
     payload = _parse_loudnorm_metrics("\n".join(part for part in (completed.stdout, completed.stderr) if part))
     if payload is None:
         return None
@@ -732,7 +847,7 @@ def _measure_loudness(audio_path: Path, *, target_lufs: float) -> float | None:
         return None
 
 
-def _measure_noise_floor(audio_path: Path) -> float:
+def _measure_noise_floor(audio_path: Path, duration_seconds: float | None = None) -> float | None:
     """Return the average RMS level for the quietest 10 percent of one audio file."""
 
     ffprobe_path = shutil.which("ffprobe")
@@ -753,13 +868,22 @@ def _measure_noise_floor(audio_path: Path) -> float:
         "-of",
         "json",
     ]
-    completed = subprocess.run(
-        command,
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=EXPORT_VERIFY_TIMEOUT_SECONDS,
-    )
+    timeout_seconds = _resolve_ffmpeg_timeout(duration_seconds)
+    try:
+        completed = subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            "Noise floor measurement timed out for %s after %s.",
+            audio_path,
+            _format_timeout_seconds(timeout_seconds),
+        )
+        return None
 
     try:
         payload = json.loads(completed.stdout or "{}")
@@ -795,12 +919,14 @@ def normalize_loudness(
     input_wav: Path,
     output_wav: Path,
     target_lufs: float = -19.0,
+    duration_seconds: float | None = None,
 ) -> LoudnessNormalizationResult:
     """Normalize audio and keep retrying until the measured LUFS is ACX compliant."""
 
     ffmpeg_path = _require_ffmpeg()
     measured_lufs: float | None = None
     current_target = target_lufs
+    measurement_timeout = _resolve_ffmpeg_timeout(duration_seconds)
 
     for attempt in range(1, EXPORT_LUFS_MAX_ATTEMPTS + 1):
         command = [
@@ -813,7 +939,11 @@ def normalize_loudness(
             str(output_wav),
         ]
         run_ffmpeg(command)
-        measured_lufs = _measure_loudness(output_wav, target_lufs=current_target)
+        measured_lufs = _measure_loudness(
+            output_wav,
+            target_lufs=current_target,
+            duration_seconds=duration_seconds,
+        )
         if measured_lufs is not None and -23.0 <= measured_lufs <= -18.0:
             return LoudnessNormalizationResult(
                 measured_lufs=measured_lufs,
@@ -825,7 +955,16 @@ def normalize_loudness(
             break
 
         if measured_lufs is None:
-            current_target = target_lufs
+            warning = (
+                "LUFS measurement timed out after "
+                f"{_format_timeout_seconds(measurement_timeout)}. Manual verification recommended."
+            )
+            logger.warning("%s", warning)
+            return LoudnessNormalizationResult(
+                measured_lufs=None,
+                lufs_warning=warning,
+                attempts=attempt,
+            )
         elif measured_lufs < -23.0:
             current_target = -21.0
         else:
@@ -988,7 +1127,7 @@ def export_m4b(
     )
 
 
-def _probe_media(path: Path) -> dict[str, Any]:
+def _ffprobe_metadata(path: Path) -> dict[str, Any]:
     """Return ffprobe metadata when available, falling back to pydub decode checks."""
 
     ffprobe_path = shutil.which("ffprobe")
@@ -1044,7 +1183,7 @@ def _verify_export_output(
         issues.append("file exceeds the ACX upload size limit")
 
     try:
-        probe = _probe_media(output_path)
+        probe = _ffprobe_metadata(output_path)
     except Exception as exc:
         issues.append(f"ffprobe/decode failed: {exc}")
         return {
@@ -1299,7 +1438,7 @@ def _recovery_probe_output(output_path: Path) -> str | None:
     """Return an integrity error for one recovered export output when probing fails."""
 
     try:
-        probe = _probe_media(output_path)
+        probe = _ffprobe_metadata(output_path)
     except Exception as exc:
         return f"ffprobe/decode failed during recovery: {exc}"
 
@@ -1599,6 +1738,7 @@ def _build_recovered_qa_report(
     skipped_notes: list[str] = []
     for chapter in chapters:
         qa_record = qa_records.get(chapter.number)
+        approval_decision = _chapter_approval_decision(chapter, qa_record)
         if chapter.status != ChapterStatus.GENERATED or not chapter.audio_path:
             if chapter.status != ChapterStatus.GENERATED:
                 skipped_notes.append(f"Skipped chapter {chapter.number}: audio not generated.")
@@ -1606,7 +1746,7 @@ def _build_recovered_qa_report(
         if qa_record is not None and qa_record.manual_status == QAManualStatus.FLAGGED:
             skipped_notes.append(f"Skipped chapter {chapter.number}: manually flagged during QA.")
             continue
-        if include_only_approved and not _chapter_is_approved(chapter, qa_record):
+        if include_only_approved and not approval_decision.approved:
             skipped_notes.append(f"Skipped chapter {chapter.number}: not QA approved.")
             continue
 
@@ -1619,7 +1759,9 @@ def _build_recovered_qa_report(
                 file_size_bytes=chapter.audio_file_size_bytes or 0,
                 duration_seconds=chapter.duration_seconds or 0.0,
                 qa_status=_chapter_effective_qa_status(chapter, qa_record),
-                export_approved=_chapter_is_approved(chapter, qa_record),
+                export_approved=approval_decision.approved,
+                qa_soft_pass=approval_decision.soft_pass,
+                qa_warnings=list(approval_decision.warnings),
             )
         )
 
@@ -1713,6 +1855,8 @@ def _build_qa_report(
             status=chapter.qa_status,
             file_size_bytes=chapter.file_size_bytes,
             duration_seconds=round(chapter.duration_seconds, 3),
+            qa_soft_pass=chapter.qa_soft_pass,
+            qa_warnings=list(chapter.qa_warnings),
         )
         for chapter in included_chapters
     ]
@@ -1992,10 +2136,16 @@ def export_book_sync(
         ensure_active()
         total_chapters = len(concatenation.included_chapters)
         checkpoint_artifacts["master_wav_hash"] = _file_sha256(concatenation.master_wav_path)
+        expected_duration_seconds = (
+            concatenation.chapter_markers[-1].end_ms / 1000.0
+            if concatenation.chapter_markers
+            else sum(chapter.duration_seconds for chapter in concatenation.included_chapters)
+        )
         normalization_result = normalize_loudness(
             concatenation.master_wav_path,
             temp_paths["normalized_wav"],
             target_lufs=settings.EXPORT_TARGET_LUFS,
+            duration_seconds=expected_duration_seconds,
         )
         if not isinstance(normalization_result, LoudnessNormalizationResult):
             normalization_result = LoudnessNormalizationResult(
@@ -2022,12 +2172,6 @@ def export_book_sync(
             stage="Concatenation complete",
             current_chapter_n=total_chapters or None,
             total_chapters=total_chapters or None,
-        )
-
-        expected_duration_seconds = (
-            concatenation.chapter_markers[-1].end_ms / 1000.0
-            if concatenation.chapter_markers
-            else sum(chapter.duration_seconds for chapter in concatenation.included_chapters)
         )
 
         encoded_outputs: dict[str, Path] = {}
@@ -2219,9 +2363,19 @@ def export_book_sync(
                 )
                 continue
 
-            noise_floor_dbfs = _measure_noise_floor(output_path)
-            noise_floor_compliant = noise_floor_dbfs <= -60.0
-            if not noise_floor_compliant:
+            noise_floor_dbfs = _measure_noise_floor(output_path, duration_seconds=expected_duration_seconds)
+            noise_floor_warning: str | None = None
+            noise_floor_compliant: bool | None = None
+            if noise_floor_dbfs is None:
+                noise_floor_warning = (
+                    "Noise floor measurement timed out after "
+                    f"{_format_timeout_seconds(_resolve_ffmpeg_timeout(expected_duration_seconds))}. "
+                    "Manual verification recommended."
+                )
+                logger.warning("%s", noise_floor_warning)
+            else:
+                noise_floor_compliant = noise_floor_dbfs <= -60.0
+            if noise_floor_compliant is False:
                 logger.warning("Noise floor %s dBFS exceeds ACX limit of -60 dBFS", noise_floor_dbfs)
 
             format_results[export_format] = ExportFormatResult(
@@ -2237,6 +2391,7 @@ def export_book_sync(
                 lufs_warning=normalization_result.lufs_warning,
                 noise_floor_dbfs=noise_floor_dbfs,
                 noise_floor_compliant=noise_floor_compliant,
+                noise_floor_warning=noise_floor_warning,
             )
             persist_checkpoint(
                 current_stage=_format_stage_label("Verified", export_format),
@@ -2267,7 +2422,9 @@ def export_book_sync(
                     loudness_result.message,
                 )
                 lufs_notes.append(f"{output_path.name}: {loudness_result.message}")
-            if not noise_floor_compliant:
+            if noise_floor_warning:
+                lufs_notes.append(f"{output_path.name}: {noise_floor_warning}")
+            elif noise_floor_compliant is False:
                 lufs_notes.append(
                     f"{output_path.name}: noise floor {noise_floor_dbfs:.1f} dBFS exceeds ACX limit of -60 dBFS."
                 )

@@ -198,6 +198,7 @@ class ExportRequest(BaseModel):
 
     formats: list[str] = Field(default_factory=lambda: ["mp3", "m4b"])
     include_only_approved: bool = True
+    force_export: bool = False
 
 
 class ExportQueuedResponse(BaseModel):
@@ -295,6 +296,12 @@ def _session_factory_for(db: Session) -> sessionmaker[Session]:
         autocommit=False,
         expire_on_commit=False,
     )
+
+
+def _effective_include_only_approved(request: ExportRequest | BatchExportRequest) -> bool:
+    """Return whether QA approval filtering should be enforced for this request."""
+
+    return request.include_only_approved and not getattr(request, "force_export", False)
 
 
 def _serialize_format_details(export_job: ExportJob, formats_requested: list[str]) -> dict[str, ExportFormatResult]:
@@ -440,10 +447,11 @@ def _queue_export_for_book(
 
     try:
         formats = _normalize_export_formats(request.formats)
+        include_only_approved = _effective_include_only_approved(request)
         expected_completion_seconds = estimate_export_seconds(
             book.id,
             export_formats=formats,
-            include_only_approved=request.include_only_approved,
+            include_only_approved=include_only_approved,
             session_factory=session_factory,
         )
     except ValueError as exc:
@@ -475,7 +483,7 @@ def _queue_export_for_book(
             current_format=None,
             current_chapter_n=None,
             total_chapters=None,
-            include_only_approved=request.include_only_approved,
+            include_only_approved=include_only_approved,
             created_at=started_at,
             started_at=started_at,
             completed_at=None,
@@ -495,7 +503,7 @@ def _queue_export_for_book(
         export_job.current_format = None
         export_job.current_chapter_n = None
         export_job.total_chapters = None
-        export_job.include_only_approved = request.include_only_approved
+        export_job.include_only_approved = include_only_approved
         export_job.created_at = started_at
         export_job.started_at = started_at
         export_job.completed_at = None
@@ -680,7 +688,7 @@ async def export_book_endpoint(
     ready, reason = _validate_book_export_readiness(
         book_id,
         db,
-        include_only_approved=request.include_only_approved,
+        include_only_approved=_effective_include_only_approved(request),
     )
     if not ready:
         raise HTTPException(status_code=400, detail=reason)

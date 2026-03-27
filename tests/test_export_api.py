@@ -255,7 +255,28 @@ def test_export_rejects_unapproved_book(client, test_db: Session) -> None:
 
     book = _create_book(test_db, title="Unapproved Export Book")
     _create_generated_chapter(test_db, book_id=book.id, number=1, qa_status=QAStatus.APPROVED)
-    _create_generated_chapter(test_db, book_id=book.id, number=2, qa_status=QAStatus.NOT_REVIEWED)
+    failing_chapter = _create_generated_chapter(test_db, book_id=book.id, number=2, qa_status=QAStatus.NEEDS_REVIEW)
+    test_db.add(
+        ChapterQARecord(
+            book_id=book.id,
+            chapter_n=failing_chapter.number,
+            overall_status=QAAutomaticStatus.FAIL,
+            qa_details=json.dumps(
+                {
+                    "chapter_n": failing_chapter.number,
+                    "overall_status": QAAutomaticStatus.FAIL.value,
+                    "checks": [
+                        {
+                            "name": "clipping_detection",
+                            "status": QAAutomaticStatus.FAIL.value,
+                            "message": "Clipping detected at peak 0.998.",
+                        }
+                    ],
+                }
+            ),
+        )
+    )
+    test_db.commit()
 
     response = client.post(
         f"/api/book/{book.id}/export",
@@ -267,6 +288,83 @@ def test_export_rejects_unapproved_book(client, test_db: Session) -> None:
 
     assert response.status_code == 400
     assert response.json()["detail"] == "Only 1/2 chapters approved. Approve all chapters before exporting."
+
+
+def test_export_accepts_book_without_qa_record_when_approval_required(client, test_db: Session, monkeypatch) -> None:
+    """Books without QA rows should stay exportable for backwards compatibility."""
+
+    book = _create_book(test_db, title="No QA Rows Export Book")
+    _create_generated_chapter(test_db, book_id=book.id, number=1, qa_status=QAStatus.NOT_REVIEWED)
+
+    launched_jobs: list[int] = []
+    monkeypatch.setattr(export_routes, "estimate_export_seconds", lambda *args, **kwargs: 120)
+    monkeypatch.setattr(
+        export_routes,
+        "_launch_export_job",
+        lambda export_job_id, session_factory=None: launched_jobs.append(export_job_id),
+    )
+
+    response = client.post(
+        f"/api/book/{book.id}/export",
+        json={
+            "formats": ["mp3"],
+            "include_only_approved": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert launched_jobs
+
+
+def test_export_force_export_bypasses_all_qa_checks(client, test_db: Session, monkeypatch) -> None:
+    """force_export should queue the job even when hard QA failures exist."""
+
+    book = _create_book(test_db, title="Force Export Book")
+    failing_chapter = _create_generated_chapter(test_db, book_id=book.id, number=1, qa_status=QAStatus.NEEDS_REVIEW)
+    test_db.add(
+        ChapterQARecord(
+            book_id=book.id,
+            chapter_n=failing_chapter.number,
+            overall_status=QAAutomaticStatus.FAIL,
+            qa_details=json.dumps(
+                {
+                    "chapter_n": failing_chapter.number,
+                    "overall_status": QAAutomaticStatus.FAIL.value,
+                    "checks": [
+                        {
+                            "name": "clipping_detection",
+                            "status": QAAutomaticStatus.FAIL.value,
+                            "message": "Clipping detected at peak 0.998.",
+                        }
+                    ],
+                }
+            ),
+        )
+    )
+    test_db.commit()
+
+    launched_jobs: list[int] = []
+    monkeypatch.setattr(export_routes, "estimate_export_seconds", lambda *args, **kwargs: 120)
+    monkeypatch.setattr(
+        export_routes,
+        "_launch_export_job",
+        lambda export_job_id, session_factory=None: launched_jobs.append(export_job_id),
+    )
+
+    response = client.post(
+        f"/api/book/{book.id}/export",
+        json={
+            "formats": ["mp3"],
+            "include_only_approved": True,
+            "force_export": True,
+        },
+    )
+
+    export_job = test_db.query(ExportJob).filter(ExportJob.book_id == book.id).one()
+
+    assert response.status_code == 200
+    assert launched_jobs == [export_job.id]
+    assert export_job.include_only_approved is False
 
 
 def test_export_accepts_warning_chapter_when_ready_for_export(client, test_db: Session, monkeypatch) -> None:

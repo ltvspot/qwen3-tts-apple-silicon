@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import threading
 from pathlib import Path
+from typing import Any
 
 import pytest
 from pydub import AudioSegment
@@ -37,9 +38,12 @@ from src.pipeline.exporter import (
     QAChapterSummary,
     QAReport,
     SelectedChapter,
+    _chapter_is_approved,
     _build_export_paths,
+    _ffmpeg_timeout,
     _file_sha256,
     _load_export_state_payload,
+    _measure_loudness,
     _measure_noise_floor,
     _persist_export_checkpoint,
     _verify_checksum,
@@ -129,6 +133,7 @@ def _store_qa_record(
     *,
     overall_status: QAAutomaticStatus,
     manual_status: QAManualStatus | None = None,
+    qa_details: dict[str, Any] | None = None,
 ) -> None:
     """Persist the QA state consumed by the exporter."""
 
@@ -137,11 +142,27 @@ def _store_qa_record(
             book_id=chapter.book_id,
             chapter_n=chapter.number,
             overall_status=overall_status,
-            qa_details=json.dumps({"chapter_n": chapter.number, "overall_status": overall_status.value}),
+            qa_details=json.dumps(
+                qa_details
+                or {
+                    "chapter_n": chapter.number,
+                    "overall_status": overall_status.value,
+                }
+            ),
             manual_status=manual_status,
         )
     )
     test_db.commit()
+
+
+def _qa_check(name: str, status: str, message: str) -> dict[str, str]:
+    """Return one serialized QA check for exporter tests."""
+
+    return {
+        "name": name,
+        "status": status,
+        "message": message,
+    }
 
 
 def test_concatenate_chapters_sync_inserts_expected_silence_and_skips_flagged(test_db: Session) -> None:
@@ -751,6 +772,498 @@ def test_measure_noise_floor_returns_quietest_ten_percent_average(
     assert _measure_noise_floor(audio_path) == -90.0
 
 
+def test_ffmpeg_timeout_scales_for_long_audio() -> None:
+    """Long exports should receive a duration-aware ffmpeg timeout."""
+
+    assert _ffmpeg_timeout(4440) == 2220
+
+
+def test_ffmpeg_timeout_enforces_minimum_for_short_audio() -> None:
+    """Short exports should still get the minimum timeout."""
+
+    assert _ffmpeg_timeout(10) == 60
+
+
+def test_ffmpeg_timeout_enforces_minimum_for_zero_duration() -> None:
+    """Zero-duration inputs should not collapse the timeout to zero."""
+
+    assert _ffmpeg_timeout(0) == 60
+
+
+def test_measure_loudness_short_wav_completes_without_timeout(tmp_path: Path) -> None:
+    """A short WAV should be measurable with the scaled loudness timeout."""
+
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("ffmpeg unavailable")
+
+    audio_path = tmp_path / "short.wav"
+    _write_wav(audio_path, duration_ms=500, frequency=220)
+
+    measured = _measure_loudness(audio_path, target_lufs=-19.0, duration_seconds=0.5)
+
+    assert measured is not None
+
+
+def test_measure_noise_floor_short_wav_completes_without_timeout(tmp_path: Path) -> None:
+    """A short WAV should complete the noise-floor probe without timing out."""
+
+    audio_path = tmp_path / "short.wav"
+    _write_wav(audio_path, duration_ms=500, frequency=220)
+
+    measured = _measure_noise_floor(audio_path, duration_seconds=0.5)
+
+    assert measured is not None
+
+
+def test_measure_loudness_returns_none_on_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """LUFS measurement should degrade to None when ffmpeg times out."""
+
+    audio_path = tmp_path / "timeout.wav"
+    audio_path.write_bytes(b"wav")
+
+    monkeypatch.setattr("src.pipeline.exporter._require_ffmpeg", lambda: "ffmpeg")
+
+    def raise_timeout(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(cmd=["ffmpeg"], timeout=120)
+
+    monkeypatch.setattr("src.pipeline.exporter.subprocess.run", raise_timeout)
+
+    assert _measure_loudness(audio_path, target_lufs=-19.0, duration_seconds=240.0) is None
+
+
+def test_measure_noise_floor_returns_none_on_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Noise-floor measurement should degrade to None when ffprobe times out."""
+
+    audio_path = tmp_path / "timeout.wav"
+    audio_path.write_bytes(b"wav")
+
+    monkeypatch.setattr("src.pipeline.exporter.shutil.which", lambda name: "/usr/bin/ffprobe" if name == "ffprobe" else None)
+
+    def raise_timeout(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(cmd=["ffprobe"], timeout=120)
+
+    monkeypatch.setattr("src.pipeline.exporter.subprocess.run", raise_timeout)
+
+    assert _measure_noise_floor(audio_path, duration_seconds=240.0) is None
+
+
+def test_chapter_is_approved_soft_pass_for_pacing_failure(test_db: Session) -> None:
+    """Soft-fail categories should remain eligible for approval-only export."""
+
+    book = _create_book(test_db, title="Soft Pass Pacing")
+    chapter = _create_chapter(
+        test_db,
+        book=book,
+        number=1,
+        title="Chapter One",
+        chapter_type=ChapterType.CHAPTER,
+        duration_ms=500,
+        frequency=330,
+        qa_status=QAStatus.NEEDS_REVIEW,
+    )
+    _store_qa_record(
+        test_db,
+        chapter,
+        overall_status=QAAutomaticStatus.FAIL,
+        qa_details={
+            "chapter_n": chapter.number,
+            "overall_status": QAAutomaticStatus.FAIL.value,
+            "checks": [
+                _qa_check(
+                    "pacing_detailed",
+                    QAAutomaticStatus.FAIL.value,
+                    "Major pacing inconsistency detected in 2 windows.",
+                )
+            ],
+        },
+    )
+    qa_record = test_db.query(ChapterQARecord).filter(ChapterQARecord.book_id == book.id).one()
+
+    assert _chapter_is_approved(chapter, qa_record) is True
+
+
+def test_chapter_is_approved_blocks_clipping_failure(test_db: Session) -> None:
+    """Hard-fail clipping must still block approval-only export."""
+
+    book = _create_book(test_db, title="Hard Fail Clipping")
+    chapter = _create_chapter(
+        test_db,
+        book=book,
+        number=1,
+        title="Chapter One",
+        chapter_type=ChapterType.CHAPTER,
+        duration_ms=500,
+        frequency=330,
+        qa_status=QAStatus.NEEDS_REVIEW,
+    )
+    _store_qa_record(
+        test_db,
+        chapter,
+        overall_status=QAAutomaticStatus.FAIL,
+        qa_details={
+            "chapter_n": chapter.number,
+            "overall_status": QAAutomaticStatus.FAIL.value,
+            "checks": [
+                _qa_check(
+                    "clipping_detection",
+                    QAAutomaticStatus.FAIL.value,
+                    "Clipping detected at peak 0.998.",
+                )
+            ],
+        },
+    )
+    qa_record = test_db.query(ChapterQARecord).filter(ChapterQARecord.book_id == book.id).one()
+
+    assert _chapter_is_approved(chapter, qa_record) is False
+
+
+def test_chapter_is_approved_blocks_mixed_soft_and_hard_failures(test_db: Session) -> None:
+    """Hard failures must win when mixed with soft-pass categories."""
+
+    book = _create_book(test_db, title="Mixed Failures")
+    chapter = _create_chapter(
+        test_db,
+        book=book,
+        number=1,
+        title="Chapter One",
+        chapter_type=ChapterType.CHAPTER,
+        duration_ms=500,
+        frequency=330,
+        qa_status=QAStatus.NEEDS_REVIEW,
+    )
+    _store_qa_record(
+        test_db,
+        chapter,
+        overall_status=QAAutomaticStatus.FAIL,
+        qa_details={
+            "chapter_n": chapter.number,
+            "overall_status": QAAutomaticStatus.FAIL.value,
+            "checks": [
+                _qa_check(
+                    "pacing_detailed",
+                    QAAutomaticStatus.FAIL.value,
+                    "Major pacing inconsistency detected in 2 windows.",
+                ),
+                _qa_check(
+                    "clipping_detection",
+                    QAAutomaticStatus.FAIL.value,
+                    "Clipping detected at peak 0.998.",
+                ),
+            ],
+        },
+    )
+    qa_record = test_db.query(ChapterQARecord).filter(ChapterQARecord.book_id == book.id).one()
+
+    assert _chapter_is_approved(chapter, qa_record) is False
+
+
+def test_chapter_is_approved_without_qa_record_is_backwards_compatible(test_db: Session) -> None:
+    """Missing QA rows should not block approval-only export."""
+
+    book = _create_book(test_db, title="No QA Record")
+    chapter = _create_chapter(
+        test_db,
+        book=book,
+        number=1,
+        title="Chapter One",
+        chapter_type=ChapterType.CHAPTER,
+        duration_ms=500,
+        frequency=330,
+        qa_status=QAStatus.NOT_REVIEWED,
+    )
+
+    assert _chapter_is_approved(chapter, None) is True
+
+
+def test_export_book_sync_persists_soft_pass_metadata_in_export_state(
+    test_db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Soft-passed chapters should be annotated in the persisted export state."""
+
+    monkeypatch.setattr(settings, "EXPORT_INCLUDE_ALBUM_ART", False)
+    book = _create_book(test_db, title="Soft Pass State")
+    chapter = _create_chapter(
+        test_db,
+        book=book,
+        number=1,
+        title="Chapter One",
+        chapter_type=ChapterType.CHAPTER,
+        duration_ms=500,
+        frequency=330,
+        qa_status=QAStatus.NEEDS_REVIEW,
+    )
+    _store_qa_record(
+        test_db,
+        chapter,
+        overall_status=QAAutomaticStatus.FAIL,
+        qa_details={
+            "chapter_n": chapter.number,
+            "overall_status": QAAutomaticStatus.FAIL.value,
+            "checks": [
+                _qa_check(
+                    "pacing_detailed",
+                    QAAutomaticStatus.FAIL.value,
+                    "Major pacing inconsistency detected in 2 windows.",
+                )
+            ],
+        },
+    )
+
+    monkeypatch.setattr(
+        "src.pipeline.exporter.BookMasteringPipeline.master_book_sync",
+        lambda *args, **kwargs: MasteringReport(
+            book_id=book.id,
+            mastered_chapters=1,
+            loudness_adjustments=[],
+            edge_normalized_chapters=[],
+            peak_limited_chapters=[],
+            notes=[],
+            blockers=[],
+            book_report=BookQAReport(
+                book_id=book.id,
+                title=book.title,
+                total_chapters=1,
+                chapters_grade_a=0,
+                chapters_grade_b=1,
+                chapters_grade_c=0,
+                chapters_grade_f=0,
+                overall_grade="B",
+                ready_for_export=True,
+                cross_chapter_checks={},
+                recommendations=[],
+                export_blockers=[],
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        "src.pipeline.exporter.normalize_loudness",
+        lambda _input_path, output_path, target_lufs, duration_seconds=None: (
+            output_path.write_bytes(f"{target_lufs}".encode()),
+            LoudnessNormalizationResult(measured_lufs=-20.0, lufs_warning=None, attempts=1),
+        )[1],
+    )
+    monkeypatch.setattr(
+        "src.pipeline.exporter.export_mp3",
+        lambda _input_path, output_path, **kwargs: (
+            output_path.write_bytes(b"mp3"),
+            EncodedExportArtifact(file_size_bytes=3, sha256="mp3hash"),
+        )[1],
+    )
+    monkeypatch.setattr(
+        "src.pipeline.exporter._verify_export_output",
+        lambda *_args, **_kwargs: {"ok": True, "issues": []},
+    )
+    monkeypatch.setattr(
+        "src.pipeline.exporter.check_lufs_compliance",
+        lambda _audio_path: type("PassResult", (), {"status": QAAutomaticStatus.PASS.value, "message": "ok"})(),
+    )
+    monkeypatch.setattr("src.pipeline.exporter._measure_noise_floor", lambda _audio_path, duration_seconds=None: -65.2)
+
+    result = export_book_sync(
+        book.id,
+        export_formats=["mp3"],
+        include_only_approved=True,
+        session_factory=sessionmaker(
+            bind=test_db.get_bind(),
+            autoflush=False,
+            autocommit=False,
+            expire_on_commit=False,
+        ),
+    )
+
+    state_payload = _load_export_state_payload(book)
+    chapter_summary = state_payload["qa_report"]["chapter_summary"][0]
+
+    assert result.export_status == BookExportStatus.COMPLETED.value
+    assert chapter_summary["qa_soft_pass"] is True
+    assert chapter_summary["qa_warnings"] == [
+        "pacing_detailed: Major pacing inconsistency detected in 2 windows."
+    ]
+
+
+def test_export_book_sync_sets_lufs_warning_when_measurement_times_out(
+    test_db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A loudness timeout should not fail export completion."""
+
+    monkeypatch.setattr(settings, "EXPORT_INCLUDE_ALBUM_ART", False)
+    book = _create_book(test_db, title="LUFS Timeout Export")
+    chapter = _create_chapter(
+        test_db,
+        book=book,
+        number=1,
+        title="Chapter One",
+        chapter_type=ChapterType.CHAPTER,
+        duration_ms=500,
+        frequency=330,
+    )
+    _store_qa_record(test_db, chapter, overall_status=QAAutomaticStatus.PASS)
+
+    monkeypatch.setattr(
+        "src.pipeline.exporter.BookMasteringPipeline.master_book_sync",
+        lambda *args, **kwargs: MasteringReport(
+            book_id=book.id,
+            mastered_chapters=1,
+            loudness_adjustments=[],
+            edge_normalized_chapters=[],
+            peak_limited_chapters=[],
+            notes=[],
+            blockers=[],
+            book_report=BookQAReport(
+                book_id=book.id,
+                title=book.title,
+                total_chapters=1,
+                chapters_grade_a=1,
+                chapters_grade_b=0,
+                chapters_grade_c=0,
+                chapters_grade_f=0,
+                overall_grade="A",
+                ready_for_export=True,
+                cross_chapter_checks={},
+                recommendations=[],
+                export_blockers=[],
+            ),
+        ),
+    )
+    monkeypatch.setattr("src.pipeline.exporter.measure_integrated_lufs", lambda _audio_path: -20.0)
+    monkeypatch.setattr("src.pipeline.exporter._require_ffmpeg", lambda: "ffmpeg")
+    monkeypatch.setattr(
+        "src.pipeline.exporter.run_ffmpeg",
+        lambda command: Path(command[-1]).write_bytes(b"normalized"),
+    )
+
+    def raise_timeout(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(cmd=["ffmpeg"], timeout=120)
+
+    monkeypatch.setattr("src.pipeline.exporter.subprocess.run", raise_timeout)
+    monkeypatch.setattr(
+        "src.pipeline.exporter.export_mp3",
+        lambda _input_path, output_path, **kwargs: (
+            output_path.write_bytes(b"mp3"),
+            EncodedExportArtifact(file_size_bytes=3, sha256="mp3hash"),
+        )[1],
+    )
+    monkeypatch.setattr(
+        "src.pipeline.exporter._verify_export_output",
+        lambda *_args, **_kwargs: {"ok": True, "issues": []},
+    )
+    monkeypatch.setattr(
+        "src.pipeline.exporter.check_lufs_compliance",
+        lambda _audio_path: type("PassResult", (), {"status": QAAutomaticStatus.PASS.value, "message": "ok"})(),
+    )
+    monkeypatch.setattr("src.pipeline.exporter._measure_noise_floor", lambda _audio_path, duration_seconds=None: -65.2)
+
+    result = export_book_sync(
+        book.id,
+        export_formats=["mp3"],
+        session_factory=sessionmaker(
+            bind=test_db.get_bind(),
+            autoflush=False,
+            autocommit=False,
+            expire_on_commit=False,
+        ),
+    )
+
+    assert result.export_status == BookExportStatus.COMPLETED.value
+    assert result.formats["mp3"].measured_lufs is None
+    assert result.formats["mp3"].lufs_warning is not None
+    assert "timed out" in result.formats["mp3"].lufs_warning.lower()
+
+
+def test_export_book_sync_sets_noise_floor_warning_when_measurement_times_out(
+    test_db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A noise-floor timeout should set warning metadata instead of failing export."""
+
+    monkeypatch.setattr(settings, "EXPORT_INCLUDE_ALBUM_ART", False)
+    book = _create_book(test_db, title="Noise Timeout Export")
+    chapter = _create_chapter(
+        test_db,
+        book=book,
+        number=1,
+        title="Chapter One",
+        chapter_type=ChapterType.CHAPTER,
+        duration_ms=500,
+        frequency=330,
+    )
+    _store_qa_record(test_db, chapter, overall_status=QAAutomaticStatus.PASS)
+
+    monkeypatch.setattr(
+        "src.pipeline.exporter.BookMasteringPipeline.master_book_sync",
+        lambda *args, **kwargs: MasteringReport(
+            book_id=book.id,
+            mastered_chapters=1,
+            loudness_adjustments=[],
+            edge_normalized_chapters=[],
+            peak_limited_chapters=[],
+            notes=[],
+            blockers=[],
+            book_report=BookQAReport(
+                book_id=book.id,
+                title=book.title,
+                total_chapters=1,
+                chapters_grade_a=1,
+                chapters_grade_b=0,
+                chapters_grade_c=0,
+                chapters_grade_f=0,
+                overall_grade="A",
+                ready_for_export=True,
+                cross_chapter_checks={},
+                recommendations=[],
+                export_blockers=[],
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        "src.pipeline.exporter.normalize_loudness",
+        lambda _input_path, output_path, target_lufs, duration_seconds=None: (
+            output_path.write_bytes(f"{target_lufs}".encode()),
+            LoudnessNormalizationResult(measured_lufs=-19.9, lufs_warning=None, attempts=1),
+        )[1],
+    )
+    monkeypatch.setattr(
+        "src.pipeline.exporter.export_mp3",
+        lambda _input_path, output_path, **kwargs: (
+            output_path.write_bytes(b"mp3"),
+            EncodedExportArtifact(file_size_bytes=3, sha256="mp3hash"),
+        )[1],
+    )
+    monkeypatch.setattr(
+        "src.pipeline.exporter._verify_export_output",
+        lambda *_args, **_kwargs: {"ok": True, "issues": []},
+    )
+    monkeypatch.setattr(
+        "src.pipeline.exporter.check_lufs_compliance",
+        lambda _audio_path: type("PassResult", (), {"status": QAAutomaticStatus.PASS.value, "message": "ok"})(),
+    )
+    monkeypatch.setattr("src.pipeline.exporter._measure_noise_floor", lambda _audio_path, duration_seconds=None: None)
+
+    result = export_book_sync(
+        book.id,
+        export_formats=["mp3"],
+        session_factory=sessionmaker(
+            bind=test_db.get_bind(),
+            autoflush=False,
+            autocommit=False,
+            expire_on_commit=False,
+        ),
+    )
+
+    assert result.export_status == BookExportStatus.COMPLETED.value
+    assert result.formats["mp3"].noise_floor_compliant is None
+    assert result.formats["mp3"].noise_floor_warning is not None
+    assert "timed out" in result.formats["mp3"].noise_floor_warning.lower()
+
+
 def test_export_book_sync_reports_mastering_and_qa_progress_ranges(
     test_db: Session,
     monkeypatch: pytest.MonkeyPatch,
@@ -864,7 +1377,7 @@ def test_export_book_sync_reports_mastering_and_qa_progress_ranges(
     monkeypatch.setattr("src.pipeline.exporter.concatenate_chapters_sync", fake_concatenate)
     monkeypatch.setattr(
         "src.pipeline.exporter.normalize_loudness",
-        lambda _input_path, output_path, target_lufs: (
+        lambda _input_path, output_path, target_lufs, duration_seconds=None: (
             output_path.write_bytes(f"{target_lufs}".encode()),
             LoudnessNormalizationResult(measured_lufs=-20.0, lufs_warning=None, attempts=1),
         )[1],
@@ -900,7 +1413,7 @@ def test_export_book_sync_reports_mastering_and_qa_progress_ranges(
             overall_status=QAAutomaticStatus.PASS.value,
         ).checks or type("PassResult", (), {"status": QAAutomaticStatus.PASS.value, "message": "ok"})(),
     )
-    monkeypatch.setattr("src.pipeline.exporter._measure_noise_floor", lambda _audio_path: -65.2)
+    monkeypatch.setattr("src.pipeline.exporter._measure_noise_floor", lambda _audio_path, duration_seconds=None: -65.2)
 
     progress_events: list[tuple[float, str | None, str | None]] = []
     result = export_book_sync(
@@ -977,7 +1490,7 @@ def test_export_book_sync_records_noise_floor_warning_metadata(
     )
     monkeypatch.setattr(
         "src.pipeline.exporter.normalize_loudness",
-        lambda _input_path, output_path, target_lufs: (
+        lambda _input_path, output_path, target_lufs, duration_seconds=None: (
             output_path.write_bytes(f"{target_lufs}".encode()),
             LoudnessNormalizationResult(measured_lufs=-19.9, lufs_warning=None, attempts=1),
         )[1],
@@ -997,7 +1510,7 @@ def test_export_book_sync_records_noise_floor_warning_metadata(
         "src.pipeline.exporter.check_lufs_compliance",
         lambda _audio_path: type("PassResult", (), {"status": QAAutomaticStatus.PASS.value, "message": "ok"})(),
     )
-    monkeypatch.setattr("src.pipeline.exporter._measure_noise_floor", lambda _audio_path: -55.2)
+    monkeypatch.setattr("src.pipeline.exporter._measure_noise_floor", lambda _audio_path, duration_seconds=None: -55.2)
 
     result = export_book_sync(book.id, export_formats=["mp3"], session_factory=sessionmaker(
         bind=test_db.get_bind(),
@@ -1058,7 +1571,7 @@ def test_export_book_sync_records_noise_floor_compliance_metadata(
     )
     monkeypatch.setattr(
         "src.pipeline.exporter.normalize_loudness",
-        lambda _input_path, output_path, target_lufs: (
+        lambda _input_path, output_path, target_lufs, duration_seconds=None: (
             output_path.write_bytes(f"{target_lufs}".encode()),
             LoudnessNormalizationResult(measured_lufs=-20.2, lufs_warning="still close", attempts=3),
         )[1],
@@ -1078,7 +1591,7 @@ def test_export_book_sync_records_noise_floor_compliance_metadata(
         "src.pipeline.exporter.check_lufs_compliance",
         lambda _audio_path: type("PassResult", (), {"status": QAAutomaticStatus.PASS.value, "message": "ok"})(),
     )
-    monkeypatch.setattr("src.pipeline.exporter._measure_noise_floor", lambda _audio_path: -65.2)
+    monkeypatch.setattr("src.pipeline.exporter._measure_noise_floor", lambda _audio_path, duration_seconds=None: -65.2)
 
     result = export_book_sync(book.id, export_formats=["mp3"], session_factory=sessionmaker(
         bind=test_db.get_bind(),
@@ -1175,7 +1688,8 @@ def test_concurrent_exports_use_unique_temporary_paths(
             qa_records={},
         )
 
-    def fake_normalize(_input_path, output_path, target_lufs) -> LoudnessNormalizationResult:
+    def fake_normalize(_input_path, output_path, target_lufs, duration_seconds=None) -> LoudnessNormalizationResult:
+        del duration_seconds
         output_path.write_bytes(f"{target_lufs}".encode())
         with lock:
             temp_normalized_paths.append(str(output_path))
@@ -1198,7 +1712,7 @@ def test_concurrent_exports_use_unique_temporary_paths(
         "src.pipeline.exporter.check_lufs_compliance",
         lambda _audio_path: type("PassResult", (), {"status": QAAutomaticStatus.PASS.value, "message": "ok"})(),
     )
-    monkeypatch.setattr("src.pipeline.exporter._measure_noise_floor", lambda _audio_path: -65.0)
+    monkeypatch.setattr("src.pipeline.exporter._measure_noise_floor", lambda _audio_path, duration_seconds=None: -65.0)
 
     failures: list[BaseException] = []
 
