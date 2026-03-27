@@ -896,7 +896,7 @@ describe("BookDetail page", () => {
 
     const emotionInput = container.querySelector("#emotion-input");
     expect(emotionInput.value).toBe("dramatic");
-    expect(container.textContent).toContain("0.95x playback");
+    expect(container.textContent).toContain("0.95x");
 
     await act(async () => {
       getButtonByText("Edit Chapter").dispatchEvent(
@@ -939,6 +939,31 @@ describe("BookDetail page", () => {
     expect(voiceSelect.value).toBe("kent-zimering");
   });
 
+  test("shows the current speed value beside the speed slider and updates it live", async () => {
+    const book = createBook({});
+    const chapters = [createChapter({})];
+
+    fetchMock
+      .mockResolvedValueOnce(createJsonResponse(book))
+      .mockResolvedValueOnce(createJsonResponse(chapters))
+      .mockResolvedValueOnce(createJsonResponse(createStatusSnapshot()))
+      .mockResolvedValueOnce(createJsonResponse(createExportSnapshot()))
+      .mockResolvedValueOnce(createJsonResponse(createVoiceListPayload()));
+
+    await renderBookDetail();
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("1.0x");
+    });
+
+    const speedRange = container.querySelector("#speed-range");
+    await act(async () => {
+      setFormValue(speedRange, "1.15", "change");
+    });
+
+    expect(container.textContent).toContain("1.15x");
+  });
+
   test("renders a not-found state when the book record is missing", async () => {
     fetchMock.mockResolvedValueOnce(
       createJsonResponse(
@@ -963,7 +988,7 @@ describe("BookDetail page", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  test("queues generate all after confirmation", async () => {
+  test("renders a styled generate-all confirmation modal instead of using window.confirm", async () => {
     const book = createBook({});
     const chapters = [
       createChapter({}),
@@ -1006,15 +1031,28 @@ describe("BookDetail page", () => {
     });
 
     await waitFor(() => {
+      expect(container.textContent).toContain("Generate All Chapters");
+      expect(container.textContent).toContain(
+        "This will generate audio for all remaining 2 chapters. This may take a while.",
+      );
+    });
+
+    expect(window.confirm).not.toHaveBeenCalledWith(
+      "This will generate all remaining chapters. Continue?",
+    );
+
+    await act(async () => {
+      getButtonByText("Start Generation").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+    });
+
+    await waitFor(() => {
       expect(fetchMock).toHaveBeenCalledWith(
         "/api/book/7/generate-all",
         expect.objectContaining({ method: "POST" }),
       );
     });
-
-    expect(window.confirm).toHaveBeenCalledWith(
-      "This will generate all remaining chapters. Continue?",
-    );
   });
 
   test("starts an export and renders completed download cards", async () => {
@@ -1122,6 +1160,10 @@ describe("BookDetail page", () => {
 
     await waitFor(() => {
       expect(container.textContent).toContain("Include M4B");
+      expect(container.textContent).toContain("Skip flagged chapters");
+      expect(container.textContent).toContain(
+        "Will export 1 of 1 chapters (4m estimated)",
+      );
     });
 
     await act(async () => {
@@ -1450,7 +1492,7 @@ describe("BookDetail page", () => {
     });
   });
 
-  test("runs book QA on demand and renders the Gate 3 overview", async () => {
+  test("runs book QA on demand and renders the book quality review without Gate 3 jargon", async () => {
     const book = createBook({ status: "generated" });
     const chapters = [
       createChapter({
@@ -1498,13 +1540,14 @@ describe("BookDetail page", () => {
     });
 
     await waitFor(() => {
-      expect(container.textContent).toContain("Gate 3 Overview");
+      expect(container.textContent).toContain("Book Quality Review");
       expect(container.textContent).toContain("Grade A");
       expect(container.textContent).toContain("Ready for Export");
       expect(container.textContent).toContain("Voice Consistency Chart");
       expect(container.textContent).toContain(
         "All chapters within ACX loudness range.",
       );
+      expect(container.textContent).not.toContain("Gate 3");
     });
 
     expect(fetchMock).toHaveBeenCalledWith("/api/book/7/qa/book-report");
@@ -1564,7 +1607,9 @@ describe("BookDetail page", () => {
       expect(container.textContent).toContain("97.1 Avg");
       expect(container.textContent).toContain("Chapters Analyzed");
       expect(container.textContent).toContain("Chapter Scores");
-      expect(container.textContent).toContain("TX 100.0");
+      expect(container.textContent).toContain("Transcription");
+      expect(container.textContent).toContain("Timing");
+      expect(container.textContent).toContain("Quality");
     });
 
     expect(fetchMock).toHaveBeenCalledWith("/api/books/7/deep-qa", {

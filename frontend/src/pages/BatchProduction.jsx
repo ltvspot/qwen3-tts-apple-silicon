@@ -9,11 +9,54 @@ async function parseResponse(response, fallbackMessage) {
   return response.json();
 }
 
-function formatEta(value) {
+function formatEtaTimestamp(value) {
   if (!value) {
-    return "Pending";
+    return null;
   }
-  return new Date(value).toLocaleString();
+
+  const parsedDate = new Date(value);
+  if (Number.isNaN(parsedDate.getTime())) {
+    return null;
+  }
+
+  return parsedDate.toLocaleString();
+}
+
+function resolveEtaSeconds(batch) {
+  if (typeof batch?.estimatedTimeRemainingSeconds === "number") {
+    return Math.max(0, batch.estimatedTimeRemainingSeconds);
+  }
+
+  if (!batch?.estimated_completion) {
+    return null;
+  }
+
+  const etaTimestamp = new Date(batch.estimated_completion).getTime();
+  if (Number.isNaN(etaTimestamp)) {
+    return null;
+  }
+
+  return Math.max(0, Math.round((etaTimestamp - Date.now()) / 1000));
+}
+
+function formatRelativeEta(seconds) {
+  if (seconds === null || seconds === undefined || Number.isNaN(seconds)) {
+    return "ETA pending";
+  }
+
+  const totalMinutes = Math.max(1, Math.round(seconds / 60));
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+
+  if (hours > 0 && minutes > 0) {
+    return `~${hours}h ${minutes}m remaining`;
+  }
+
+  if (hours > 0) {
+    return `~${hours}h remaining`;
+  }
+
+  return `~${totalMinutes}m remaining`;
 }
 
 export default function BatchProduction() {
@@ -23,6 +66,8 @@ export default function BatchProduction() {
   const [loadingAction, setLoadingAction] = useState(false);
   const [modelStatus, setModelStatus] = useState(null);
   const [resources, setResources] = useState(null);
+  const etaSeconds = resolveEtaSeconds(batch);
+  const etaTimestampLabel = formatEtaTimestamp(batch?.estimated_completion);
 
   function toneClass(status) {
     if (status === "critical") {
@@ -154,51 +199,68 @@ export default function BatchProduction() {
               <p className="mt-2 text-sm text-slate-600">
                 Current book: {batch?.current_book_title ?? "Waiting for a new run."}
               </p>
-              <p className="mt-1 text-sm text-slate-500">
-                ETA: {formatEta(batch?.estimated_completion)}
-              </p>
+              {batch?.current_book_title ? (
+                <div className="mt-3 inline-flex items-center rounded-full border border-sky-200 bg-sky-50 px-3 py-1 text-xs font-semibold uppercase tracking-[0.18em] text-sky-700">
+                  ▶ Currently processing {batch.current_book_title}
+                </div>
+              ) : null}
+              <div className="mt-3">
+                <div className="text-sm font-semibold text-slate-800">
+                  ETA: {formatRelativeEta(etaSeconds)}
+                </div>
+                <div className="mt-1 text-xs text-slate-500">
+                  {etaTimestampLabel ?? "Completion time will appear after the batch settles into a steady pace."}
+                </div>
+              </div>
             </div>
-            <div className="flex flex-wrap gap-3">
-              <button
-                className="rounded-full bg-slate-950 px-5 py-3 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-300"
-                disabled={loadingAction}
-                onClick={() => {
-                  void performAction("start");
-                }}
-                type="button"
-              >
-                Start Batch
-              </button>
-              <button
-                className="rounded-full border border-slate-300 px-5 py-3 text-sm font-semibold text-slate-700 transition hover:border-slate-950 hover:text-slate-950 disabled:cursor-not-allowed disabled:opacity-50"
-                disabled={loadingAction || !batch?.batch_id || batch?.status !== "running"}
-                onClick={() => {
-                  void performAction("pause");
-                }}
-                type="button"
-              >
-                Pause
-              </button>
-              <button
-                className="rounded-full border border-slate-300 px-5 py-3 text-sm font-semibold text-slate-700 transition hover:border-slate-950 hover:text-slate-950 disabled:cursor-not-allowed disabled:opacity-50"
-                disabled={loadingAction || !batch?.batch_id || batch?.status !== "paused"}
-                onClick={() => {
-                  void performAction("resume");
-                }}
-                type="button"
-              >
-                Resume
-              </button>
-              <button
-                className="rounded-full border border-rose-300 px-5 py-3 text-sm font-semibold text-rose-700 transition hover:border-rose-500 hover:text-rose-800 disabled:cursor-not-allowed disabled:opacity-50"
-                disabled={loadingAction || !batch?.batch_id}
-                onClick={() => {
-                  void performAction("cancel");
-                }}
-                type="button"
-              >
-                Cancel
-              </button>
+            <div className="flex flex-col gap-3 lg:items-end">
+              <div className="flex flex-wrap gap-3">
+                <button
+                  className="rounded-full bg-slate-950 px-5 py-3 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-300"
+                  disabled={loadingAction}
+                  onClick={() => {
+                    void performAction("start");
+                  }}
+                  type="button"
+                >
+                  Start Batch
+                </button>
+                <button
+                  className="rounded-full border border-slate-300 px-5 py-3 text-sm font-semibold text-slate-700 transition hover:border-slate-950 hover:text-slate-950 disabled:cursor-not-allowed disabled:opacity-50"
+                  disabled={loadingAction || !batch?.batch_id || batch?.status !== "running"}
+                  onClick={() => {
+                    void performAction("pause");
+                  }}
+                  type="button"
+                >
+                  Pause
+                </button>
+                <button
+                  className="rounded-full border border-slate-300 px-5 py-3 text-sm font-semibold text-slate-700 transition hover:border-slate-950 hover:text-slate-950 disabled:cursor-not-allowed disabled:opacity-50"
+                  disabled={loadingAction || !batch?.batch_id || batch?.status !== "paused"}
+                  onClick={() => {
+                    void performAction("resume");
+                  }}
+                  type="button"
+                >
+                  Resume
+                </button>
+                <button
+                  className="rounded-full border border-rose-300 px-5 py-3 text-sm font-semibold text-rose-700 transition hover:border-rose-500 hover:text-rose-800 disabled:cursor-not-allowed disabled:opacity-50"
+                  disabled={loadingAction || !batch?.batch_id}
+                  onClick={() => {
+                    void performAction("cancel");
+                  }}
+                  type="button"
+                >
+                  Cancel
+                </button>
+              </div>
+              {!batch?.batch_id ? (
+                <div className="max-w-sm text-sm text-slate-500">
+                  Generates audio for all unparsed and unfinished books in the catalog sequentially.
+                </div>
+              ) : null}
             </div>
           </div>
 
@@ -262,12 +324,23 @@ export default function BatchProduction() {
               </div>
             ) : (batch?.book_results ?? []).map((book) => (
               <div
-                className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-4"
+                className={`rounded-2xl border px-4 py-4 ${
+                  book.book_id === batch?.current_book_id ||
+                  (batch?.current_book_title && book.title === batch.current_book_title)
+                    ? "border-sky-200 bg-sky-50"
+                    : "border-slate-200 bg-slate-50"
+                }`}
                 key={`${book.book_id}-${book.title}`}
               >
                 <div className="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
                   <div>
                     <div className="text-sm font-semibold text-slate-950">{book.title}</div>
+                    {book.book_id === batch?.current_book_id ||
+                    (batch?.current_book_title && book.title === batch.current_book_title) ? (
+                      <div className="mt-1 text-xs font-semibold uppercase tracking-[0.18em] text-sky-700">
+                        ▶ Currently processing
+                      </div>
+                    ) : null}
                     <div className="mt-1 text-sm text-slate-600">
                       Status: {book.status}
                       {book.qa_average_score !== null && book.qa_average_score !== undefined

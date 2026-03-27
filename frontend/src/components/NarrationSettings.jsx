@@ -33,6 +33,20 @@ const NARRATOR_PRESETS = [
   },
 ];
 
+function formatSpeedValue(value) {
+  const normalized = Number.parseFloat(value).toFixed(2);
+
+  if (normalized.endsWith("00")) {
+    return `${Number.parseFloat(value).toFixed(1)}x`;
+  }
+
+  if (normalized.endsWith("0")) {
+    return `${normalized.slice(0, -1)}x`;
+  }
+
+  return `${normalized}x`;
+}
+
 function getChapterSummary(selectedChapter) {
   if (!selectedChapter) {
     return "No chapter selected";
@@ -198,12 +212,15 @@ export default function NarrationSettings({
         </div>
 
         <div>
-          <label className="block text-sm font-semibold text-white" htmlFor="speed-range">
-            Speed
+          <label
+            className="flex items-center justify-between gap-3 text-sm font-semibold text-white"
+            htmlFor="speed-range"
+          >
+            <span>Speed</span>
+            <span aria-live="polite" className="text-amber-100">
+              {formatSpeedValue(settings.speed)}
+            </span>
           </label>
-          <div className="mt-2 text-sm text-slate-300">
-            <span className="font-semibold text-amber-100">{settings.speed.toFixed(2)}x</span> playback
-          </div>
           <input
             className="mt-4 w-full accent-amber-300"
             id="speed-range"
@@ -233,7 +250,7 @@ export default function NarrationSettings({
               >
                 <div className="text-sm font-semibold text-white">{preset.name}</div>
                 <div className="mt-1 text-xs uppercase tracking-[0.18em] text-slate-400">
-                  {preset.emotion} · {preset.speed.toFixed(2)}x
+                  {preset.emotion} · {formatSpeedValue(preset.speed)}
                 </div>
               </button>
             ))}

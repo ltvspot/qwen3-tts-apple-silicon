@@ -1,11 +1,55 @@
 import PropTypes from "prop-types";
 import React, { useEffect, useState } from "react";
 
-export default function ExportDialog({ open = false, pending = false, onClose, onSubmit }) {
+function chapterDurationSeconds(chapter) {
+  return chapter.audio_duration_seconds ?? chapter.duration_seconds ?? 0;
+}
+
+function formatEstimatedDuration(seconds) {
+  if (!seconds || Number.isNaN(seconds) || seconds <= 0) {
+    return "<1m";
+  }
+
+  const totalMinutes = Math.max(1, Math.round(seconds / 60));
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+
+  if (hours > 0 && minutes > 0) {
+    return `${hours}h ${minutes}m`;
+  }
+
+  if (hours > 0) {
+    return `${hours}h`;
+  }
+
+  return `${totalMinutes}m`;
+}
+
+function isFlaggedChapter(chapter) {
+  return chapter?.qa_status === "needs_review" || chapter?.qa_status === "flagged";
+}
+
+export default function ExportDialog({
+  chapters = [],
+  open = false,
+  pending = false,
+  onClose,
+  onSubmit,
+}) {
   const [includeM4b, setIncludeM4b] = useState(true);
   const [includeMp3, setIncludeMp3] = useState(true);
   const [includeOnlyApproved, setIncludeOnlyApproved] = useState(true);
   const [validationMessage, setValidationMessage] = useState("");
+  const exportableChapters = chapters;
+  const includedChapters = includeOnlyApproved
+    ? exportableChapters.filter((chapter) => !isFlaggedChapter(chapter))
+    : exportableChapters;
+  const estimatedDuration = formatEstimatedDuration(
+    includedChapters.reduce(
+      (totalDuration, chapter) => totalDuration + chapterDurationSeconds(chapter),
+      0,
+    ),
+  );
 
   useEffect(() => {
     if (!open) {
@@ -109,14 +153,16 @@ export default function ExportDialog({ open = false, pending = false, onClose, o
               type="checkbox"
             />
             <span>
-              <span className="block text-sm font-semibold text-amber-100">
-                Include only QA-approved chapters
-              </span>
+              <span className="block text-sm font-semibold text-amber-100">Skip flagged chapters</span>
               <span className="mt-1 block text-sm text-amber-50/80">
-                Flagged chapters are excluded. Uncheck this to export all generated chapters that are not flagged.
+                When checked, chapters flagged during QA will be excluded from the export.
               </span>
             </span>
           </label>
+
+          <div className="rounded-3xl border border-white/10 bg-slate-950/45 px-4 py-3 text-sm text-slate-300">
+            Will export {includedChapters.length} of {exportableChapters.length} chapters ({estimatedDuration} estimated)
+          </div>
         </div>
 
         {validationMessage ? (
@@ -149,6 +195,13 @@ export default function ExportDialog({ open = false, pending = false, onClose, o
 }
 
 ExportDialog.propTypes = {
+  chapters: PropTypes.arrayOf(
+    PropTypes.shape({
+      audio_duration_seconds: PropTypes.number,
+      duration_seconds: PropTypes.number,
+      qa_status: PropTypes.string,
+    }),
+  ),
   onClose: PropTypes.func.isRequired,
   onSubmit: PropTypes.func.isRequired,
   open: PropTypes.bool,

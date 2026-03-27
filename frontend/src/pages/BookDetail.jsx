@@ -213,6 +213,7 @@ export default function BookDetail() {
     createIdleExportSnapshot(id),
   );
   const [exportSubmitting, setExportSubmitting] = useState(false);
+  const [generateAllModalOpen, setGenerateAllModalOpen] = useState(false);
   const [generationAction, setGenerationAction] = useState(null);
   const [generationErrorMessage, setGenerationErrorMessage] = useState("");
   const [generationSnapshot, setGenerationSnapshot] = useState(null);
@@ -229,6 +230,7 @@ export default function BookDetail() {
   const [saveErrorMessage, setSaveErrorMessage] = useState("");
   const [saving, setSaving] = useState(false);
   const [selectedChapterId, setSelectedChapterId] = useState(null);
+  const [showAllChapterIssues, setShowAllChapterIssues] = useState(false);
   const [voiceLoadingMessage, setVoiceLoadingMessage] = useState("");
   const [voiceOptions, setVoiceOptions] = useState(DEFAULT_VOICE_OPTIONS);
   const [voiceConsistencyChart, setVoiceConsistencyChart] = useState(null);
@@ -262,6 +264,9 @@ export default function BookDetail() {
   const hasRemainingChapters = mergedChapters.some(
     (chapter) => chapter.generation_status !== "completed",
   );
+  const remainingChapterCount = mergedChapters.filter(
+    (chapter) => chapter.generation_status !== "completed",
+  ).length;
   const generationActive =
     generationAction !== null || generationSnapshot?.status === "generating";
   const generationDisabled = generationActive;
@@ -314,12 +319,21 @@ export default function BookDetail() {
           chapterReport.chapter_n === selectedChapter.number,
       ) ?? null)
     : null;
+  const visibleChapterIssues = selectedChapterAudioQa
+    ? showAllChapterIssues
+      ? selectedChapterAudioQa.issues
+      : selectedChapterAudioQa.issues.slice(0, 8)
+    : [];
 
   useEffect(() => {
     if (!editMode) {
       setDraftText(selectedChapter?.text_content ?? "");
     }
   }, [editMode, selectedChapter]);
+
+  useEffect(() => {
+    setShowAllChapterIssues(false);
+  }, [selectedChapterId, selectedChapterAudioQa?.issues?.length]);
 
   useEffect(() => {
     void fetchBookData();
@@ -507,6 +521,7 @@ export default function BookDetail() {
     setExportErrorMessage("");
     setExportSnapshot(createIdleExportSnapshot(id));
     setExportSubmitting(false);
+    setGenerateAllModalOpen(false);
     setGenerationErrorMessage("");
     setBook(null);
     setBookQualityAction(null);
@@ -967,13 +982,15 @@ export default function BookDetail() {
   }
 
   function handleGenerateAll() {
-    const shouldContinue = window.confirm(
-      "This will generate all remaining chapters. Continue?",
-    );
-    if (!shouldContinue) {
+    if (!hasRemainingChapters || generationDisabled) {
       return;
     }
 
+    setGenerateAllModalOpen(true);
+  }
+
+  function handleConfirmGenerateAll() {
+    setGenerateAllModalOpen(false);
     void queueGeneration(`/api/book/${id}/generate-all`, { scope: "all" });
   }
 
@@ -1491,6 +1508,9 @@ export default function BookDetail() {
                             ? "Running Deep QA..."
                             : "Deep QA"}
                         </button>
+                        <div className="inline-flex items-center text-xs text-slate-400">
+                          Analyzes transcription accuracy, pacing, and audio quality
+                        </div>
                         {selectedChapterAudioQa?.checked_at ? (
                           <div className="inline-flex items-center rounded-full border border-white/10 bg-slate-950/45 px-4 py-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-slate-300">
                             Checked{" "}
@@ -1576,9 +1596,7 @@ export default function BookDetail() {
                               Issues
                             </div>
                             <div className="mt-4 space-y-3">
-                              {selectedChapterAudioQa.issues
-                                .slice(0, 8)
-                                .map((issue, index) => (
+                              {visibleChapterIssues.map((issue, index) => (
                                   <div
                                     className="rounded-2xl border border-white/10 bg-slate-900/60 px-4 py-3"
                                     key={`${issue.code}-${index}`}
@@ -1602,6 +1620,17 @@ export default function BookDetail() {
                                   </div>
                                 ))}
                             </div>
+                            {selectedChapterAudioQa.issues.length > 8 &&
+                            !showAllChapterIssues ? (
+                              <button
+                                aria-expanded={showAllChapterIssues}
+                                className="mt-4 text-sm font-semibold text-amber-100 transition hover:text-amber-50"
+                                onClick={() => setShowAllChapterIssues(true)}
+                                type="button"
+                              >
+                                Show all {selectedChapterAudioQa.issues.length} issues
+                              </button>
+                            ) : null}
                           </div>
                         ) : (
                           <div className="rounded-3xl border border-emerald-300/20 bg-emerald-400/10 px-4 py-4 text-sm text-emerald-100">
@@ -1664,10 +1693,10 @@ export default function BookDetail() {
                   <div className="flex flex-wrap items-start justify-between gap-3">
                     <div>
                       <div className="text-xs font-semibold uppercase tracking-[0.28em] text-emerald-200/75">
-                        Book Quality
+                        Quality Review
                       </div>
                       <h2 className="mt-3 text-xl font-semibold">
-                        Gate 3 Overview
+                        Book Quality Review
                       </h2>
                       <p className="mt-3 text-sm leading-7 text-slate-300">
                         Run cross-chapter QA, inspect voice drift, and master
@@ -1689,8 +1718,8 @@ export default function BookDetail() {
 
                   {!bookQualityEligible ? (
                     <div className="rounded-3xl border border-white/10 bg-slate-950/45 px-4 py-4 text-sm leading-7 text-slate-300">
-                      Gate 3 runs after every chapter is generated and chapter
-                      QA is complete.
+                      Book-level QA runs after every chapter is generated and
+                      chapter QA is complete.
                     </div>
                   ) : null}
 
@@ -1976,18 +2005,32 @@ export default function BookDetail() {
                                   </div>
                                   <div className="mt-3 grid gap-2 text-sm text-slate-300 sm:grid-cols-3">
                                     <div>
-                                      TX{" "}
-                                      {chapterReport.scoring.transcription.toFixed(
-                                        1,
-                                      )}
+                                      <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
+                                        Transcription
+                                      </div>
+                                      <div className="mt-1 font-semibold text-white">
+                                        {chapterReport.scoring.transcription.toFixed(
+                                          1,
+                                        )}
+                                      </div>
                                     </div>
                                     <div>
-                                      TM{" "}
-                                      {chapterReport.scoring.timing.toFixed(1)}
+                                      <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
+                                        Timing
+                                      </div>
+                                      <div className="mt-1 font-semibold text-white">
+                                        {chapterReport.scoring.timing.toFixed(1)}
+                                      </div>
                                     </div>
                                     <div>
-                                      QL{" "}
-                                      {chapterReport.scoring.quality.toFixed(1)}
+                                      <div className="text-xs font-semibold uppercase tracking-[0.18em] text-slate-500">
+                                        Quality
+                                      </div>
+                                      <div className="mt-1 font-semibold text-white">
+                                        {chapterReport.scoring.quality.toFixed(
+                                          1,
+                                        )}
+                                      </div>
                                     </div>
                                   </div>
                                 </div>
@@ -2203,6 +2246,7 @@ export default function BookDetail() {
       />
 
       <ExportDialog
+        chapters={completedChapters}
         onClose={() => {
           if (!exportSubmitting) {
             setExportDialogOpen(false);
@@ -2214,6 +2258,45 @@ export default function BookDetail() {
         open={exportDialogOpen}
         pending={exportSubmitting}
       />
+
+      {generateAllModalOpen ? (
+        <div className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-950/80 px-4 backdrop-blur-sm">
+          <div
+            aria-labelledby="generate-all-modal-title"
+            aria-modal="true"
+            className="w-full max-w-lg rounded-[2rem] border border-white/10 bg-slate-950/95 p-6 text-white shadow-2xl shadow-slate-950/50"
+            role="dialog"
+          >
+            <div className="text-xs font-semibold uppercase tracking-[0.28em] text-amber-200/70">
+              Generation Queue
+            </div>
+            <h2 className="mt-3 text-2xl font-semibold" id="generate-all-modal-title">
+              Generate All Chapters
+            </h2>
+            <p className="mt-3 text-sm leading-7 text-slate-300">
+              This will generate audio for all remaining {remainingChapterCount} chapter
+              {remainingChapterCount === 1 ? "" : "s"}. This may take a while.
+            </p>
+
+            <div className="mt-6 flex flex-col-reverse gap-3 sm:flex-row sm:justify-end">
+              <button
+                className="inline-flex items-center justify-center rounded-full border border-white/10 px-5 py-3 text-sm font-semibold text-slate-300 transition hover:border-white/20 hover:text-white"
+                onClick={() => setGenerateAllModalOpen(false)}
+                type="button"
+              >
+                Cancel
+              </button>
+              <button
+                className="inline-flex items-center justify-center rounded-full border border-amber-300/25 bg-amber-400/10 px-5 py-3 text-sm font-semibold text-amber-100 transition hover:bg-amber-400/20"
+                onClick={handleConfirmGenerateAll}
+                type="button"
+              >
+                Start Generation
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
     </div>
   );
 }

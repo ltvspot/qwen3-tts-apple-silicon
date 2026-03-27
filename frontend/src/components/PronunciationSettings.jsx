@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 
 function flattenEntries(dictionaryPayload) {
   const globalEntries = Object.entries(dictionaryPayload?.global ?? {}).map(([word, pronunciation]) => ({
@@ -36,6 +36,8 @@ export default function PronunciationSettings() {
   const [searchValue, setSearchValue] = useState("");
   const [successMessage, setSuccessMessage] = useState("");
   const [suggestions, setSuggestions] = useState([]);
+  const globalFormSectionRef = useRef(null);
+  const globalPronunciationInputRef = useRef(null);
 
   async function loadPronunciations() {
     setLoading(true);
@@ -142,6 +144,25 @@ export default function PronunciationSettings() {
     }
   }
 
+  function handleQuickAddSuggestion(suggestion) {
+    setGlobalForm({
+      pronunciation: suggestion.suggested_pronunciation ?? suggestion.pronunciation ?? "",
+      word: suggestion.word ?? "",
+    });
+    setErrorMessage("");
+    setSuccessMessage(`Loaded ${suggestion.word} into the global dictionary form.`);
+
+    const scheduleFocus = window.requestAnimationFrame
+      ? window.requestAnimationFrame.bind(window)
+      : (callback) => window.setTimeout(callback, 0);
+
+    scheduleFocus(() => {
+      globalFormSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+      globalPronunciationInputRef.current?.focus();
+      globalPronunciationInputRef.current?.select();
+    });
+  }
+
   if (loading) {
     return (
       <div className="rounded-[2rem] border border-slate-200 bg-white p-6 text-sm text-slate-600 shadow-sm">
@@ -163,7 +184,7 @@ export default function PronunciationSettings() {
         </div>
       ) : null}
 
-      <section className="rounded-[2rem] border border-slate-200 bg-white p-6 shadow-sm">
+      <section className="rounded-[2rem] border border-slate-200 bg-white p-6 shadow-sm" ref={globalFormSectionRef}>
         <div className="grid gap-6 lg:grid-cols-2">
           <div className="space-y-3">
             <div className="text-xs font-semibold uppercase tracking-[0.24em] text-slate-500">Global</div>
@@ -180,6 +201,7 @@ export default function PronunciationSettings() {
               className="w-full rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3 text-sm text-slate-950"
               onChange={(event) => setGlobalForm((current) => ({ ...current, pronunciation: event.target.value }))}
               placeholder="Pronunciation"
+              ref={globalPronunciationInputRef}
               value={globalForm.pronunciation}
             />
             <button
@@ -292,11 +314,27 @@ export default function PronunciationSettings() {
               className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-4"
               key={`${suggestion.book_id}-${suggestion.chapter_n}-${suggestion.word}`}
             >
-              <div className="text-sm font-semibold text-slate-950">{suggestion.word}</div>
-              <div className="mt-1 text-sm text-slate-600">
-                Book {suggestion.book_id} · Chapter {suggestion.chapter_n} · {suggestion.book_title}
+              <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
+                <div>
+                  <div className="text-sm font-semibold text-slate-950">{suggestion.word}</div>
+                  <div className="mt-1 text-sm text-slate-600">
+                    Book {suggestion.book_id} · Chapter {suggestion.chapter_n} · {suggestion.book_title}
+                  </div>
+                  <div className="mt-1 text-sm text-slate-500">{suggestion.reason}</div>
+                  {suggestion.suggested_pronunciation ?? suggestion.pronunciation ? (
+                    <div className="mt-1 text-sm text-slate-500">
+                      Suggested pronunciation: {suggestion.suggested_pronunciation ?? suggestion.pronunciation}
+                    </div>
+                  ) : null}
+                </div>
+                <button
+                  className="rounded-full border border-slate-300 px-4 py-2 text-sm font-semibold text-slate-700 transition hover:border-slate-950 hover:text-slate-950"
+                  onClick={() => handleQuickAddSuggestion(suggestion)}
+                  type="button"
+                >
+                  Add to Dictionary
+                </button>
               </div>
-              <div className="mt-1 text-sm text-slate-500">{suggestion.reason}</div>
             </div>
           ))}
         </div>
