@@ -34,8 +34,11 @@ export default function ChapterList({
   generationDisabled = false,
   loadingChapterNumber = null,
   onGenerateChapter,
+  onParse = () => {},
   onPreviewChapter,
   onSelectChapter,
+  parseErrorMessage = "",
+  parsing = false,
   selectedChapterId = null,
 }) {
   return (
@@ -44,22 +47,63 @@ export default function ChapterList({
         <div className="text-xs font-semibold uppercase tracking-[0.28em] text-amber-200/75">
           Manuscript Structure
         </div>
-        <h2 className="mt-2 text-xl font-semibold text-white">Chapters ({chapters.length})</h2>
+        <h2 className="mt-2 text-xl font-semibold text-white">
+          Chapters ({chapters.length})
+        </h2>
         <p className="mt-2 text-sm text-slate-400">
-          Review text, trigger generation, and jump straight into completed audio.
+          Review text, trigger generation, and jump straight into completed
+          audio.
         </p>
       </div>
 
       <div className="flex-1 overflow-y-auto">
         {chapters.length === 0 ? (
           <div className="flex h-full min-h-[18rem] items-center justify-center px-6 py-8 text-center">
-            <div>
+            <div className="max-w-sm">
               <div className="text-sm font-semibold uppercase tracking-[0.28em] text-slate-500">
                 No Chapters Yet
               </div>
+              <h3 className="mt-3 text-2xl font-semibold text-white">
+                Parse the manuscript to unlock the narration workflow.
+              </h3>
               <p className="mt-3 text-sm leading-7 text-slate-400">
-                Parse the manuscript before editing or generating narration.
+                Alexandria will extract credits, chapters, and narratable
+                sections from the uploaded document.
               </p>
+              <button
+                className="mt-6 inline-flex items-center gap-2 rounded-full border border-amber-300/30 bg-amber-400/10 px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-amber-100 transition hover:bg-amber-400/20 disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/[0.04] disabled:text-slate-500"
+                disabled={parsing}
+                onClick={onParse}
+                type="button"
+              >
+                {parsing ? (
+                  <span
+                    aria-hidden="true"
+                    className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-current border-r-transparent"
+                  />
+                ) : (
+                  <svg
+                    aria-hidden="true"
+                    className="h-3.5 w-3.5"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth="1.7"
+                    viewBox="0 0 24 24"
+                  >
+                    <path d="M6.75 4.75h8.5a2 2 0 0 1 2 2v12.5l-3.75-2-3.75 2-3.75-2-3.75 2V6.75a2 2 0 0 1 2-2h2.5" />
+                    <path d="M7.75 4.75v12.5" />
+                  </svg>
+                )}
+                {parsing ? "Parsing Manuscript..." : "Parse Manuscript"}
+              </button>
+
+              {parseErrorMessage ? (
+                <div className="mt-4 rounded-3xl border border-rose-400/30 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">
+                  {parseErrorMessage}
+                </div>
+              ) : null}
             </div>
           </div>
         ) : (
@@ -69,8 +113,12 @@ export default function ChapterList({
               const generationStatus = mapChapterGenerationState(
                 chapter.generation_status ?? chapter.status,
               );
-              const qaMeta = CHAPTER_QA_META[chapter.qa_status ?? "not_reviewed"] ?? CHAPTER_QA_META.not_reviewed;
-              const statusMeta = GENERATION_STATUS_META[generationStatus] ?? GENERATION_STATUS_META.pending;
+              const qaMeta =
+                CHAPTER_QA_META[chapter.qa_status ?? "not_reviewed"] ??
+                CHAPTER_QA_META.not_reviewed;
+              const statusMeta =
+                GENERATION_STATUS_META[generationStatus] ??
+                GENERATION_STATUS_META.pending;
               const durationLabel = formatCompactDuration(
                 chapter.audio_duration_seconds ?? chapter.duration_seconds,
               );
@@ -135,7 +183,9 @@ export default function ChapterList({
                             ) : null}
                             <span
                               className={`rounded-full border px-2 py-1 font-semibold ${statusMeta.accentClass}`}
-                              title={chapter.error_message || statusMeta.tooltip}
+                              title={
+                                chapter.error_message || statusMeta.tooltip
+                              }
                             >
                               {statusMeta.icon} {statusMeta.label}
                             </span>
@@ -158,7 +208,12 @@ export default function ChapterList({
                       <button
                         className="inline-flex items-center gap-2 rounded-full border border-amber-300/25 bg-amber-400/10 px-3 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-amber-100 transition hover:bg-amber-400/20 disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/[0.04] disabled:text-slate-500"
                         disabled={generationDisabled}
-                        onClick={() => onGenerateChapter(chapter, generationStatus === "completed")}
+                        onClick={() =>
+                          onGenerateChapter(
+                            chapter,
+                            generationStatus === "completed",
+                          )
+                        }
                         type="button"
                       >
                         {isChapterLoading ? (
@@ -167,11 +222,16 @@ export default function ChapterList({
                             className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-current border-r-transparent"
                           />
                         ) : null}
-                        {isChapterLoading ? "Queueing..." : chapterActionLabel(generationStatus)}
+                        {isChapterLoading
+                          ? "Queueing..."
+                          : chapterActionLabel(generationStatus)}
                       </button>
 
                       {chapter.error_message ? (
-                        <div className="text-xs text-amber-100/85" title={chapter.error_message}>
+                        <div
+                          className="text-xs text-amber-100/85"
+                          title={chapter.error_message}
+                        >
                           {chapter.error_message}
                         </div>
                       ) : null}
@@ -188,24 +248,29 @@ export default function ChapterList({
 }
 
 ChapterList.propTypes = {
-  chapters: PropTypes.arrayOf(PropTypes.shape({
-    audio_duration_seconds: PropTypes.number,
-    duration_seconds: PropTypes.number,
-    error_message: PropTypes.string,
-    generation_status: PropTypes.string,
-    id: PropTypes.number.isRequired,
-    number: PropTypes.number.isRequired,
-    qa_status: PropTypes.string,
-    status: PropTypes.string,
-    text_content: PropTypes.string,
-    title: PropTypes.string,
-    type: PropTypes.string.isRequired,
-    word_count: PropTypes.number,
-  })).isRequired,
+  chapters: PropTypes.arrayOf(
+    PropTypes.shape({
+      audio_duration_seconds: PropTypes.number,
+      duration_seconds: PropTypes.number,
+      error_message: PropTypes.string,
+      generation_status: PropTypes.string,
+      id: PropTypes.number.isRequired,
+      number: PropTypes.number.isRequired,
+      qa_status: PropTypes.string,
+      status: PropTypes.string,
+      text_content: PropTypes.string,
+      title: PropTypes.string,
+      type: PropTypes.string.isRequired,
+      word_count: PropTypes.number,
+    }),
+  ).isRequired,
   generationDisabled: PropTypes.bool,
   loadingChapterNumber: PropTypes.number,
   onGenerateChapter: PropTypes.func.isRequired,
+  onParse: PropTypes.func,
   onPreviewChapter: PropTypes.func.isRequired,
   onSelectChapter: PropTypes.func.isRequired,
+  parseErrorMessage: PropTypes.string,
+  parsing: PropTypes.bool,
   selectedChapterId: PropTypes.number,
 };

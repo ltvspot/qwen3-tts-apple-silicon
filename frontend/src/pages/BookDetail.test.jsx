@@ -204,7 +204,11 @@ function createDeepQaReport(overrides = {}) {
         quality: {
           artifact_events: [],
           clipping_ratio: 0.0,
-          dependency: { available: true, dependency: "pyloudnorm", message: null },
+          dependency: {
+            available: true,
+            dependency: "pyloudnorm",
+            message: null,
+          },
           integrated_lufs: -20.0,
           issues: [],
           loudness_range_lu: 4.0,
@@ -236,7 +240,11 @@ function createDeepQaReport(overrides = {}) {
           status: "pass",
         },
         transcription: {
-          dependency: { available: true, dependency: "mlx-whisper", message: null },
+          dependency: {
+            available: true,
+            dependency: "mlx-whisper",
+            message: null,
+          },
           diff: [
             {
               actual: "chapter two",
@@ -270,7 +278,11 @@ function createDeepQaReport(overrides = {}) {
         quality: {
           artifact_events: [],
           clipping_ratio: 0.0,
-          dependency: { available: true, dependency: "pyloudnorm", message: null },
+          dependency: {
+            available: true,
+            dependency: "pyloudnorm",
+            message: null,
+          },
           integrated_lufs: -20.2,
           issues: [],
           loudness_range_lu: 4.0,
@@ -302,7 +314,11 @@ function createDeepQaReport(overrides = {}) {
           status: "pass",
         },
         transcription: {
-          dependency: { available: true, dependency: "mlx-whisper", message: null },
+          dependency: {
+            available: true,
+            dependency: "mlx-whisper",
+            message: null,
+          },
           diff: [],
           issues: [],
           model_name: "mlx-community/whisper-tiny",
@@ -407,9 +423,32 @@ describe("BookDetail page", () => {
     });
   }
 
+  async function renderUnparsedBookDetail(bookOverrides = {}) {
+    fetchMock
+      .mockResolvedValueOnce(
+        createJsonResponse(
+          createBook({
+            chapter_count: 0,
+            status: "not_started",
+            ...bookOverrides,
+          }),
+        ),
+      )
+      .mockResolvedValueOnce(createJsonResponse([]))
+      .mockResolvedValueOnce(createJsonResponse(createStatusSnapshot()))
+      .mockResolvedValueOnce(createJsonResponse(createExportSnapshot()))
+      .mockResolvedValueOnce(createJsonResponse(createVoiceListPayload()));
+
+    await renderBookDetail();
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("The Test Chronicle");
+    });
+  }
+
   function getButtonByText(label) {
-    return Array.from(container.querySelectorAll("button")).find(
-      (button) => button.textContent.includes(label),
+    return Array.from(container.querySelectorAll("button")).find((button) =>
+      button.textContent.includes(label),
     );
   }
 
@@ -441,7 +480,9 @@ describe("BookDetail page", () => {
       expect(container.textContent).toContain("Opening credits text.");
     });
 
-    expect(document.title).toBe("The Test Chronicle | Alexandria Audiobook Narrator");
+    expect(document.title).toBe(
+      "The Test Chronicle | Alexandria Audiobook Narrator",
+    );
     expect(fetchMock.mock.calls[0][0]).toBe("/api/book/7");
     expect(fetchMock.mock.calls[1][0]).toBe("/api/book/7/chapters");
     expect(fetchMock.mock.calls[2][0]).toBe("/api/book/7/status");
@@ -452,7 +493,9 @@ describe("BookDetail page", () => {
     expect(container.textContent).toContain("Narrated by Kent Zimering");
 
     await act(async () => {
-      getButtonByText("Back to Library").dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      getButtonByText("Back to Library").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
     });
 
     expect(mockNavigate).toHaveBeenCalledWith("/");
@@ -487,6 +530,129 @@ describe("BookDetail page", () => {
     });
   });
 
+  test("shows parse manuscript buttons when no chapters exist", async () => {
+    await renderUnparsedBookDetail();
+
+    const parseButtons = Array.from(
+      container.querySelectorAll("button"),
+    ).filter((button) => button.textContent.includes("Parse Manuscript"));
+
+    expect(parseButtons.length).toBeGreaterThan(0);
+  });
+
+  test("triggers the parse API and refreshes book data", async () => {
+    const parsedChapters = [
+      createChapter({
+        status: "pending",
+      }),
+      createChapter({
+        id: 702,
+        number: 1,
+        text_content: "Chapter one body text.",
+        title: "Chapter One",
+        type: "chapter",
+        word_count: 4,
+      }),
+    ];
+    let parsed = false;
+
+    fetchMock.mockImplementation((url, options = {}) => {
+      if (url === "/api/book/7") {
+        return Promise.resolve(
+          createJsonResponse(
+            createBook({
+              chapter_count: parsed ? parsedChapters.length : 0,
+              status: parsed ? "parsed" : "not_started",
+            }),
+          ),
+        );
+      }
+      if (url === "/api/book/7/chapters") {
+        return Promise.resolve(
+          createJsonResponse(parsed ? parsedChapters : []),
+        );
+      }
+      if (url === "/api/book/7/status") {
+        return Promise.resolve(createJsonResponse(createStatusSnapshot()));
+      }
+      if (url === "/api/book/7/export/status") {
+        return Promise.resolve(createJsonResponse(createExportSnapshot()));
+      }
+      if (url === "/api/voice-lab/voices") {
+        return Promise.resolve(createJsonResponse(createVoiceListPayload()));
+      }
+      if (url === "/api/book/7/parse") {
+        parsed = true;
+        return Promise.resolve(
+          createJsonResponse({
+            chapters_detected: parsedChapters.length,
+            message: "Parsed successfully.",
+            status: "parsing",
+          }),
+        );
+      }
+
+      throw new Error(`Unhandled fetch: ${url}`);
+    });
+
+    await renderBookDetail();
+
+    await waitFor(() => {
+      expect(getButtonByText("Parse Manuscript")).toBeTruthy();
+    });
+
+    await act(async () => {
+      getButtonByText("Parse Manuscript").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+    });
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "/api/book/7/parse",
+        expect.objectContaining({
+          body: JSON.stringify({}),
+          headers: {
+            "Content-Type": "application/json",
+          },
+          method: "POST",
+        }),
+      );
+      expect(container.textContent).toContain("Chapters (2)");
+      expect(container.textContent).toContain("Generate All");
+    });
+  });
+
+  test("hides generate all controls until the manuscript is parsed", async () => {
+    await renderUnparsedBookDetail();
+
+    expect(getButtonByText("Generate All")).toBeUndefined();
+  });
+
+  test("hides narration settings until chapters exist", async () => {
+    await renderUnparsedBookDetail();
+
+    expect(
+      container.querySelector('select[aria-label="Narration voice"]'),
+    ).toBeNull();
+    expect(container.textContent).not.toContain("Voice and delivery");
+  });
+
+  test("shows manuscript not parsed as the status label for unparsed books", async () => {
+    await renderUnparsedBookDetail();
+
+    expect(container.textContent).toContain("Manuscript not parsed");
+  });
+
+  test("renders the get started workflow guide when no chapters are available", async () => {
+    await renderUnparsedBookDetail();
+
+    expect(container.textContent).toContain("Get Started");
+    expect(container.textContent).toContain("Review & Edit");
+    expect(container.textContent).toContain("Generate Audio");
+    expect(container.textContent).toContain("Quality Check & Export");
+  });
+
   test("renders an inline audio preview player for generated chapters", async () => {
     const book = createBook({});
     const chapters = [
@@ -500,21 +666,25 @@ describe("BookDetail page", () => {
     fetchMock
       .mockResolvedValueOnce(createJsonResponse(book))
       .mockResolvedValueOnce(createJsonResponse(chapters))
-      .mockResolvedValueOnce(createJsonResponse(createStatusSnapshot({
-        chapters: [
-          {
-            audio_duration_seconds: 252,
-            audio_file_size_bytes: 19000000,
-            chapter_n: 0,
-            error_message: null,
-            generated_at: "2026-03-24T00:00:47+00:00",
-            generation_seconds: 47.2,
-            progress_seconds: null,
-            started_at: "2026-03-24T00:00:00+00:00",
-            status: "completed",
-          },
-        ],
-      })))
+      .mockResolvedValueOnce(
+        createJsonResponse(
+          createStatusSnapshot({
+            chapters: [
+              {
+                audio_duration_seconds: 252,
+                audio_file_size_bytes: 19000000,
+                chapter_n: 0,
+                error_message: null,
+                generated_at: "2026-03-24T00:00:47+00:00",
+                generation_seconds: 47.2,
+                progress_seconds: null,
+                started_at: "2026-03-24T00:00:00+00:00",
+                status: "completed",
+              },
+            ],
+          }),
+        ),
+      )
       .mockResolvedValueOnce(createJsonResponse(createExportSnapshot()))
       .mockResolvedValueOnce(createJsonResponse(createVoiceListPayload()));
 
@@ -527,7 +697,9 @@ describe("BookDetail page", () => {
 
     const audioElement = container.querySelector("audio");
     expect(audioElement).not.toBeNull();
-    expect(audioElement.getAttribute("src")).toBe("/api/book/7/chapter/0/preview");
+    expect(audioElement.getAttribute("src")).toBe(
+      "/api/book/7/chapter/0/preview",
+    );
   });
 
   test("retries voice loading while the engine is still warming up", async () => {
@@ -552,11 +724,13 @@ describe("BookDetail page", () => {
       if (url === "/api/voice-lab/voices") {
         voiceRequests += 1;
         if (voiceRequests === 1) {
-          return Promise.resolve(createJsonResponse({
-            engine: "qwen3_tts",
-            loading: true,
-            voices: [],
-          }));
+          return Promise.resolve(
+            createJsonResponse({
+              engine: "qwen3_tts",
+              loading: true,
+              voices: [],
+            }),
+          );
         }
         return Promise.resolve(createJsonResponse(createVoiceListPayload()));
       }
@@ -629,16 +803,22 @@ describe("BookDetail page", () => {
     });
 
     await act(async () => {
-      getButtonByText("Edit Chapter").dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      getButtonByText("Edit Chapter").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
     });
 
-    const textarea = container.querySelector('textarea[aria-label="Chapter text editor"]');
+    const textarea = container.querySelector(
+      'textarea[aria-label="Chapter text editor"]',
+    );
     await act(async () => {
       setFormValue(textarea, updatedChapter.text_content, "input");
     });
 
     await act(async () => {
-      getButtonByText("Save Changes").dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      getButtonByText("Save Changes").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
     });
 
     await waitFor(() => {
@@ -683,7 +863,11 @@ describe("BookDetail page", () => {
           createVoiceListPayload({
             voices: [
               { display_name: "Ethan", is_cloned: false, name: "Ethan" },
-              { display_name: "Kent Zimering Clone", is_cloned: true, name: "kent-zimering" },
+              {
+                display_name: "Kent Zimering Clone",
+                is_cloned: true,
+                name: "kent-zimering",
+              },
             ],
           }),
         ),
@@ -695,7 +879,9 @@ describe("BookDetail page", () => {
       expect(container.textContent).toContain("Opening credits text.");
     });
 
-    const voiceSelect = container.querySelector('select[aria-label="Narration voice"]');
+    const voiceSelect = container.querySelector(
+      'select[aria-label="Narration voice"]',
+    );
     await act(async () => {
       setFormValue(voiceSelect, "kent-zimering", "change");
     });
@@ -703,7 +889,9 @@ describe("BookDetail page", () => {
     expect(voiceSelect.value).toBe("kent-zimering");
 
     await act(async () => {
-      getButtonByText("Dramatic Reading").dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      getButtonByText("Dramatic Reading").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
     });
 
     const emotionInput = container.querySelector("#emotion-input");
@@ -711,10 +899,14 @@ describe("BookDetail page", () => {
     expect(container.textContent).toContain("0.95x playback");
 
     await act(async () => {
-      getButtonByText("Edit Chapter").dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      getButtonByText("Edit Chapter").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
     });
 
-    const textarea = container.querySelector('textarea[aria-label="Chapter text editor"]');
+    const textarea = container.querySelector(
+      'textarea[aria-label="Chapter text editor"]',
+    );
     await act(async () => {
       setFormValue(textarea, "Unsaved rewrite for opening credits.", "input");
     });
@@ -726,7 +918,9 @@ describe("BookDetail page", () => {
         .dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
 
-    expect(window.confirm).toHaveBeenCalledWith("Discard unsaved chapter edits?");
+    expect(window.confirm).toHaveBeenCalledWith(
+      "Discard unsaved chapter edits?",
+    );
     expect(container.textContent).toContain("Unsaved changes");
     expect(container.textContent).toContain("Opening Credits");
 
@@ -747,7 +941,10 @@ describe("BookDetail page", () => {
 
   test("renders a not-found state when the book record is missing", async () => {
     fetchMock.mockResolvedValueOnce(
-      createJsonResponse({ detail: "Book 7 not found" }, { ok: false, status: 404 }),
+      createJsonResponse(
+        { detail: "Book 7 not found" },
+        { ok: false, status: 404 },
+      ),
     );
 
     await renderBookDetail();
@@ -757,7 +954,9 @@ describe("BookDetail page", () => {
     });
 
     await act(async () => {
-      getButtonByText("Back to Library").dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      getButtonByText("Back to Library").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
     });
 
     expect(mockNavigate).toHaveBeenCalledWith("/");
@@ -784,12 +983,14 @@ describe("BookDetail page", () => {
       .mockResolvedValueOnce(createJsonResponse(createStatusSnapshot()))
       .mockResolvedValueOnce(createJsonResponse(createExportSnapshot()))
       .mockResolvedValueOnce(createJsonResponse(createVoiceListPayload()))
-      .mockResolvedValueOnce(createJsonResponse({
-        book_id: 7,
-        job_id: 91,
-        message: "Book 7 queued for generation",
-        status: "queued",
-      }))
+      .mockResolvedValueOnce(
+        createJsonResponse({
+          book_id: 7,
+          job_id: 91,
+          message: "Book 7 queued for generation",
+          status: "queued",
+        }),
+      )
       .mockResolvedValueOnce(createJsonResponse(createStatusSnapshot()));
 
     await renderBookDetail();
@@ -799,7 +1000,9 @@ describe("BookDetail page", () => {
     });
 
     await act(async () => {
-      getButtonByText("Generate All").dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      getButtonByText("Generate All").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
     });
 
     await waitFor(() => {
@@ -893,14 +1096,16 @@ describe("BookDetail page", () => {
       .mockResolvedValueOnce(createJsonResponse(statusSnapshot))
       .mockResolvedValueOnce(createJsonResponse(createExportSnapshot()))
       .mockResolvedValueOnce(createJsonResponse(createVoiceListPayload()))
-      .mockResolvedValueOnce(createJsonResponse({
-        book_id: 7,
-        export_status: "processing",
-        expected_completion_seconds: 30,
-        formats_requested: ["mp3", "m4b"],
-        job_id: "export_7_20260324_001000",
-        started_at: "2026-03-24T00:09:00+00:00",
-      }))
+      .mockResolvedValueOnce(
+        createJsonResponse({
+          book_id: 7,
+          export_status: "processing",
+          expected_completion_seconds: 30,
+          formats_requested: ["mp3", "m4b"],
+          job_id: "export_7_20260324_001000",
+          started_at: "2026-03-24T00:09:00+00:00",
+        }),
+      )
       .mockResolvedValueOnce(createJsonResponse(completedExportSnapshot));
 
     await renderBookDetail();
@@ -910,7 +1115,9 @@ describe("BookDetail page", () => {
     });
 
     await act(async () => {
-      getButtonByText("Export Audiobook").dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      getButtonByText("Export Audiobook").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
     });
 
     await waitFor(() => {
@@ -945,7 +1152,9 @@ describe("BookDetail page", () => {
     });
 
     await waitFor(() => {
-      expect(clipboardWriteMock).toHaveBeenCalledWith("http://localhost/api/book/7/export/download/mp3");
+      expect(clipboardWriteMock).toHaveBeenCalledWith(
+        "http://localhost/api/book/7/export/download/mp3",
+      );
     });
   });
 
@@ -984,55 +1193,65 @@ describe("BookDetail page", () => {
     fetchMock
       .mockResolvedValueOnce(createJsonResponse(book))
       .mockResolvedValueOnce(createJsonResponse(chapters))
-      .mockResolvedValueOnce(createJsonResponse(createStatusSnapshot({
-        chapters: [
-          {
-            audio_duration_seconds: 252,
-            audio_file_size_bytes: 19000000,
-            chapter_n: 0,
-            error_message: null,
-            generated_at: "2026-03-24T00:00:47+00:00",
-            generation_seconds: 47.2,
-            expected_total_seconds: 23.4,
-            progress_seconds: null,
-            started_at: "2026-03-24T00:00:00+00:00",
-            status: "completed",
-          },
-        ],
-      })))
-      .mockResolvedValueOnce(createJsonResponse(createExportSnapshot({
-        completed_at: "2026-03-24T00:10:00+00:00",
-        export_status: "completed",
-        formats: {
-          mp3: {
+      .mockResolvedValueOnce(
+        createJsonResponse(
+          createStatusSnapshot({
+            chapters: [
+              {
+                audio_duration_seconds: 252,
+                audio_file_size_bytes: 19000000,
+                chapter_n: 0,
+                error_message: null,
+                generated_at: "2026-03-24T00:00:47+00:00",
+                generation_seconds: 47.2,
+                expected_total_seconds: 23.4,
+                progress_seconds: null,
+                started_at: "2026-03-24T00:00:00+00:00",
+                status: "completed",
+              },
+            ],
+          }),
+        ),
+      )
+      .mockResolvedValueOnce(
+        createJsonResponse(
+          createExportSnapshot({
             completed_at: "2026-03-24T00:10:00+00:00",
-            download_url: "/api/book/7/export/download/mp3",
-            error_message: null,
-            file_name: "The Test Chronicle.mp3",
-            file_size_bytes: 487923048,
-            status: "completed",
-          },
-        },
-        qa_report: {
-          book_id: 7,
-          book_title: "The Test Chronicle",
-          chapter_summary: [],
-          chapters_approved: 1,
-          chapters_flagged: 0,
-          chapters_included: 1,
-          chapters_warnings: 0,
-          export_approved: true,
-          export_date: "2026-03-24T00:10:00+00:00",
-          notes: "Partial export completed.",
-        },
-      })))
+            export_status: "completed",
+            formats: {
+              mp3: {
+                completed_at: "2026-03-24T00:10:00+00:00",
+                download_url: "/api/book/7/export/download/mp3",
+                error_message: null,
+                file_name: "The Test Chronicle.mp3",
+                file_size_bytes: 487923048,
+                status: "completed",
+              },
+            },
+            qa_report: {
+              book_id: 7,
+              book_title: "The Test Chronicle",
+              chapter_summary: [],
+              chapters_approved: 1,
+              chapters_flagged: 0,
+              chapters_included: 1,
+              chapters_warnings: 0,
+              export_approved: true,
+              export_date: "2026-03-24T00:10:00+00:00",
+              notes: "Partial export completed.",
+            },
+          }),
+        ),
+      )
       .mockResolvedValueOnce(createJsonResponse(createVoiceListPayload()));
 
     await renderBookDetail();
 
     await waitFor(() => {
       expect(container.textContent).toContain("Past export available");
-      expect(container.textContent).toContain("Generate the remaining chapters and re-export for a complete audiobook.");
+      expect(container.textContent).toContain(
+        "Generate the remaining chapters and re-export for a complete audiobook.",
+      );
     });
   });
 
@@ -1079,44 +1298,52 @@ describe("BookDetail page", () => {
     fetchMock
       .mockResolvedValueOnce(createJsonResponse(book))
       .mockResolvedValueOnce(createJsonResponse(chapters))
-      .mockResolvedValueOnce(createJsonResponse(createStatusSnapshot({
-        chapters: chapters.map((chapter) => ({
-          audio_duration_seconds: chapter.duration_seconds,
-          audio_file_size_bytes: chapter.audio_file_size_bytes,
-          chapter_n: chapter.number,
-          error_message: null,
-          generated_at: chapter.completed_at,
-          generation_seconds: 47.2,
-          expected_total_seconds: 23.4,
-          progress_seconds: null,
-          started_at: "2026-03-24T00:00:00+00:00",
-          status: "completed",
-        })),
-      })))
-      .mockResolvedValueOnce(createJsonResponse(createExportSnapshot({
-        completed_at: "2026-03-24T00:10:00+00:00",
-        current_stage: "Export completed",
-        export_status: "completed",
-        formats: {
-          mp3: {
+      .mockResolvedValueOnce(
+        createJsonResponse(
+          createStatusSnapshot({
+            chapters: chapters.map((chapter) => ({
+              audio_duration_seconds: chapter.duration_seconds,
+              audio_file_size_bytes: chapter.audio_file_size_bytes,
+              chapter_n: chapter.number,
+              error_message: null,
+              generated_at: chapter.completed_at,
+              generation_seconds: 47.2,
+              expected_total_seconds: 23.4,
+              progress_seconds: null,
+              started_at: "2026-03-24T00:00:00+00:00",
+              status: "completed",
+            })),
+          }),
+        ),
+      )
+      .mockResolvedValueOnce(
+        createJsonResponse(
+          createExportSnapshot({
             completed_at: "2026-03-24T00:10:00+00:00",
-            download_url: "/api/book/7/export/download/mp3",
-            error_message: null,
-            file_name: "The Test Chronicle.mp3",
-            file_size_bytes: 487923048,
-            status: "completed",
-          },
-          m4b: {
-            completed_at: "2026-03-24T00:10:00+00:00",
-            download_url: "/api/book/7/export/download/m4b",
-            error_message: null,
-            file_name: "The Test Chronicle.m4b",
-            file_size_bytes: 341234056,
-            status: "completed",
-          },
-        },
-        qa_report: null,
-      })))
+            current_stage: "Export completed",
+            export_status: "completed",
+            formats: {
+              mp3: {
+                completed_at: "2026-03-24T00:10:00+00:00",
+                download_url: "/api/book/7/export/download/mp3",
+                error_message: null,
+                file_name: "The Test Chronicle.mp3",
+                file_size_bytes: 487923048,
+                status: "completed",
+              },
+              m4b: {
+                completed_at: "2026-03-24T00:10:00+00:00",
+                download_url: "/api/book/7/export/download/m4b",
+                error_message: null,
+                file_name: "The Test Chronicle.m4b",
+                file_size_bytes: 341234056,
+                status: "completed",
+              },
+            },
+            qa_report: null,
+          }),
+        ),
+      )
       .mockResolvedValueOnce(createJsonResponse(createVoiceListPayload()));
 
     await renderBookDetail();
@@ -1124,27 +1351,38 @@ describe("BookDetail page", () => {
     await waitFor(() => {
       expect(container.textContent).toContain("Ready to download");
       expect(container.textContent).not.toContain("Past export available");
-      expect(container.textContent).not.toContain("missing from the latest export");
+      expect(container.textContent).not.toContain(
+        "missing from the latest export",
+      );
     });
   });
 
   test("renders real export progress instead of a fake placeholder bar", async () => {
     const book = createBook({});
-    const chapters = [createChapter({ status: "generated", audio_path: "7-the-test-chronicle/chapters/00-opening-credits.wav" })];
+    const chapters = [
+      createChapter({
+        status: "generated",
+        audio_path: "7-the-test-chronicle/chapters/00-opening-credits.wav",
+      }),
+    ];
 
     fetchMock
       .mockResolvedValueOnce(createJsonResponse(book))
       .mockResolvedValueOnce(createJsonResponse(chapters))
       .mockResolvedValueOnce(createJsonResponse(createStatusSnapshot()))
-      .mockResolvedValueOnce(createJsonResponse(createExportSnapshot({
-        current_chapter_n: 3,
-        current_format: "mp3",
-        current_stage: "Encoding MP3 (chapter 3/10)",
-        export_status: "processing",
-        progress_percent: 45,
-        started_at: "2026-03-24T00:09:00+00:00",
-        total_chapters: 10,
-      })))
+      .mockResolvedValueOnce(
+        createJsonResponse(
+          createExportSnapshot({
+            current_chapter_n: 3,
+            current_format: "mp3",
+            current_stage: "Encoding MP3 (chapter 3/10)",
+            export_status: "processing",
+            progress_percent: 45,
+            started_at: "2026-03-24T00:09:00+00:00",
+            total_chapters: 10,
+          }),
+        ),
+      )
       .mockResolvedValueOnce(createJsonResponse(createVoiceListPayload()));
 
     await renderBookDetail();
@@ -1200,7 +1438,9 @@ describe("BookDetail page", () => {
     });
 
     await act(async () => {
-      getButtonByText("Preview Audio").dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      getButtonByText("Preview Audio").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
     });
 
     await waitFor(() => {
@@ -1252,7 +1492,9 @@ describe("BookDetail page", () => {
     });
 
     await act(async () => {
-      getButtonByText("Run Book QA").dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      getButtonByText("Run Book QA").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
     });
 
     await waitFor(() => {
@@ -1260,11 +1502,15 @@ describe("BookDetail page", () => {
       expect(container.textContent).toContain("Grade A");
       expect(container.textContent).toContain("Ready for Export");
       expect(container.textContent).toContain("Voice Consistency Chart");
-      expect(container.textContent).toContain("All chapters within ACX loudness range.");
+      expect(container.textContent).toContain(
+        "All chapters within ACX loudness range.",
+      );
     });
 
     expect(fetchMock).toHaveBeenCalledWith("/api/book/7/qa/book-report");
-    expect(fetchMock).toHaveBeenCalledWith("/api/book/7/qa/voice-consistency-chart");
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/book/7/qa/voice-consistency-chart",
+    );
   });
 
   test("runs book-level audio QA and renders the persisted deep audio report", async () => {
@@ -1308,7 +1554,9 @@ describe("BookDetail page", () => {
     });
 
     await act(async () => {
-      getButtonByText("Run Audio QA").dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      getButtonByText("Run Audio QA").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
     });
 
     await waitFor(() => {
@@ -1319,7 +1567,9 @@ describe("BookDetail page", () => {
       expect(container.textContent).toContain("TX 100.0");
     });
 
-    expect(fetchMock).toHaveBeenCalledWith("/api/books/7/deep-qa", { method: "POST" });
+    expect(fetchMock).toHaveBeenCalledWith("/api/books/7/deep-qa", {
+      method: "POST",
+    });
   });
 
   test("runs chapter deep QA and renders issue + diff details for the selected chapter", async () => {
@@ -1344,7 +1594,14 @@ describe("BookDetail page", () => {
       .mockResolvedValueOnce(createJsonResponse(createExportSnapshot()))
       .mockResolvedValueOnce(createJsonResponse(createVoiceListPayload()))
       .mockResolvedValueOnce(createJsonResponse({ ok: true }))
-      .mockResolvedValueOnce(createJsonResponse(createDeepQaReport({ chapter_count: 1, chapters: [createDeepQaReport().chapters[0]] })));
+      .mockResolvedValueOnce(
+        createJsonResponse(
+          createDeepQaReport({
+            chapter_count: 1,
+            chapters: [createDeepQaReport().chapters[0]],
+          }),
+        ),
+      );
 
     await renderBookDetail();
 
@@ -1353,19 +1610,26 @@ describe("BookDetail page", () => {
     });
 
     await act(async () => {
-      getButtonByText("Deep QA").dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      getButtonByText("Deep QA").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
     });
 
     await waitFor(() => {
       expect(container.textContent).toContain("Transcript Diff");
-      expect(container.textContent).toContain("Transcript segment drift detected.");
+      expect(container.textContent).toContain(
+        "Transcript segment drift detected.",
+      );
       expect(container.textContent).toContain("1.50s - 2.20s");
       expect(container.textContent).toContain("Expected:");
       expect(container.textContent).toContain("chapter one");
       expect(container.textContent).toContain("chapter two");
     });
 
-    expect(fetchMock).toHaveBeenCalledWith("/api/books/7/chapters/701/deep-qa", { method: "POST" });
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/books/7/chapters/701/deep-qa",
+      { method: "POST" },
+    );
     expect(fetchMock).toHaveBeenCalledWith("/api/books/7/qa-report");
   });
 });
