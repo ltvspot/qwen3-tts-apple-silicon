@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -32,14 +33,21 @@ from src.pipeline.exporter import (
     ChapterMarker,
     ConcatenationResult,
     EncodedExportArtifact,
+    LoudnessNormalizationResult,
     QAChapterSummary,
     QAReport,
     SelectedChapter,
     _build_export_paths,
     _file_sha256,
+    _load_export_state_payload,
+    _measure_noise_floor,
     _persist_export_checkpoint,
+    _verify_checksum,
+    _write_export_state_atomic,
     concatenate_chapters_sync,
     export_book_sync,
+    get_expected_export_sha256,
+    normalize_loudness,
     run_export_job_sync,
     ExportFormatResult,
     ExportResult,
@@ -544,12 +552,212 @@ def test_file_sha256_matches_known_hash(tmp_path: Path) -> None:
     assert _file_sha256(target) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
 
 
+def test_verify_checksum_accepts_matching_file(tmp_path: Path) -> None:
+    """Checksum verification should return True for untouched files."""
+
+    target = tmp_path / "checksum.txt"
+    target.write_text("trusted", encoding="utf-8")
+
+    assert _verify_checksum(target, _file_sha256(target)) is True
+
+
+def test_verify_checksum_detects_tampered_file(tmp_path: Path) -> None:
+    """Checksum verification should reject files that changed on disk."""
+
+    target = tmp_path / "checksum.txt"
+    target.write_text("trusted", encoding="utf-8")
+    expected = _file_sha256(target)
+    target.write_text("tampered", encoding="utf-8")
+
+    assert _verify_checksum(target, expected) is False
+
+
+def test_write_export_state_atomic_writes_expected_payload(tmp_path: Path) -> None:
+    """Atomic state writes should leave only the final JSON file behind."""
+
+    state_path = tmp_path / "export_state.json"
+    payload = {"stage": "Encoding", "progress_percent": 72.5}
+
+    _write_export_state_atomic(state_path, payload)
+
+    assert json.loads(state_path.read_text(encoding="utf-8")) == payload
+    assert not state_path.with_suffix(".tmp").exists()
+
+
+def test_load_export_state_payload_prefers_valid_tmp_file(test_db: Session) -> None:
+    """Recovery should prefer a valid temp state file over a corrupt main file."""
+
+    book = _create_book(test_db, title="Tmp Recovery Book")
+    state_path = _build_export_paths(book)["state"]
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text("{not-json", encoding="utf-8")
+    tmp_path = state_path.with_suffix(".tmp")
+    tmp_payload = {"current_stage": "Verified", "format_details": {"mp3": {"sha256": "abc"}}}
+    tmp_path.write_text(json.dumps(tmp_payload), encoding="utf-8")
+
+    payload = _load_export_state_payload(book)
+
+    assert payload == tmp_payload
+    assert not tmp_path.exists()
+    assert json.loads(state_path.read_text(encoding="utf-8")) == tmp_payload
+
+
+def test_load_export_state_payload_discards_invalid_tmp_when_main_valid(test_db: Session) -> None:
+    """Recovery should fall back to the main state file when the temp file is stale garbage."""
+
+    book = _create_book(test_db, title="Main Recovery Book")
+    state_path = _build_export_paths(book)["state"]
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_payload = {"current_stage": "Ready", "format_details": {"mp3": {"sha256": "good"}}}
+    state_path.write_text(json.dumps(state_payload), encoding="utf-8")
+    tmp_path = state_path.with_suffix(".tmp")
+    tmp_path.write_text("not-valid-json", encoding="utf-8")
+
+    payload = _load_export_state_payload(book)
+
+    assert payload == state_payload
+    assert not tmp_path.exists()
+
+
+def test_get_expected_export_sha256_reads_export_state_file(test_db: Session) -> None:
+    """Checksum lookup should prefer the persisted export-state snapshot."""
+
+    book = _create_book(test_db, title="Checksum State Book")
+    state_path = _build_export_paths(book)["state"]
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_export_state_atomic(
+        state_path,
+        {
+            "format_details": {
+                "mp3": {"status": "completed", "sha256": "abc123"},
+            }
+        },
+    )
+
+    assert get_expected_export_sha256(book, "mp3") == "abc123"
+
+
+def test_normalize_loudness_returns_measured_lufs_within_range(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A compliant first pass should return without retries or warnings."""
+
+    input_wav = tmp_path / "input.wav"
+    output_wav = tmp_path / "output.wav"
+    input_wav.write_bytes(b"input")
+    commands: list[list[str]] = []
+
+    monkeypatch.setattr("src.pipeline.exporter._require_ffmpeg", lambda: "ffmpeg")
+
+    def fake_run_ffmpeg(command: list[str]) -> None:
+        commands.append(command)
+        Path(command[-1]).write_bytes(b"normalized")
+
+    monkeypatch.setattr("src.pipeline.exporter.run_ffmpeg", fake_run_ffmpeg)
+    monkeypatch.setattr("src.pipeline.exporter._measure_loudness", lambda *_args, **_kwargs: -20.4)
+
+    result = normalize_loudness(input_wav, output_wav, target_lufs=-19.0)
+
+    assert result == LoudnessNormalizationResult(measured_lufs=-20.4, lufs_warning=None, attempts=1)
+    assert len(commands) == 1
+    assert "loudnorm=I=-19.0" in commands[0][5]
+
+
+def test_normalize_loudness_retries_when_first_pass_is_too_quiet(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An out-of-range quiet result should trigger a retry at -21 LUFS."""
+
+    input_wav = tmp_path / "input.wav"
+    output_wav = tmp_path / "output.wav"
+    input_wav.write_bytes(b"input")
+    targets: list[str] = []
+    measured_values = iter([-23.8, -20.8])
+
+    monkeypatch.setattr("src.pipeline.exporter._require_ffmpeg", lambda: "ffmpeg")
+
+    def fake_run_ffmpeg(command: list[str]) -> None:
+        targets.append(command[5])
+        Path(command[-1]).write_bytes(b"normalized")
+
+    monkeypatch.setattr("src.pipeline.exporter.run_ffmpeg", fake_run_ffmpeg)
+    monkeypatch.setattr(
+        "src.pipeline.exporter._measure_loudness",
+        lambda *_args, **_kwargs: next(measured_values),
+    )
+
+    result = normalize_loudness(input_wav, output_wav, target_lufs=-19.0)
+
+    assert result == LoudnessNormalizationResult(measured_lufs=-20.8, lufs_warning=None, attempts=2)
+    assert "loudnorm=I=-19.0" in targets[0]
+    assert "loudnorm=I=-21.0" in targets[1]
+
+
+def test_normalize_loudness_adds_warning_after_three_failed_attempts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Persistent out-of-range loudness should be reported in metadata instead of blocking export."""
+
+    input_wav = tmp_path / "input.wav"
+    output_wav = tmp_path / "output.wav"
+    input_wav.write_bytes(b"input")
+    measured_values = iter([-24.0, -23.7, -23.5])
+    command_count = {"value": 0}
+
+    monkeypatch.setattr("src.pipeline.exporter._require_ffmpeg", lambda: "ffmpeg")
+
+    def fake_run_ffmpeg(command: list[str]) -> None:
+        command_count["value"] += 1
+        Path(command[-1]).write_bytes(b"normalized")
+
+    monkeypatch.setattr("src.pipeline.exporter.run_ffmpeg", fake_run_ffmpeg)
+    monkeypatch.setattr(
+        "src.pipeline.exporter._measure_loudness",
+        lambda *_args, **_kwargs: next(measured_values),
+    )
+
+    result = normalize_loudness(input_wav, output_wav, target_lufs=-19.0)
+
+    assert result.measured_lufs == -23.5
+    assert result.attempts == 3
+    assert result.lufs_warning is not None
+    assert command_count["value"] == 3
+
+
+def test_measure_noise_floor_returns_quietest_ten_percent_average(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Noise-floor measurement should average the quietest astats windows."""
+
+    audio_path = tmp_path / "noise.wav"
+    audio_path.write_bytes(b"unused")
+    payload = {
+        "frames": [
+            {"tags": {"lavfi.astats.1.RMS_level": value}}
+            for value in ["-70.0", "-65.0", "-80.0", "-60.0", "-75.0", "-50.0", "-55.0", "-58.0", "-62.0", "-90.0"]
+        ]
+    }
+
+    monkeypatch.setattr("src.pipeline.exporter.shutil.which", lambda name: "/usr/bin/ffprobe" if name == "ffprobe" else None)
+    monkeypatch.setattr(
+        "src.pipeline.exporter.subprocess.run",
+        lambda *args, **kwargs: type("Completed", (), {"stdout": json.dumps(payload)})(),
+    )
+
+    assert _measure_noise_floor(audio_path) == -90.0
+
+
 def test_export_book_sync_reports_mastering_and_qa_progress_ranges(
     test_db: Session,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Export progress should advance through mastering, QA, encoding, verification, and finalizing."""
 
+    monkeypatch.setattr(settings, "EXPORT_INCLUDE_ALBUM_ART", False)
     book = _create_book(test_db, title="Progress Ranges")
     opening = _create_chapter(
         test_db,
@@ -656,7 +864,10 @@ def test_export_book_sync_reports_mastering_and_qa_progress_ranges(
     monkeypatch.setattr("src.pipeline.exporter.concatenate_chapters_sync", fake_concatenate)
     monkeypatch.setattr(
         "src.pipeline.exporter.normalize_loudness",
-        lambda _input_path, output_path, target_lufs: output_path.write_bytes(f"{target_lufs}".encode()),
+        lambda _input_path, output_path, target_lufs: (
+            output_path.write_bytes(f"{target_lufs}".encode()),
+            LoudnessNormalizationResult(measured_lufs=-20.0, lufs_warning=None, attempts=1),
+        )[1],
     )
 
     def fake_export_mp3(_input_path, output_path, **kwargs) -> EncodedExportArtifact:
@@ -689,6 +900,7 @@ def test_export_book_sync_reports_mastering_and_qa_progress_ranges(
             overall_status=QAAutomaticStatus.PASS.value,
         ).checks or type("PassResult", (), {"status": QAAutomaticStatus.PASS.value, "message": "ok"})(),
     )
+    monkeypatch.setattr("src.pipeline.exporter._measure_noise_floor", lambda _audio_path: -65.2)
 
     progress_events: list[tuple[float, str | None, str | None]] = []
     result = export_book_sync(
@@ -716,6 +928,296 @@ def test_export_book_sync_reports_mastering_and_qa_progress_ranges(
     assert any(percent == 80.0 and stage.startswith("Verifying output MP3") and export_format == "mp3" for percent, stage, export_format in progress_events)
     assert (95.0, "Finalizing", None) in progress_events
     assert progress_events[-1] == (100.0, "Ready", None)
+
+
+def test_export_book_sync_records_noise_floor_warning_metadata(
+    test_db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Noisy exports should warn without blocking completion."""
+
+    monkeypatch.setattr(settings, "EXPORT_INCLUDE_ALBUM_ART", False)
+    book = _create_book(test_db, title="Noisy Metadata")
+    chapter = _create_chapter(
+        test_db,
+        book=book,
+        number=1,
+        title="Chapter One",
+        chapter_type=ChapterType.CHAPTER,
+        duration_ms=500,
+        frequency=330,
+    )
+    _store_qa_record(test_db, chapter, overall_status=QAAutomaticStatus.PASS)
+
+    monkeypatch.setattr(
+        "src.pipeline.exporter.BookMasteringPipeline.master_book_sync",
+        lambda *args, **kwargs: MasteringReport(
+            book_id=book.id,
+            mastered_chapters=1,
+            loudness_adjustments=[],
+            edge_normalized_chapters=[],
+            peak_limited_chapters=[],
+            notes=[],
+            blockers=[],
+            book_report=BookQAReport(
+                book_id=book.id,
+                title=book.title,
+                total_chapters=1,
+                chapters_grade_a=1,
+                chapters_grade_b=0,
+                chapters_grade_c=0,
+                chapters_grade_f=0,
+                overall_grade="A",
+                ready_for_export=True,
+                cross_chapter_checks={},
+                recommendations=[],
+                export_blockers=[],
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        "src.pipeline.exporter.normalize_loudness",
+        lambda _input_path, output_path, target_lufs: (
+            output_path.write_bytes(f"{target_lufs}".encode()),
+            LoudnessNormalizationResult(measured_lufs=-19.9, lufs_warning=None, attempts=1),
+        )[1],
+    )
+
+    def fake_export_mp3(_input_path, output_path, **kwargs) -> EncodedExportArtifact:
+        del kwargs
+        output_path.write_bytes(b"mp3")
+        return EncodedExportArtifact(file_size_bytes=3, sha256="mp3hash")
+
+    monkeypatch.setattr("src.pipeline.exporter.export_mp3", fake_export_mp3)
+    monkeypatch.setattr(
+        "src.pipeline.exporter._verify_export_output",
+        lambda *_args, **_kwargs: {"ok": True, "issues": []},
+    )
+    monkeypatch.setattr(
+        "src.pipeline.exporter.check_lufs_compliance",
+        lambda _audio_path: type("PassResult", (), {"status": QAAutomaticStatus.PASS.value, "message": "ok"})(),
+    )
+    monkeypatch.setattr("src.pipeline.exporter._measure_noise_floor", lambda _audio_path: -55.2)
+
+    result = export_book_sync(book.id, export_formats=["mp3"], session_factory=sessionmaker(
+        bind=test_db.get_bind(),
+        autoflush=False,
+        autocommit=False,
+        expire_on_commit=False,
+    ))
+
+    assert result.export_status == BookExportStatus.COMPLETED.value
+    assert result.formats["mp3"].noise_floor_dbfs == -55.2
+    assert result.formats["mp3"].noise_floor_compliant is False
+
+
+def test_export_book_sync_records_noise_floor_compliance_metadata(
+    test_db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Quiet exports should record compliant noise-floor metadata."""
+
+    monkeypatch.setattr(settings, "EXPORT_INCLUDE_ALBUM_ART", False)
+    book = _create_book(test_db, title="Quiet Metadata")
+    chapter = _create_chapter(
+        test_db,
+        book=book,
+        number=1,
+        title="Chapter One",
+        chapter_type=ChapterType.CHAPTER,
+        duration_ms=500,
+        frequency=330,
+    )
+    _store_qa_record(test_db, chapter, overall_status=QAAutomaticStatus.PASS)
+
+    monkeypatch.setattr(
+        "src.pipeline.exporter.BookMasteringPipeline.master_book_sync",
+        lambda *args, **kwargs: MasteringReport(
+            book_id=book.id,
+            mastered_chapters=1,
+            loudness_adjustments=[],
+            edge_normalized_chapters=[],
+            peak_limited_chapters=[],
+            notes=[],
+            blockers=[],
+            book_report=BookQAReport(
+                book_id=book.id,
+                title=book.title,
+                total_chapters=1,
+                chapters_grade_a=1,
+                chapters_grade_b=0,
+                chapters_grade_c=0,
+                chapters_grade_f=0,
+                overall_grade="A",
+                ready_for_export=True,
+                cross_chapter_checks={},
+                recommendations=[],
+                export_blockers=[],
+            ),
+        ),
+    )
+    monkeypatch.setattr(
+        "src.pipeline.exporter.normalize_loudness",
+        lambda _input_path, output_path, target_lufs: (
+            output_path.write_bytes(f"{target_lufs}".encode()),
+            LoudnessNormalizationResult(measured_lufs=-20.2, lufs_warning="still close", attempts=3),
+        )[1],
+    )
+
+    def fake_export_mp3(_input_path, output_path, **kwargs) -> EncodedExportArtifact:
+        del kwargs
+        output_path.write_bytes(b"mp3")
+        return EncodedExportArtifact(file_size_bytes=3, sha256="mp3hash")
+
+    monkeypatch.setattr("src.pipeline.exporter.export_mp3", fake_export_mp3)
+    monkeypatch.setattr(
+        "src.pipeline.exporter._verify_export_output",
+        lambda *_args, **_kwargs: {"ok": True, "issues": []},
+    )
+    monkeypatch.setattr(
+        "src.pipeline.exporter.check_lufs_compliance",
+        lambda _audio_path: type("PassResult", (), {"status": QAAutomaticStatus.PASS.value, "message": "ok"})(),
+    )
+    monkeypatch.setattr("src.pipeline.exporter._measure_noise_floor", lambda _audio_path: -65.2)
+
+    result = export_book_sync(book.id, export_formats=["mp3"], session_factory=sessionmaker(
+        bind=test_db.get_bind(),
+        autoflush=False,
+        autocommit=False,
+        expire_on_commit=False,
+    ))
+
+    assert result.formats["mp3"].noise_floor_dbfs == -65.2
+    assert result.formats["mp3"].noise_floor_compliant is True
+    assert result.formats["mp3"].lufs_warning == "still close"
+
+
+def test_concurrent_exports_use_unique_temporary_paths(
+    test_db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Concurrent exports of the same book should not reuse temp filenames."""
+
+    monkeypatch.setattr(settings, "EXPORT_INCLUDE_ALBUM_ART", False)
+    book = _create_book(test_db, title="Concurrent Temps")
+    chapter = _create_chapter(
+        test_db,
+        book=book,
+        number=1,
+        title="Chapter One",
+        chapter_type=ChapterType.CHAPTER,
+        duration_ms=500,
+        frequency=330,
+    )
+    _store_qa_record(test_db, chapter, overall_status=QAAutomaticStatus.PASS)
+
+    session_factory = sessionmaker(
+        bind=test_db.get_bind(),
+        autoflush=False,
+        autocommit=False,
+        expire_on_commit=False,
+    )
+    lock = threading.Lock()
+    barrier = threading.Barrier(2)
+    temp_master_paths: list[str] = []
+    temp_normalized_paths: list[str] = []
+
+    monkeypatch.setattr(
+        "src.pipeline.exporter.BookMasteringPipeline.master_book_sync",
+        lambda *args, **kwargs: MasteringReport(
+            book_id=book.id,
+            mastered_chapters=1,
+            loudness_adjustments=[],
+            edge_normalized_chapters=[],
+            peak_limited_chapters=[],
+            notes=[],
+            blockers=[],
+            book_report=BookQAReport(
+                book_id=book.id,
+                title=book.title,
+                total_chapters=1,
+                chapters_grade_a=1,
+                chapters_grade_b=0,
+                chapters_grade_c=0,
+                chapters_grade_f=0,
+                overall_grade="A",
+                ready_for_export=True,
+                cross_chapter_checks={},
+                recommendations=[],
+                export_blockers=[],
+            ),
+        ),
+    )
+
+    def fake_concatenate(*args, **kwargs) -> ConcatenationResult:
+        master_wav_path = kwargs["master_wav_path"]
+        master_wav_path.parent.mkdir(parents=True, exist_ok=True)
+        master_wav_path.write_bytes(b"master")
+        with lock:
+            temp_master_paths.append(str(master_wav_path))
+        barrier.wait(timeout=2.0)
+        return ConcatenationResult(
+            master_wav_path=master_wav_path,
+            chapter_markers=[ChapterMarker(title="Chapter One", start_ms=0, end_ms=500)],
+            included_chapters=[
+                SelectedChapter(
+                    chapter_n=chapter.number,
+                    chapter_title=chapter.title or "Chapter One",
+                    chapter_type=chapter.type,
+                    audio_path=Path(settings.OUTPUTS_PATH) / str(chapter.audio_path),
+                    file_size_bytes=chapter.audio_file_size_bytes or 0,
+                    duration_seconds=chapter.duration_seconds or 0.0,
+                    qa_status="approved",
+                    export_approved=True,
+                )
+            ],
+            skipped_notes=[],
+            qa_records={},
+        )
+
+    def fake_normalize(_input_path, output_path, target_lufs) -> LoudnessNormalizationResult:
+        output_path.write_bytes(f"{target_lufs}".encode())
+        with lock:
+            temp_normalized_paths.append(str(output_path))
+        return LoudnessNormalizationResult(measured_lufs=-20.0, lufs_warning=None, attempts=1)
+
+    monkeypatch.setattr("src.pipeline.exporter.concatenate_chapters_sync", fake_concatenate)
+    monkeypatch.setattr("src.pipeline.exporter.normalize_loudness", fake_normalize)
+    monkeypatch.setattr(
+        "src.pipeline.exporter.export_mp3",
+        lambda _input_path, output_path, **kwargs: (
+            output_path.write_bytes(b"mp3"),
+            EncodedExportArtifact(file_size_bytes=3, sha256="mp3hash"),
+        )[1],
+    )
+    monkeypatch.setattr(
+        "src.pipeline.exporter._verify_export_output",
+        lambda *_args, **_kwargs: {"ok": True, "issues": []},
+    )
+    monkeypatch.setattr(
+        "src.pipeline.exporter.check_lufs_compliance",
+        lambda _audio_path: type("PassResult", (), {"status": QAAutomaticStatus.PASS.value, "message": "ok"})(),
+    )
+    monkeypatch.setattr("src.pipeline.exporter._measure_noise_floor", lambda _audio_path: -65.0)
+
+    failures: list[BaseException] = []
+
+    def run_export() -> None:
+        try:
+            export_book_sync(book.id, export_formats=["mp3"], session_factory=session_factory)
+        except BaseException as exc:  # pragma: no cover - surfaces assertion failures across threads
+            failures.append(exc)
+
+    first = threading.Thread(target=run_export)
+    second = threading.Thread(target=run_export)
+    first.start()
+    second.start()
+    first.join(timeout=2.0)
+    second.join(timeout=2.0)
+
+    assert failures == []
+    assert len(set(temp_master_paths)) == 2
+    assert len(set(temp_normalized_paths)) == 2
 
 
 def test_export_book_sync_persists_mastering_checkpoint_before_crash(

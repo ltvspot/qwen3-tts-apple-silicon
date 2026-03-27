@@ -6,9 +6,12 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import re
 import shutil
 import subprocess
+import threading
+import uuid
 import wave
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -50,6 +53,11 @@ ExportProgressCallback = Callable[[float, str | None, str | None, int | None, in
 EXPORT_VERIFY_TIMEOUT_SECONDS = 30
 EXPORT_STALE_TIMEOUT = timedelta(minutes=15)
 FORMAT_DETAILS_ARTIFACTS_KEY = "_artifacts"
+EXPORT_LUFS_MAX_ATTEMPTS = 3
+EXPORT_STATE_FILE_NAME = "export_state.json"
+_active_export_temp_files: dict[int, set[Path]] = {}
+_active_export_temp_files_lock = threading.RLock()
+_atomic_json_write_lock = threading.RLock()
 
 
 class ExportFormatResult(BaseModel):
@@ -64,6 +72,10 @@ class ExportFormatResult(BaseModel):
     error_message: str | None = None
     verification: dict[str, Any] | None = None
     attempts: int = 0
+    measured_lufs: float | None = None
+    lufs_warning: str | None = None
+    noise_floor_dbfs: float | None = None
+    noise_floor_compliant: bool | None = None
 
 
 class QAChapterSummary(BaseModel):
@@ -149,6 +161,15 @@ class EncodedExportArtifact:
 
     file_size_bytes: int
     sha256: str
+
+
+@dataclass(slots=True)
+class LoudnessNormalizationResult:
+    """Measured loudness details captured after final normalization."""
+
+    measured_lufs: float | None
+    lufs_warning: str | None
+    attempts: int
 
 
 def _slugify(value: str, *, fallback: str, max_length: int = 50) -> str:
@@ -262,6 +283,66 @@ def _file_sha256(path: Path, *, chunk_size: int = 64 * 1024) -> str:
         for chunk in iter(lambda: file_handle.read(chunk_size), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _verify_checksum(file_path: Path, expected_sha256: str) -> bool:
+    """Return whether one file still matches its persisted SHA256 checksum."""
+
+    if not file_path.exists():
+        logger.error("Checksum verification skipped because %s is missing.", file_path)
+        return False
+
+    actual_sha256 = _file_sha256(file_path)
+    if actual_sha256 == expected_sha256:
+        return True
+
+    logger.error(
+        "Checksum mismatch for %s. Expected %s, got %s. File may be corrupted.",
+        file_path,
+        expected_sha256,
+        actual_sha256,
+    )
+    return False
+
+
+def _serialize_state_value(value: Any) -> Any:
+    """Return one JSON-serializable export-state value."""
+
+    if isinstance(value, BaseModel):
+        return value.model_dump(mode="json")
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if hasattr(value, "value"):
+        return value.value
+    if isinstance(value, Path):
+        return str(value)
+    return value
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any], *, temp_suffix: str = ".tmp") -> None:
+    """Atomically persist one JSON payload with a caller-selected temp suffix."""
+
+    with _atomic_json_write_lock:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = path.with_suffix(temp_suffix)
+        temp_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        temp_path.replace(path)
+
+
+def _write_export_state_atomic(state_path: Path, state: dict[str, Any]) -> None:
+    """Atomically persist the on-disk export state snapshot."""
+
+    _write_json_atomic(state_path, state, temp_suffix=".tmp")
+
+
+def _load_json_payload(path: Path) -> dict[str, Any] | None:
+    """Load one JSON object from disk when it is valid."""
+
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def _resolve_chapter_audio_path(chapter: Chapter) -> Path | None:
@@ -536,6 +617,7 @@ def concatenate_chapters_sync(
     closing_silence_seconds: float = 3.0,
     session_factory: sessionmaker[Session] | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
+    master_wav_path: Path | None = None,
 ) -> ConcatenationResult:
     """Concatenate exported chapter WAV files and return the master WAV path."""
 
@@ -555,17 +637,17 @@ def concatenate_chapters_sync(
 
         exports_root = _exports_root(book)
         exports_root.mkdir(parents=True, exist_ok=True)
-        master_wav_path = exports_root / "master.wav"
+        target_master_wav_path = master_wav_path or (exports_root / "master.wav")
         chapter_markers = _concatenate_chapters_streaming(
             selected,
-            master_wav_path=master_wav_path,
+            master_wav_path=target_master_wav_path,
             chapter_silence_seconds=chapter_silence_seconds,
             opening_silence_seconds=opening_silence_seconds,
             closing_silence_seconds=closing_silence_seconds,
             progress_callback=progress_callback,
         )
         return ConcatenationResult(
-            master_wav_path=master_wav_path,
+            master_wav_path=target_master_wav_path,
             chapter_markers=chapter_markers,
             included_chapters=selected,
             skipped_notes=skipped_notes,
@@ -596,24 +678,169 @@ async def concatenate_chapters(
     return result.master_wav_path
 
 
-def normalize_loudness(
-    input_wav: Path,
-    output_wav: Path,
-    target_lufs: float = -19.0,
-) -> None:
-    """Normalize audio to a target LUFS value using ffmpeg loudnorm."""
+def _parse_loudnorm_metrics(output: str) -> dict[str, Any] | None:
+    """Return the parsed loudnorm JSON block from one ffmpeg run."""
+
+    match = re.search(r"(\{\s*\"input_i\".*?\})", output, re.DOTALL)
+    if match is None:
+        return None
+
+    try:
+        payload = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _escape_filter_path(path: Path) -> str:
+    """Escape one filesystem path for ffmpeg filter arguments."""
+
+    return str(path).replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\'")
+
+
+def _measure_loudness(audio_path: Path, *, target_lufs: float) -> float | None:
+    """Measure integrated LUFS for one audio file using ffmpeg loudnorm."""
 
     ffmpeg_path = _require_ffmpeg()
     command = [
         ffmpeg_path,
-        "-y",
+        "-hide_banner",
         "-i",
-        str(input_wav),
+        str(audio_path),
         "-af",
-        f"loudnorm=I={target_lufs}:TP={BookMasteringPipeline.PEAK_TARGET_DBFS}:LRA=11",
-        str(output_wav),
+        (
+            f"loudnorm=I={target_lufs}:"
+            f"TP={BookMasteringPipeline.PEAK_TARGET_DBFS}:LRA=11:print_format=json"
+        ),
+        "-f",
+        "null",
+        "-",
     ]
-    run_ffmpeg(command)
+    completed = subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=EXPORT_VERIFY_TIMEOUT_SECONDS,
+    )
+    payload = _parse_loudnorm_metrics("\n".join(part for part in (completed.stdout, completed.stderr) if part))
+    if payload is None:
+        return None
+    try:
+        return round(float(payload["input_i"]), 3)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _measure_noise_floor(audio_path: Path) -> float:
+    """Return the average RMS level for the quietest 10 percent of one audio file."""
+
+    ffprobe_path = shutil.which("ffprobe")
+    if ffprobe_path is None:
+        audio = AudioSegment.from_file(audio_path)
+        return round(float(audio.dBFS), 3)
+
+    command = [
+        ffprobe_path,
+        "-v",
+        "error",
+        "-f",
+        "lavfi",
+        "-i",
+        f"amovie='{_escape_filter_path(audio_path)}',astats=metadata=1:reset=1:length=0.1",
+        "-show_entries",
+        "frame_tags=lavfi.astats.1.RMS_level",
+        "-of",
+        "json",
+    ]
+    completed = subprocess.run(
+        command,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=EXPORT_VERIFY_TIMEOUT_SECONDS,
+    )
+
+    try:
+        payload = json.loads(completed.stdout or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Unable to parse astats output for {audio_path}: {exc}") from exc
+
+    values: list[float] = []
+    for frame in payload.get("frames", []):
+        if not isinstance(frame, dict):
+            continue
+        tags = frame.get("tags")
+        if not isinstance(tags, dict):
+            continue
+        raw_value = tags.get("lavfi.astats.1.RMS_level")
+        if raw_value in {None, "nan", "NAN"}:
+            continue
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value):
+            values.append(value)
+
+    if not values:
+        return -100.0
+
+    quietest_count = max(1, math.ceil(len(values) * 0.1))
+    quietest_values = sorted(values)[:quietest_count]
+    return round(sum(quietest_values) / len(quietest_values), 3)
+
+
+def normalize_loudness(
+    input_wav: Path,
+    output_wav: Path,
+    target_lufs: float = -19.0,
+) -> LoudnessNormalizationResult:
+    """Normalize audio and keep retrying until the measured LUFS is ACX compliant."""
+
+    ffmpeg_path = _require_ffmpeg()
+    measured_lufs: float | None = None
+    current_target = target_lufs
+
+    for attempt in range(1, EXPORT_LUFS_MAX_ATTEMPTS + 1):
+        command = [
+            ffmpeg_path,
+            "-y",
+            "-i",
+            str(input_wav),
+            "-af",
+            f"loudnorm=I={current_target}:TP={BookMasteringPipeline.PEAK_TARGET_DBFS}:LRA=11",
+            str(output_wav),
+        ]
+        run_ffmpeg(command)
+        measured_lufs = _measure_loudness(output_wav, target_lufs=current_target)
+        if measured_lufs is not None and -23.0 <= measured_lufs <= -18.0:
+            return LoudnessNormalizationResult(
+                measured_lufs=measured_lufs,
+                lufs_warning=None,
+                attempts=attempt,
+            )
+
+        if attempt >= EXPORT_LUFS_MAX_ATTEMPTS:
+            break
+
+        if measured_lufs is None:
+            current_target = target_lufs
+        elif measured_lufs < -23.0:
+            current_target = -21.0
+        else:
+            current_target = -20.0
+
+    warning = (
+        "Normalized loudness remained outside the ACX range after "
+        f"{EXPORT_LUFS_MAX_ATTEMPTS} attempts (measured={measured_lufs})."
+    )
+    logger.warning("%s", warning)
+    return LoudnessNormalizationResult(
+        measured_lufs=measured_lufs,
+        lufs_warning=warning,
+        attempts=EXPORT_LUFS_MAX_ATTEMPTS,
+    )
 
 
 def _escape_ffmetadata(value: str) -> str:
@@ -865,10 +1092,53 @@ def _build_export_paths(book: Book) -> dict[str, Path]:
         "master_wav": exports_root / "master.wav",
         "normalized_wav": exports_root / "master.normalized.wav",
         "metadata": exports_root / "chapters.ffmetadata",
+        "state": exports_root / EXPORT_STATE_FILE_NAME,
         "qa_report": exports_root / "qa_report.json",
         "mp3": exports_root / f"{safe_title}.mp3",
         "m4b": exports_root / f"{safe_title}.m4b",
     }
+
+
+def _build_temporary_export_paths(book: Book, *, temp_suffix: str) -> dict[str, Path]:
+    """Return unique temporary paths for one in-flight export run."""
+
+    exports_root = _exports_root(book)
+    return {
+        "master_wav": exports_root / f"master{temp_suffix}.wav",
+        "normalized_wav": exports_root / f"master.normalized{temp_suffix}.wav",
+        "metadata": exports_root / f"chapters{temp_suffix}.ffmetadata",
+    }
+
+
+def _register_export_temp_files(export_job_id: int | None, *paths: Path) -> None:
+    """Track temporary export files so route shutdown can clean them up."""
+
+    if export_job_id is None:
+        return
+
+    with _active_export_temp_files_lock:
+        bucket = _active_export_temp_files.setdefault(export_job_id, set())
+        bucket.update(paths)
+
+
+def _discard_export_temp_files(export_job_id: int | None) -> None:
+    """Forget tracked temporary files for one export job."""
+
+    if export_job_id is None:
+        return
+
+    with _active_export_temp_files_lock:
+        _active_export_temp_files.pop(export_job_id, None)
+
+
+def cleanup_export_temp_files(export_job_id: int) -> None:
+    """Delete any tracked temporary files for one export job."""
+
+    with _active_export_temp_files_lock:
+        paths = list(_active_export_temp_files.get(export_job_id, set()))
+
+    for path in paths:
+        path.unlink(missing_ok=True)
 
 
 def get_export_output_path(book: Book, export_format: str) -> Path:
@@ -877,6 +1147,55 @@ def get_export_output_path(book: Book, export_format: str) -> Path:
     if export_format not in VALID_EXPORT_FORMATS:
         raise ValueError(f"Unsupported export format: {export_format}")
     return _build_export_paths(book)[export_format]
+
+
+def _load_export_state_payload(book: Book) -> dict[str, Any]:
+    """Load the persisted export-state snapshot, preferring a valid recovery temp file."""
+
+    state_path = _build_export_paths(book)["state"]
+    temp_path = state_path.with_suffix(".tmp")
+
+    temp_payload = _load_json_payload(temp_path) if temp_path.exists() else None
+    main_payload = _load_json_payload(state_path) if state_path.exists() else None
+
+    if temp_payload is not None:
+        _write_export_state_atomic(state_path, temp_payload)
+        temp_path.unlink(missing_ok=True)
+        return temp_payload
+
+    if temp_path.exists():
+        temp_path.unlink(missing_ok=True)
+
+    return main_payload or {}
+
+
+def _resolved_format_details_payload(
+    book: Book,
+    stored_format_details: str | dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Return the best available format-details payload for recovery and downloads."""
+
+    state_payload = _load_export_state_payload(book)
+    state_format_details = state_payload.get("format_details")
+    if isinstance(state_format_details, dict):
+        return state_format_details
+    return _load_format_details_payload(stored_format_details)
+
+
+def get_expected_export_sha256(
+    book: Book,
+    export_format: str,
+    *,
+    stored_format_details: str | dict[str, Any] | None = None,
+) -> str | None:
+    """Return the persisted checksum for one export format when available."""
+
+    payload = _resolved_format_details_payload(book, stored_format_details=stored_format_details)
+    raw_result = payload.get(export_format)
+    if not isinstance(raw_result, dict):
+        return None
+    sha256 = raw_result.get("sha256")
+    return sha256 if isinstance(sha256, str) and sha256 else None
 
 
 def _job_formats_requested(export_job: ExportJob | None) -> list[str]:
@@ -1007,7 +1326,7 @@ def _existing_export_artifacts(
     latest_completed_at: datetime | None = None
     found_any = False
     results = _empty_format_details(requested)
-    stored_payload = _load_format_details_payload(stored_format_details)
+    stored_payload = _resolved_format_details_payload(book, stored_format_details=stored_format_details)
 
     for export_format in requested:
         output_path = get_export_output_path(book, export_format)
@@ -1027,17 +1346,18 @@ def _existing_export_artifacts(
                     exc,
                 )
 
+        stat_result = output_path.stat()
         integrity_error = _recovery_probe_output(output_path)
         actual_sha256: str | None = None
         expected_sha256 = stored_result.sha256 if stored_result is not None else None
         if expected_sha256:
             actual_sha256 = _file_sha256(output_path)
-            if actual_sha256 != expected_sha256:
+            if not _verify_checksum(output_path, expected_sha256):
+                output_path.unlink(missing_ok=True)
                 integrity_error = (
                     f"sha256 mismatch during recovery: expected {expected_sha256}, got {actual_sha256}"
                 )
 
-        stat_result = output_path.stat()
         if integrity_error:
             results[export_format] = ExportFormatResult(
                 status="error",
@@ -1125,7 +1445,9 @@ def reconcile_export_job_state(
                 "format_details": json.dumps(
                     _serialize_format_details_payload(
                         format_details,
-                        artifacts=_format_details_artifacts(export_job.format_details),
+                        artifacts=_format_details_artifacts(
+                            _resolved_format_details_payload(book, stored_format_details=export_job.format_details)
+                        ),
                     )
                 ),
                 "qa_report": recovered_qa_report.model_dump_json(),
@@ -1219,13 +1541,19 @@ def reconcile_book_export_artifacts(db_session: Session, book: Book) -> bool:
         book=book,
         include_only_approved=True,
         export_date=created_at,
+        stored_format_details=_resolved_format_details_payload(book),
     )
     export_job = ExportJob(
         book_id=book.id,
         job_token=f"recovered_export_{book.id}_{created_at.strftime('%Y%m%d_%H%M%S')}",
         export_status=BookExportStatus.COMPLETED,
         formats_requested=json.dumps(completed_formats or list(DEFAULT_EXPORT_FORMATS)),
-        format_details=json.dumps({name: result.model_dump(mode="json") for name, result in format_details.items()}),
+        format_details=json.dumps(
+            _serialize_format_details_payload(
+                format_details,
+                artifacts=_format_details_artifacts(_resolved_format_details_payload(book)),
+            )
+        ),
         progress_percent=100.0,
         current_stage="Export completed",
         current_format=None,
@@ -1316,7 +1644,8 @@ def _load_recovered_qa_report(
     """Load an existing QA report from disk when possible, or rebuild a minimal replacement."""
 
     qa_report_path = _build_export_paths(book)["qa_report"]
-    qa_report_artifact = _format_details_artifacts(stored_format_details).get("qa_report")
+    resolved_details = _resolved_format_details_payload(book, stored_format_details=stored_format_details)
+    qa_report_artifact = _format_details_artifacts(resolved_details).get("qa_report")
     expected_qa_report_sha256 = (
         qa_report_artifact.get("sha256")
         if isinstance(qa_report_artifact, dict)
@@ -1330,27 +1659,33 @@ def _load_recovered_qa_report(
             )
             return None
 
-        actual_qa_report_sha256 = _file_sha256(qa_report_path)
-        if actual_qa_report_sha256 != expected_qa_report_sha256:
-            logger.warning(
-                "Refusing to recover QA report for book %s because the hash mismatched (expected=%s actual=%s)",
-                book.id,
-                expected_qa_report_sha256,
-                actual_qa_report_sha256,
+        if not _verify_checksum(qa_report_path, expected_qa_report_sha256):
+            qa_report_path.unlink(missing_ok=True)
+            logger.warning("Rebuilding QA report for book %s after checksum verification failed.", book.id)
+            return _build_recovered_qa_report(
+                db_session,
+                book=book,
+                include_only_approved=include_only_approved,
+                export_date=export_date,
             )
-            return None
 
     if qa_report_path.exists():
         try:
             return QAReport.model_validate_json(qa_report_path.read_text(encoding="utf-8"))
         except (OSError, ValidationError, json.JSONDecodeError) as exc:
             if expected_qa_report_sha256:
+                qa_report_path.unlink(missing_ok=True)
                 logger.warning(
-                    "Refusing to recover QA report for book %s because the hashed artifact could not be parsed: %s",
+                    "Rebuilding QA report for book %s because the hashed artifact could not be parsed: %s",
                     book.id,
                     exc,
                 )
-                return None
+                return _build_recovered_qa_report(
+                    db_session,
+                    book=book,
+                    include_only_approved=include_only_approved,
+                    export_date=export_date,
+                )
             logger.warning("Failed to load recovered QA report for book %s: %s", book.id, exc)
 
     return _build_recovered_qa_report(
@@ -1492,7 +1827,13 @@ def export_book_sync(
         db_session.expunge(book)
 
     export_paths = _build_export_paths(book)
+    temp_suffix = f".{uuid.uuid4().hex[:8]}.tmp"
+    temp_paths = _build_temporary_export_paths(
+        book,
+        temp_suffix=temp_suffix,
+    )
     export_paths["exports_root"].mkdir(parents=True, exist_ok=True)
+    _register_export_temp_files(export_job_id, *temp_paths.values())
     cover_art_path = (
         _ensure_placeholder_cover(export_paths["exports_root"])
         if settings.EXPORT_INCLUDE_ALBUM_ART
@@ -1506,14 +1847,37 @@ def export_book_sync(
     concatenation: ConcatenationResult | None = None
     total_chapters = 0
     checkpoint_artifacts: dict[str, Any] = {}
+    normalization_result = LoudnessNormalizationResult(measured_lufs=None, lufs_warning=None, attempts=0)
+    state_payload = _load_export_state_payload(book)
+    state_payload.update(
+        {
+            "book_id": book.id,
+            "book_title": book.title,
+            "export_job_id": export_job_id,
+            "formats_requested": formats,
+            "include_only_approved": include_only_approved,
+            "export_status": BookExportStatus.PROCESSING.value,
+            "current_stage": "Preparing export job",
+            "current_format": None,
+            "progress_percent": 0.0,
+            "format_details": _serialize_format_details_payload(format_results),
+            "updated_at": utc_now().isoformat(),
+        }
+    )
+    _write_export_state_atomic(export_paths["state"], state_payload)
 
     def persist_checkpoint(**updates: Any) -> None:
+        serialized_updates = dict(updates)
+        serialized_updates.setdefault("updated_at", utc_now())
+        for field_name, field_value in serialized_updates.items():
+            state_payload[field_name] = _serialize_state_value(field_value)
+        _write_export_state_atomic(export_paths["state"], state_payload)
         if export_job_id is None:
             return
         _persist_export_checkpoint(
             session_factory,
             export_job_id,
-            updates,
+            serialized_updates,
         )
 
     _emit_progress(
@@ -1623,15 +1987,24 @@ def export_book_sync(
             closing_silence_seconds=settings.EXPORT_CLOSING_SILENCE_SECONDS,
             session_factory=session_factory,
             progress_callback=report_concatenation_progress,
+            master_wav_path=temp_paths["master_wav"],
         )
         ensure_active()
         total_chapters = len(concatenation.included_chapters)
         checkpoint_artifacts["master_wav_hash"] = _file_sha256(concatenation.master_wav_path)
-        normalize_loudness(
+        normalization_result = normalize_loudness(
             concatenation.master_wav_path,
-            export_paths["normalized_wav"],
+            temp_paths["normalized_wav"],
             target_lufs=settings.EXPORT_TARGET_LUFS,
         )
+        if not isinstance(normalization_result, LoudnessNormalizationResult):
+            normalization_result = LoudnessNormalizationResult(
+                measured_lufs=None,
+                lufs_warning=None,
+                attempts=0,
+            )
+        if normalization_result.lufs_warning:
+            lufs_notes.append(normalization_result.lufs_warning)
         persist_checkpoint(
             current_stage="Concatenation complete",
             progress_percent=50.0,
@@ -1681,23 +2054,25 @@ def export_book_sync(
                 status="processing",
                 file_name=output_path.name,
                 file_size_bytes=output_path.stat().st_size if output_path.exists() else None,
+                measured_lufs=normalization_result.measured_lufs,
+                lufs_warning=normalization_result.lufs_warning,
             )
 
             try:
                 if export_format == "mp3":
                     encoded_artifact = export_mp3(
-                        export_paths["normalized_wav"],
+                        temp_paths["normalized_wav"],
                         export_paths["mp3"],
                         book=book,
                         cover_art_path=cover_art_path,
                     )
                 else:
                     encoded_artifact = export_m4b(
-                        export_paths["normalized_wav"],
+                        temp_paths["normalized_wav"],
                         export_paths["m4b"],
                         book=book,
                         chapter_markers=concatenation.chapter_markers,
-                        metadata_path=export_paths["metadata"],
+                        metadata_path=temp_paths["metadata"],
                     )
                 encoded_artifacts[export_format] = encoded_artifact
                 encoded_outputs[export_format] = output_path
@@ -1707,6 +2082,8 @@ def export_book_sync(
                     sha256=encoded_artifact.sha256,
                     file_name=output_path.name,
                     attempts=0,
+                    measured_lufs=normalization_result.measured_lufs,
+                    lufs_warning=normalization_result.lufs_warning,
                 )
                 persist_checkpoint(
                     current_stage=_format_stage_label("Encoded", export_format),
@@ -1735,6 +2112,8 @@ def export_book_sync(
                     error_message=str(exc),
                     file_name=output_path.name,
                     file_size_bytes=output_path.stat().st_size if output_path.exists() else None,
+                    measured_lufs=normalization_result.measured_lufs,
+                    lufs_warning=normalization_result.lufs_warning,
                 )
                 persist_checkpoint(
                     current_stage=_format_stage_label("Encoding failed", export_format),
@@ -1787,18 +2166,18 @@ def export_book_sync(
                 ensure_active()
                 if export_format == "mp3":
                     encoded_artifacts[export_format] = export_mp3(
-                        export_paths["normalized_wav"],
+                        temp_paths["normalized_wav"],
                         export_paths["mp3"],
                         book=book,
                         cover_art_path=cover_art_path,
                     )
                 else:
                     encoded_artifacts[export_format] = export_m4b(
-                        export_paths["normalized_wav"],
+                        temp_paths["normalized_wav"],
                         export_paths["m4b"],
                         book=book,
                         chapter_markers=concatenation.chapter_markers,
-                        metadata_path=export_paths["metadata"],
+                        metadata_path=temp_paths["metadata"],
                     )
 
             if verification is None or not verification.get("ok"):
@@ -1816,6 +2195,8 @@ def export_book_sync(
                     error_message=error_message,
                     verification=verification,
                     attempts=attempts,
+                    measured_lufs=normalization_result.measured_lufs,
+                    lufs_warning=normalization_result.lufs_warning,
                 )
                 persist_checkpoint(
                     current_stage=_format_stage_label("Verification failed", export_format),
@@ -1838,6 +2219,11 @@ def export_book_sync(
                 )
                 continue
 
+            noise_floor_dbfs = _measure_noise_floor(output_path)
+            noise_floor_compliant = noise_floor_dbfs <= -60.0
+            if not noise_floor_compliant:
+                logger.warning("Noise floor %s dBFS exceeds ACX limit of -60 dBFS", noise_floor_dbfs)
+
             format_results[export_format] = ExportFormatResult(
                 status="completed",
                 file_size_bytes=encoded_artifacts[export_format].file_size_bytes,
@@ -1847,6 +2233,10 @@ def export_book_sync(
                 completed_at=utc_now(),
                 verification=verification,
                 attempts=attempts,
+                measured_lufs=normalization_result.measured_lufs,
+                lufs_warning=normalization_result.lufs_warning,
+                noise_floor_dbfs=noise_floor_dbfs,
+                noise_floor_compliant=noise_floor_compliant,
             )
             persist_checkpoint(
                 current_stage=_format_stage_label("Verified", export_format),
@@ -1877,14 +2267,14 @@ def export_book_sync(
                     loudness_result.message,
                 )
                 lufs_notes.append(f"{output_path.name}: {loudness_result.message}")
+            if not noise_floor_compliant:
+                lufs_notes.append(
+                    f"{output_path.name}: noise floor {noise_floor_dbfs:.1f} dBFS exceeds ACX limit of -60 dBFS."
+                )
     finally:
-        for temporary_path in (
-            export_paths["master_wav"],
-            export_paths["normalized_wav"],
-            export_paths["metadata"],
-        ):
-            if temporary_path.exists():
-                temporary_path.unlink()
+        for temporary_path in temp_paths.values():
+            temporary_path.unlink(missing_ok=True)
+        _discard_export_temp_files(export_job_id)
 
     qa_report = _build_qa_report(
         book=book,
@@ -1900,10 +2290,7 @@ def export_book_sync(
         current_chapter_n=total_chapters or None,
         total_chapters=total_chapters or None,
     )
-    export_paths["qa_report"].write_text(
-        json.dumps(qa_report.model_dump(mode="json"), indent=2),
-        encoding="utf-8",
-    )
+    _write_json_atomic(export_paths["qa_report"], qa_report.model_dump(mode="json"), temp_suffix=temp_suffix)
     checkpoint_artifacts["qa_report"] = {
         "file_name": export_paths["qa_report"].name,
         "file_size_bytes": export_paths["qa_report"].stat().st_size,
@@ -1922,17 +2309,32 @@ def export_book_sync(
         qa_report=qa_report,
     )
 
+    final_stage = "Ready" if not errors else "Export completed with errors"
+    final_status = BookExportStatus.COMPLETED.value if not errors else BookExportStatus.ERROR.value
+    persist_checkpoint(
+        current_stage=final_stage,
+        progress_percent=100.0 if not errors else max(95.0, 100.0 - (100.0 / max(len(formats), 1))),
+        current_format=None,
+        current_chapter_n=total_chapters or None,
+        total_chapters=total_chapters or None,
+        format_details=_serialize_format_details_payload(
+            format_results,
+            artifacts=checkpoint_artifacts,
+        ),
+        qa_report=qa_report,
+        export_status=final_status,
+    )
     _emit_progress(
         progress_callback,
         progress_percent=100.0 if not errors else max(95.0, 100.0 - (100.0 / max(len(formats), 1))),
-        stage="Ready" if not errors else "Export completed with errors",
+        stage=final_stage,
         current_chapter_n=total_chapters or None,
         total_chapters=total_chapters or None,
     )
 
     return ExportResult(
         book_id=book.id,
-        export_status=BookExportStatus.COMPLETED.value if not errors else BookExportStatus.ERROR.value,
+        export_status=final_status,
         formats=format_results,
         qa_report=qa_report,
     )
@@ -2067,12 +2469,7 @@ def run_export_job_sync(export_job_id: int, session_factory: sessionmaker[Sessio
         export_job.current_format = None
         export_job.current_chapter_n = None
         export_job.total_chapters = None
-        export_job.format_details = json.dumps(
-            {
-                name: result.model_dump(mode="json")
-                for name, result in _empty_format_details(formats_requested).items()
-            }
-        )
+        export_job.format_details = json.dumps(_serialize_format_details_payload(_empty_format_details(formats_requested)))
         book.export_status = BookExportStatus.PROCESSING
         db_session.commit()
 
@@ -2129,7 +2526,10 @@ def run_export_job_sync(export_job_id: int, session_factory: sessionmaker[Sessio
         completed_job.current_format = None
         completed_job.current_chapter_n = completed_job.total_chapters
         completed_job.format_details = json.dumps(
-            {name: format_result.model_dump(mode="json") for name, format_result in result.formats.items()}
+            _serialize_format_details_payload(
+                result.formats,
+                artifacts=_format_details_artifacts(completed_job.format_details),
+            )
         )
         completed_job.qa_report = result.qa_report.model_dump_json()
 

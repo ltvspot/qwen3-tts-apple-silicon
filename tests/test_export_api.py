@@ -6,11 +6,12 @@ import json
 import asyncio
 import threading
 import time
+from pathlib import Path
 from typing import cast
 from urllib.parse import unquote
 
 from pydub import AudioSegment
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from src.api import export_routes
 from src.database import (
@@ -26,6 +27,7 @@ from src.database import (
     QAStatus,
     utc_now,
 )
+from src.pipeline import exporter as export_pipeline
 from src.pipeline.exporter import ExportFormatResult, ExportResult, QAReport, get_export_output_path, run_export_job_sync
 
 
@@ -178,14 +180,43 @@ def test_export_endpoint_returns_quickly_and_health_stays_responsive(
     health_elapsed = time.monotonic() - health_started
 
     release_worker.set()
-    for thread in export_routes._snapshot_export_threads():
-        thread.join(timeout=1.0)
+    export_routes._wait_for_export_workers(timeout_seconds=1.0)
 
     assert response.status_code == 200
     assert started.wait(timeout=1.0)
     assert queue_elapsed < 2.0
     assert health_response.status_code == 200
     assert health_elapsed < 1.0
+
+
+def test_launch_export_job_uses_thread_pool(monkeypatch) -> None:
+    """Launching an export should submit a tracked future to the shared executor."""
+
+    started = threading.Event()
+    finished = threading.Event()
+
+    def fake_run_export_job_sync(export_job_id: int, session_factory=None) -> None:
+        del export_job_id, session_factory
+        started.set()
+        finished.wait(timeout=1.0)
+
+    monkeypatch.setattr(export_routes, "run_export_job_sync", fake_run_export_job_sync)
+
+    export_routes._launch_export_job(99)
+    assert started.wait(timeout=1.0)
+    snapshot = export_routes._snapshot_export_futures()
+    assert 99 in snapshot
+
+    finished.set()
+    done, not_done = export_routes._wait_for_export_workers(timeout_seconds=1.0)
+    assert not not_done
+    assert snapshot[99] in done
+
+
+def test_shutdown_export_workers_handles_empty_executor() -> None:
+    """The shutdown hook should be safe even when no exports are running."""
+
+    export_routes._shutdown_export_workers(timeout_seconds=0.01, recreate_executor=True)
 
 
 def test_export_rejects_partial_book(client, test_db: Session) -> None:
@@ -609,6 +640,119 @@ def test_batch_export_queues_ready_books_and_exposes_progress(client, test_db: S
     assert progress["skipped"] == 1
     assert progress["not_ready"] == 1
     assert progress["books"][0]["title"] == "Ready For Batch Export"
+
+
+def test_download_export_checksum_mismatch_queues_reexport(client, test_db: Session, monkeypatch) -> None:
+    """Downloads should delete corrupted files and queue a replacement export instead of serving them."""
+
+    book = _create_book(test_db, title="Corrupt Download")
+    _create_ready_chapter(test_db, book_id=book.id)
+    output_path = get_export_output_path(book, "mp3")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(b"corrupt")
+    test_db.add(
+        ExportJob(
+            book_id=book.id,
+            job_token=f"export_{book.id}_20260326_160000",
+            export_status=BookExportStatus.COMPLETED,
+            formats_requested=json.dumps(["mp3"]),
+            format_details=json.dumps(
+                {
+                    "mp3": {
+                        "status": "completed",
+                        "file_name": output_path.name,
+                        "file_size_bytes": output_path.stat().st_size,
+                        "sha256": "0" * 64,
+                    }
+                }
+            ),
+            include_only_approved=True,
+            started_at=utc_now(),
+            completed_at=utc_now(),
+        )
+    )
+    book.export_status = BookExportStatus.COMPLETED
+    test_db.commit()
+
+    queued_formats: list[list[str]] = []
+
+    def fake_queue_export_for_book(book, request, *, db, session_factory):
+        del book, db, session_factory
+        queued_formats.append(request.formats)
+        return object(), request.formats, 30, utc_now()
+
+    monkeypatch.setattr(export_routes, "_queue_export_for_book", fake_queue_export_for_book)
+    monkeypatch.setattr(export_routes, "_verify_checksum", lambda *_args, **_kwargs: False)
+
+    response = client.get(f"/api/book/{book.id}/export/download/mp3")
+
+    assert response.status_code == 409
+    assert response.json()["detail"] == "Export file failed checksum verification and was deleted. Re-export queued."
+    assert queued_formats == [["mp3"]]
+    assert not output_path.exists()
+
+
+def test_shutdown_export_workers_marks_interrupted_and_cleans_temp_files(
+    test_db: Session,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """Exports still running after the shutdown timeout should be marked interrupted and cleaned up."""
+
+    book = _create_book(test_db, title="Interrupted Export")
+    export_job = ExportJob(
+        book_id=book.id,
+        job_token=f"export_{book.id}_20260326_160500",
+        export_status=BookExportStatus.PROCESSING,
+        formats_requested=json.dumps(["mp3"]),
+        format_details=json.dumps({"mp3": {"status": "pending"}}),
+        include_only_approved=True,
+        started_at=utc_now(),
+        updated_at=utc_now(),
+    )
+    test_db.add(export_job)
+    book.export_status = BookExportStatus.PROCESSING
+    test_db.commit()
+
+    temp_file = tmp_path / "lingering.tmp.wav"
+    temp_file.write_bytes(b"temp")
+    export_pipeline._register_export_temp_files(export_job.id, temp_file)
+    release_worker = threading.Event()
+
+    def fake_run_export_job_sync(export_job_id: int, session_factory=None) -> None:
+        del export_job_id, session_factory
+        release_worker.wait(timeout=1.0)
+
+    monkeypatch.setattr(export_routes, "run_export_job_sync", fake_run_export_job_sync)
+
+    export_routes._launch_export_job(
+        export_job.id,
+        session_factory=sessionmaker(
+            bind=test_db.get_bind(),
+            autoflush=False,
+            autocommit=False,
+            expire_on_commit=False,
+        ),
+    )
+    export_routes._shutdown_export_workers(
+        timeout_seconds=0.01,
+        recreate_executor=True,
+        session_factory=sessionmaker(
+            bind=test_db.get_bind(),
+            autoflush=False,
+            autocommit=False,
+            expire_on_commit=False,
+        ),
+    )
+    release_worker.set()
+
+    test_db.refresh(export_job)
+    test_db.refresh(book)
+    assert export_job.export_status == BookExportStatus.ERROR
+    assert export_job.current_stage == "interrupted"
+    assert export_job.error_message == "Export interrupted during shutdown."
+    assert book.export_status == BookExportStatus.ERROR
+    assert not temp_file.exists()
 
 
 def test_download_export_serves_audio_file(client, test_db: Session) -> None:

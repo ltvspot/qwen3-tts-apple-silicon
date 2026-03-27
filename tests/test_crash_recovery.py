@@ -502,6 +502,97 @@ def test_reconcile_export_job_state_skips_mismatched_hash(test_db: Session) -> N
     assert book.export_status == BookExportStatus.PROCESSING
 
 
+def test_reconcile_export_job_state_deletes_corrupted_output_on_hash_mismatch(test_db: Session) -> None:
+    """Corrupted recovered outputs should be removed instead of left on disk."""
+
+    book = _create_book(test_db, title="Delete Corrupt Recovery")
+    output_path = get_export_output_path(book, "mp3")
+    _write_recoverable_audio(output_path, format_name="mp3")
+    export_job = ExportJob(
+        book_id=book.id,
+        job_token=f"export_{book.id}_20260326_152000",
+        export_status=BookExportStatus.PROCESSING,
+        formats_requested=json.dumps(["mp3"]),
+        format_details=json.dumps(
+            {
+                "mp3": {
+                    "status": "completed",
+                    "file_name": output_path.name,
+                    "file_size_bytes": output_path.stat().st_size,
+                    "sha256": "f" * 64,
+                }
+            }
+        ),
+        include_only_approved=True,
+        started_at=utc_now(),
+        updated_at=utc_now(),
+    )
+    test_db.add(export_job)
+    book.export_status = BookExportStatus.PROCESSING
+    test_db.commit()
+
+    assert output_path.exists()
+
+    result = reconcile_export_job_state(test_db, book, export_job)
+
+    assert result is None
+    assert not output_path.exists()
+
+
+def test_reconcile_export_job_state_uses_valid_tmp_state_when_main_state_is_corrupt(test_db: Session) -> None:
+    """Recovery should load checksum metadata from the temp state snapshot after a crash."""
+
+    book = _create_book(test_db, title="State Tmp Recovery")
+    output_path = get_export_output_path(book, "mp3")
+    _write_recoverable_audio(output_path, format_name="mp3")
+    qa_report_path, qa_report = _write_recovered_qa_report(book)
+    export_job = ExportJob(
+        book_id=book.id,
+        job_token=f"export_{book.id}_20260326_152500",
+        export_status=BookExportStatus.PROCESSING,
+        formats_requested=json.dumps(["mp3"]),
+        format_details=json.dumps({"mp3": {"status": "pending"}}),
+        include_only_approved=True,
+        started_at=utc_now(),
+        updated_at=utc_now(),
+    )
+    test_db.add(export_job)
+    book.export_status = BookExportStatus.PROCESSING
+    test_db.commit()
+
+    state_path = _build_export_paths(book)["state"]
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text("{broken", encoding="utf-8")
+    state_path.with_suffix(".tmp").write_text(
+        json.dumps(
+            {
+                "format_details": {
+                    "mp3": {
+                        "status": "completed",
+                        "file_name": output_path.name,
+                        "file_size_bytes": output_path.stat().st_size,
+                        "sha256": _file_sha256(output_path),
+                    },
+                    "_artifacts": {
+                        "qa_report": {
+                            "file_name": qa_report_path.name,
+                            "file_size_bytes": qa_report_path.stat().st_size,
+                            "sha256": _file_sha256(qa_report_path),
+                        }
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = reconcile_export_job_state(test_db, book, export_job)
+
+    test_db.refresh(export_job)
+    assert result == "recovered"
+    assert json.loads(export_job.qa_report or "{}")["notes"] == qa_report.notes
+
+
 def test_reconcile_export_job_state_rolls_back_when_book_update_fails(test_db: Session) -> None:
     """Recovery should roll back export_job changes if the book update fails."""
 

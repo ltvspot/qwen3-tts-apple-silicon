@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import atexit
 import asyncio
 import json
+import logging
 import threading
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -13,14 +16,17 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session, selectinload, sessionmaker
 
 from src.api.cache import invalidate_library_cache
-from src.database import Book, BookExportStatus, Chapter, ChapterQARecord, ChapterStatus, ExportJob, get_db, utc_now
+from src.database import Book, BookExportStatus, Chapter, ChapterQARecord, ChapterStatus, ExportJob, SessionLocal, get_db, utc_now
 from src.pipeline.exporter import (
     ExportFormatResult,
     QAReport,
+    _verify_checksum,
     _empty_format_details,
     _chapter_is_approved,
     _normalize_export_formats,
+    cleanup_export_temp_files,
     estimate_export_seconds,
+    get_expected_export_sha256,
     get_export_output_path,
     reconcile_book_export_artifacts,
     reconcile_export_job_state,
@@ -28,10 +34,12 @@ from src.pipeline.exporter import (
 )
 
 router = APIRouter(prefix="/api", tags=["export"])
+logger = logging.getLogger(__name__)
 
 _export_tasks: set[asyncio.Task[None]] = set()
-_export_threads: dict[int, threading.Thread] = {}
 _export_threads_lock = threading.RLock()
+_export_executor: ThreadPoolExecutor | None = None
+_export_futures: dict[int, Future[None]] = {}
 _batch_export_lock = threading.RLock()
 _batch_export_monitor_task: asyncio.Task[None] | None = None
 _batch_export_progress: "BatchExportProgressResponse | None" = None
@@ -62,17 +70,115 @@ def _snapshot_export_tasks() -> list[asyncio.Task[None]]:
 def _snapshot_export_threads() -> list[threading.Thread]:
     """Return a stable snapshot of tracked export threads."""
 
-    with _export_threads_lock:
-        return list(_export_threads.values())
+    return []
 
 
 def _clear_export_threads() -> list[threading.Thread]:
     """Clear tracked export threads and return the prior snapshot."""
 
+    return []
+
+
+def _ensure_export_executor() -> ThreadPoolExecutor:
+    """Return the shared export executor, recreating it after test shutdowns."""
+
+    global _export_executor
     with _export_threads_lock:
-        threads = list(_export_threads.values())
-        _export_threads.clear()
-    return threads
+        if _export_executor is None:
+            _export_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="export")
+        return _export_executor
+
+
+def _snapshot_export_futures() -> dict[int, Future[None]]:
+    """Return a stable snapshot of tracked export futures."""
+
+    with _export_threads_lock:
+        return dict(_export_futures)
+
+
+def _clear_export_futures() -> dict[int, Future[None]]:
+    """Clear tracked export futures and return the prior snapshot."""
+
+    with _export_threads_lock:
+        futures = dict(_export_futures)
+        _export_futures.clear()
+    return futures
+
+
+def _discard_export_future(export_job_id: int, future: Future[None]) -> None:
+    """Drop one completed export future if it still owns the registry slot."""
+
+    with _export_threads_lock:
+        if _export_futures.get(export_job_id) is future:
+            _export_futures.pop(export_job_id, None)
+
+
+def _wait_for_export_workers(timeout_seconds: float = 60.0) -> tuple[set[Future[None]], set[Future[None]]]:
+    """Wait for the currently tracked export workers to finish."""
+
+    snapshot = _snapshot_export_futures()
+    if not snapshot:
+        return (set(), set())
+    return wait(list(snapshot.values()), timeout=timeout_seconds)
+
+
+def _mark_export_job_interrupted(
+    export_job_id: int,
+    *,
+    session_factory: sessionmaker[Session] | None = None,
+) -> None:
+    """Persist an interrupted export state when shutdown outlives the worker timeout."""
+
+    session_factory = session_factory or SessionLocal
+    with session_factory() as db_session:
+        export_job = db_session.query(ExportJob).filter(ExportJob.id == export_job_id).first()
+        if export_job is None or export_job.export_status != BookExportStatus.PROCESSING:
+            return
+
+        book = db_session.query(Book).filter(Book.id == export_job.book_id).first()
+        interrupted_at = utc_now()
+        export_job.export_status = BookExportStatus.ERROR
+        export_job.completed_at = interrupted_at
+        export_job.updated_at = interrupted_at
+        export_job.current_stage = "interrupted"
+        export_job.current_format = None
+        export_job.error_message = "Export interrupted during shutdown."
+        if book is not None:
+            book.export_status = BookExportStatus.ERROR
+        db_session.commit()
+
+
+def _shutdown_export_workers(
+    *,
+    timeout_seconds: float = 60.0,
+    recreate_executor: bool = False,
+    session_factory: sessionmaker[Session] | None = None,
+) -> None:
+    """Request executor shutdown, waiting briefly before marking stuck jobs interrupted."""
+
+    global _export_executor
+
+    snapshot = _snapshot_export_futures()
+    with _export_threads_lock:
+        executor = _export_executor
+        _export_executor = None
+
+    if executor is not None:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    done: set[Future[None]] = set()
+    not_done: set[Future[None]] = set()
+    if snapshot:
+        done, not_done = wait(list(snapshot.values()), timeout=timeout_seconds)
+
+    for export_job_id, future in snapshot.items():
+        if future.cancelled() or future in not_done:
+            _mark_export_job_interrupted(export_job_id, session_factory=session_factory)
+            cleanup_export_temp_files(export_job_id)
+
+    _clear_export_futures()
+    if recreate_executor:
+        _ensure_export_executor()
 
 
 def _clear_export_tasks() -> list[asyncio.Task[None]]:
@@ -82,6 +188,9 @@ def _clear_export_tasks() -> list[asyncio.Task[None]]:
         tasks = list(_export_tasks)
         _export_tasks.clear()
     return tasks
+
+
+atexit.register(lambda: _shutdown_export_workers(timeout_seconds=60.0, recreate_executor=False))
 
 
 class ExportRequest(BaseModel):
@@ -408,23 +517,16 @@ def _launch_export_job(
     *,
     session_factory: sessionmaker[Session] | None = None,
 ) -> None:
-    """Run one export job on a dedicated background thread."""
+    """Run one export job on the shared background executor."""
 
-    def worker() -> None:
-        try:
-            run_export_job_sync(export_job_id, session_factory=session_factory)
-        finally:
-            with _export_threads_lock:
-                _export_threads.pop(export_job_id, None)
-
-    thread = threading.Thread(
-        target=worker,
-        name=f"export-job-{export_job_id}",
-        daemon=True,
+    future = _ensure_export_executor().submit(
+        run_export_job_sync,
+        export_job_id,
+        session_factory=session_factory,
     )
     with _export_threads_lock:
-        _export_threads[export_job_id] = thread
-    thread.start()
+        _export_futures[export_job_id] = future
+    future.add_done_callback(lambda completed_future, job_id=export_job_id: _discard_export_future(job_id, completed_future))
 
 
 def _book_is_ready_for_batch_export(db: Session, book: Book, *, include_only_approved: bool) -> bool:
@@ -636,6 +738,26 @@ async def cancel_export(book_id: int, db: Session = Depends(get_db)) -> ExportCa
     )
 
 
+def _queue_reexport_for_format(
+    *,
+    book: Book,
+    export_format: str,
+    export_job: ExportJob | None,
+    db: Session,
+) -> None:
+    """Queue a replacement export after checksum verification rejects an existing file."""
+
+    include_only_approved = export_job.include_only_approved if export_job is not None else True
+    request = ExportRequest(formats=[export_format], include_only_approved=include_only_approved)
+    _queue_export_for_book(
+        book,
+        request,
+        db=db,
+        session_factory=_session_factory_for(db),
+    )
+    invalidate_library_cache()
+
+
 @router.get("/book/{book_id}/export/download/{export_format}")
 async def download_export(book_id: int, export_format: str, db: Session = Depends(get_db)) -> FileResponse:
     """Serve a completed MP3 or M4B export file."""
@@ -646,9 +768,40 @@ async def download_export(book_id: int, export_format: str, db: Session = Depend
     if normalized_format not in {"mp3", "m4b"}:
         raise HTTPException(status_code=400, detail="Invalid format")
 
+    export_job = db.query(ExportJob).filter(ExportJob.book_id == book_id).first()
     output_path = get_export_output_path(book, normalized_format)
     if not output_path.exists():
         raise HTTPException(status_code=404, detail="Export file not found")
+
+    expected_sha256 = get_expected_export_sha256(
+        book,
+        normalized_format,
+        stored_format_details=export_job.format_details if export_job is not None else None,
+    )
+    if expected_sha256 and not _verify_checksum(output_path, expected_sha256):
+        output_path.unlink(missing_ok=True)
+        try:
+            _queue_reexport_for_format(
+                book=book,
+                export_format=normalized_format,
+                export_job=export_job,
+                db=db,
+            )
+        except HTTPException as exc:
+            logger.warning(
+                "Failed to queue replacement export for corrupted %s book %s download: %s",
+                normalized_format,
+                book.id,
+                exc.detail,
+            )
+            raise HTTPException(
+                status_code=409,
+                detail="Export file failed checksum verification and was deleted. Re-export could not be queued.",
+            ) from exc
+        raise HTTPException(
+            status_code=409,
+            detail="Export file failed checksum verification and was deleted. Re-export queued.",
+        )
 
     media_type = "audio/mpeg" if normalized_format == "mp3" else "audio/mp4"
     return FileResponse(
