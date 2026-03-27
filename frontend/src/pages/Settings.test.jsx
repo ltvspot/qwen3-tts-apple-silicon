@@ -377,4 +377,40 @@ describe("Settings page", () => {
 
     expect(fetchMock).toHaveBeenCalledTimes(4);
   });
+
+  test("switches to the pronunciation tab and loads pronunciation controls", async () => {
+    fetchMock.mockImplementation((url) => {
+      if (url === "/api/settings") {
+        return Promise.resolve(createJsonResponse(createSettingsPayload()));
+      }
+      if (url === "/api/settings/schema") {
+        return Promise.resolve(createJsonResponse(createSettingsSchema()));
+      }
+      if (url === "/api/pronunciation") {
+        return Promise.resolve(createJsonResponse({ global: { Thoreau: "thuh-ROH" }, per_book: {} }));
+      }
+      if (url === "/api/pronunciation/suggestions") {
+        return Promise.resolve(createJsonResponse([]));
+      }
+      throw new Error(`Unexpected fetch URL: ${url}`);
+    });
+
+    await renderSettingsPage();
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("Production Defaults");
+      expect(container.textContent).toContain("Pronunciation");
+    });
+
+    await act(async () => {
+      getButtonByText(container, "Pronunciation").dispatchEvent(
+        new MouseEvent("click", { bubbles: true }),
+      );
+    });
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("Shared pronunciations");
+      expect(container.textContent).toContain("Thoreau");
+    });
+  });
 });

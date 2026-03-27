@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from src.api import export_routes
 from src.database import (
+    ChapterQARecord,
     Book,
     BookExportStatus,
     BookStatus,
@@ -288,6 +289,98 @@ def test_export_rejects_unapproved_book(client, test_db: Session) -> None:
 
     assert response.status_code == 400
     assert response.json()["detail"] == "Only 1/2 chapters approved. Approve all chapters before exporting."
+
+
+def test_batch_export_respects_requested_book_order_and_history_lookup(
+    client,
+    test_db: Session,
+    monkeypatch,
+) -> None:
+    """Batch export should preserve requested book order and expose the batch by id."""
+
+    first = _create_book(test_db, title="First Ready")
+    second = _create_book(test_db, title="Second Ready")
+    _create_ready_chapter(test_db, book_id=first.id)
+    _create_ready_chapter(test_db, book_id=second.id)
+    captured: dict[str, object] = {}
+
+    async def fake_run_batch_export(*, batch_id: str, book_ids: list[int], request, session_factory) -> None:
+        del request, session_factory
+        captured["batch_id"] = batch_id
+        captured["book_ids"] = list(book_ids)
+
+    monkeypatch.setattr(export_routes, "_run_batch_export", fake_run_batch_export)
+
+    response = client.post(
+        "/api/export/batch",
+        json={
+            "book_ids": [second.id, first.id],
+            "formats": ["mp3"],
+            "include_only_approved": True,
+            "skip_already_exported": False,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["queued"] == 2
+    assert captured["book_ids"] == [second.id, first.id]
+
+    by_id_response = client.get(f"/api/export/batch/{payload['batch_id']}")
+    assert by_id_response.status_code == 200
+    assert by_id_response.json()["batch_id"] == payload["batch_id"]
+
+
+def test_batch_export_marks_skipped_and_not_ready_books(client, test_db: Session, monkeypatch) -> None:
+    """Batch export should skip already exported books and exclude non-ready titles."""
+
+    exported = _create_book(test_db, title="Already Exported")
+    exported.export_status = BookExportStatus.COMPLETED
+    ready = _create_book(test_db, title="Ready Book")
+    not_ready = _create_book(test_db, title="Not Ready Book")
+    _create_ready_chapter(test_db, book_id=ready.id)
+    chapter = _create_generated_chapter(test_db, book_id=not_ready.id, number=1, qa_status=QAStatus.NEEDS_REVIEW)
+    test_db.add(
+        ChapterQARecord(
+            book_id=not_ready.id,
+            chapter_n=chapter.number,
+            overall_status=QAAutomaticStatus.FAIL,
+            qa_details=json.dumps({"overall_status": "fail", "checks": []}),
+        )
+    )
+    test_db.commit()
+
+    async def fake_run_batch_export(*, batch_id: str, book_ids: list[int], request, session_factory) -> None:
+        del batch_id, book_ids, request, session_factory
+
+    monkeypatch.setattr(export_routes, "_run_batch_export", fake_run_batch_export)
+
+    response = client.post(
+        "/api/export/batch",
+        json={
+            "formats": ["mp3"],
+            "include_only_approved": True,
+            "skip_already_exported": True,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["queued"] == 1
+    assert payload["skipped"] == 1
+    assert payload["not_ready"] == 1
+
+    progress = client.get("/api/export/batch/progress")
+    assert progress.status_code == 200
+    assert progress.json()["queued"] == 1
+
+
+def test_get_batch_export_by_unknown_id_returns_404(client) -> None:
+    """Unknown batch export ids should return a 404."""
+
+    response = client.get("/api/export/batch/does-not-exist")
+
+    assert response.status_code == 404
 
 
 def test_export_accepts_book_without_qa_record_when_approval_required(client, test_db: Session, monkeypatch) -> None:

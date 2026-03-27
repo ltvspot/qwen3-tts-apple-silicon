@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +13,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from src.api.generation_runtime import ensure_batch_orchestrator
 from src.config import settings
-from src.database import Book, BookStatus, GenerationJob, GenerationJobStatus, get_db
+from src.database import AudioQAResult, BatchBookStatus, BatchRun, Book, BookStatus, GenerationJob, GenerationJobStatus, get_db
 from src.notifications import send_batch_error_notification, send_batch_started_notification
 from src.pipeline.batch_orchestrator import BatchSchedulingStrategy
 
@@ -68,6 +69,8 @@ class BatchBookResultPayload(BaseModel):
     started_at: str | None = None
     completed_at: str | None = None
     duration_seconds: float = 0.0
+    qa_average_score: float | None = None
+    qa_ready_for_export: bool | None = None
 
 
 class BatchProgressPayload(BaseModel):
@@ -102,6 +105,98 @@ class BatchProgressPayload(BaseModel):
     currentBook: str | None = None
     currentChapter: str | None = None
     memoryUsageMB: float | None = None
+
+
+def _current_or_persisted_batch_payload(batch_id: str, db: Session, *, active_payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Return a batch payload from the active orchestrator or persisted DB state."""
+
+    if active_payload is not None and active_payload.get("batch_id") == batch_id:
+        return active_payload
+
+    run = db.query(BatchRun).filter(BatchRun.batch_id == batch_id).first()
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"Batch {batch_id} not found.")
+
+    book_statuses = (
+        db.query(BatchBookStatus)
+        .filter(BatchBookStatus.batch_id == batch_id)
+        .order_by(BatchBookStatus.id.asc())
+        .all()
+    )
+    qa_lookup = {
+        (record.book_id, record.chapter_n): record
+        for record in db.query(AudioQAResult).all()
+    }
+    book_results = []
+    for status in book_statuses:
+        chapter_scores = [
+            float(record.overall_score)
+            for key, record in qa_lookup.items()
+            if key[0] == status.book_id and record.overall_score is not None
+        ]
+        qa_average_score = round(sum(chapter_scores) / len(chapter_scores), 2) if chapter_scores else None
+        qa_ready_for_export = bool(chapter_scores) and min(chapter_scores) >= 80.0 if chapter_scores else None
+        book_results.append(
+            {
+                "book_id": status.book_id,
+                "title": status.book.title if getattr(status, "book", None) is not None else f"Book {status.book_id}",
+                "status": status.status,
+                "chapters_total": status.chapters_total,
+                "chapters_completed": status.chapters_completed,
+                "chapters_failed": status.chapters_failed,
+                "error_message": status.error_message,
+                "started_at": status.started_at.isoformat() if status.started_at else None,
+                "completed_at": status.completed_at.isoformat() if status.completed_at else None,
+                "duration_seconds": status.duration_seconds,
+                "qa_average_score": qa_average_score,
+                "qa_ready_for_export": qa_ready_for_export,
+            }
+        )
+
+    started_at = run.started_at.isoformat() if run.started_at else None
+    estimated_completion = run.estimated_completion.isoformat() if run.estimated_completion else None
+    books_in_progress = 1 if run.current_book_id is not None and run.status in {"running", "paused"} else 0
+    books_remaining = max(
+        run.total_books - run.books_completed - run.books_failed - run.books_skipped - books_in_progress,
+        0,
+    )
+    return {
+        "batch_id": run.batch_id,
+        "status": run.status,
+        "total_books": run.total_books,
+        "books_completed": run.books_completed,
+        "books_failed": run.books_failed,
+        "books_skipped": run.books_skipped,
+        "books_in_progress": books_in_progress,
+        "books_remaining": books_remaining,
+        "current_book_id": run.current_book_id,
+        "current_book_title": run.current_book_title,
+        "started_at": started_at,
+        "estimated_completion": estimated_completion,
+        "elapsed_seconds": round(run.elapsed_seconds, 1),
+        "avg_seconds_per_book": round(run.avg_seconds_per_book, 1),
+        "resource_warnings": [warning.strip() for warning in (run.resource_warnings or "").split(";") if warning.strip()],
+        "model_reloads": run.model_reloads,
+        "pause_reason": run.pause_reason,
+        "scheduling_strategy": None,
+        "summary": (
+            f"Completed: {run.books_completed} | Failed: {run.books_failed} | "
+            f"Skipped: {run.books_skipped} | Remaining: {books_remaining}"
+        ),
+        "percent_complete": round(
+            (run.books_completed + run.books_failed + run.books_skipped) / max(run.total_books, 1) * 100,
+            1,
+        ),
+        "book_results": book_results,
+        "estimatedTimeRemainingSeconds": int(books_remaining * run.avg_seconds_per_book) if run.avg_seconds_per_book else None,
+        "avgChapterTimeSeconds": None,
+        "avgBookTimeSeconds": round(run.avg_seconds_per_book, 1),
+        "booksCompleted": run.books_completed,
+        "booksTotal": run.total_books,
+        "currentBook": run.current_book_title,
+        "currentChapter": None,
+        "memoryUsageMB": None,
+    }
 
 
 def _default_batch_book_ids(db: Session) -> list[int]:
@@ -342,6 +437,30 @@ async def get_batch_progress(db: Session = Depends(get_db)) -> BatchProgressPayl
     return None if payload is None else BatchProgressPayload.model_validate(payload)
 
 
+@router.get("/active", response_model=BatchProgressPayload | None)
+async def get_active_batch(db: Session = Depends(get_db)) -> BatchProgressPayload | None:
+    """Return the active or most recent batch payload."""
+
+    return await get_batch_progress(db)
+
+
+@router.get("/history")
+async def get_batch_history(db: Session = Depends(get_db)) -> dict[str, list[dict[str, Any]]]:
+    """Return recent persisted batch runs."""
+
+    orchestrator = await ensure_batch_orchestrator(db)
+    return {"batches": orchestrator.history()}
+
+
+@router.get("/{batch_id}", response_model=BatchProgressPayload)
+async def get_batch_by_id(batch_id: str, db: Session = Depends(get_db)) -> BatchProgressPayload:
+    """Return one batch payload by identifier."""
+
+    orchestrator = await ensure_batch_orchestrator(db)
+    payload = _current_or_persisted_batch_payload(batch_id, db, active_payload=orchestrator.to_dict())
+    return BatchProgressPayload.model_validate(payload)
+
+
 @router.post("/pause", response_model=BatchProgressPayload | None)
 async def pause_batch(request: BatchActionRequest, db: Session = Depends(get_db)) -> BatchProgressPayload | None:
     """Pause the active batch before the next book starts."""
@@ -350,6 +469,25 @@ async def pause_batch(request: BatchActionRequest, db: Session = Depends(get_db)
     await orchestrator.pause(request.reason or "Manual pause")
     payload = orchestrator.to_dict()
     return None if payload is None else BatchProgressPayload.model_validate(payload)
+
+
+@router.post("/{batch_id}/pause", response_model=BatchProgressPayload)
+async def pause_batch_by_id(
+    batch_id: str,
+    request: BatchActionRequest,
+    db: Session = Depends(get_db),
+) -> BatchProgressPayload:
+    """Pause the active batch identified by ``batch_id``."""
+
+    orchestrator = await ensure_batch_orchestrator(db)
+    active = orchestrator.to_dict()
+    if active is None or active.get("batch_id") != batch_id:
+        raise HTTPException(status_code=409, detail="That batch is not currently active.")
+    await orchestrator.pause(request.reason or "Manual pause")
+    payload = orchestrator.to_dict()
+    if payload is None:
+        raise HTTPException(status_code=404, detail=f"Batch {batch_id} not found.")
+    return BatchProgressPayload.model_validate(payload)
 
 
 @router.post("/resume", response_model=BatchProgressPayload | None)
@@ -362,6 +500,21 @@ async def resume_batch(db: Session = Depends(get_db)) -> BatchProgressPayload | 
     return None if payload is None else BatchProgressPayload.model_validate(payload)
 
 
+@router.post("/{batch_id}/resume", response_model=BatchProgressPayload)
+async def resume_batch_by_id(batch_id: str, db: Session = Depends(get_db)) -> BatchProgressPayload:
+    """Resume the active batch identified by ``batch_id``."""
+
+    orchestrator = await ensure_batch_orchestrator(db)
+    active = orchestrator.to_dict()
+    if active is None or active.get("batch_id") != batch_id:
+        raise HTTPException(status_code=409, detail="That batch is not currently active.")
+    await orchestrator.resume()
+    payload = orchestrator.to_dict()
+    if payload is None:
+        raise HTTPException(status_code=404, detail=f"Batch {batch_id} not found.")
+    return BatchProgressPayload.model_validate(payload)
+
+
 @router.post("/cancel", response_model=BatchProgressPayload | None)
 async def cancel_batch(db: Session = Depends(get_db)) -> BatchProgressPayload | None:
     """Cancel the active batch."""
@@ -372,9 +525,17 @@ async def cancel_batch(db: Session = Depends(get_db)) -> BatchProgressPayload | 
     return None if payload is None else BatchProgressPayload.model_validate(payload)
 
 
-@router.get("/history")
-async def get_batch_history(db: Session = Depends(get_db)) -> dict[str, list[dict[str, Any]]]:
-    """Return recent persisted batch runs."""
+@router.post("/{batch_id}/cancel", response_model=BatchProgressPayload)
+async def cancel_batch_by_id(batch_id: str, db: Session = Depends(get_db)) -> BatchProgressPayload:
+    """Cancel the active batch identified by ``batch_id``."""
 
     orchestrator = await ensure_batch_orchestrator(db)
-    return {"batches": orchestrator.history()}
+    active = orchestrator.to_dict()
+    if active is None or active.get("batch_id") != batch_id:
+        raise HTTPException(status_code=409, detail="That batch is not currently active.")
+    await orchestrator.cancel()
+    payload = orchestrator.to_dict()
+    if payload is None:
+        raise HTTPException(status_code=404, detail=f"Batch {batch_id} not found.")
+    return BatchProgressPayload.model_validate(payload)
+

@@ -6,9 +6,13 @@ from dataclasses import dataclass
 import logging
 import re
 import unicodedata
+from typing import TYPE_CHECKING
 
 import numpy as np
 from pydub.audio_segment import AudioSegment
+
+if TYPE_CHECKING:
+    from src.engines.pronunciation_dictionary import PronunciationDictionary
 
 logger = logging.getLogger(__name__)
 _DFT_MATRIX_CACHE: dict[int, np.ndarray] = {}
@@ -171,6 +175,21 @@ class TextChunker:
             )
 
         return chunks
+
+    @classmethod
+    def preprocess_for_tts(
+        cls,
+        text: str,
+        *,
+        book_id: int | None = None,
+        pronunciation_dictionary: "PronunciationDictionary | None" = None,
+    ) -> str:
+        """Apply pronunciation dictionary substitutions before synthesis."""
+
+        del cls
+        if pronunciation_dictionary is None or not text:
+            return text
+        return pronunciation_dictionary.replace_text(text, book_id=book_id)
 
     @classmethod
     def split_for_retry(cls, text: str) -> tuple[str, str] | None:

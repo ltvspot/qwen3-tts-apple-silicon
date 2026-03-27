@@ -276,6 +276,115 @@ class TimeoutAlwaysEngine:
         return None
 
 
+def test_post_generation_loudness_check_re_normalizes_outlier_chapters(
+    test_db: Session,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Outlier WAV files should be re-normalized against the book chapter mean."""
+
+    generator = AudiobookGenerator(engine=FlakyEngine())
+    generator.output_path = tmp_path
+    book = create_book(test_db, status=BookStatus.GENERATED)
+    intro = create_chapter(
+        test_db,
+        book_id=book.id,
+        number=1,
+        title="Introduction",
+        chapter_type=ChapterType.INTRODUCTION,
+        text="Intro text.",
+    )
+    content = create_chapter(
+        test_db,
+        book_id=book.id,
+        number=2,
+        title="Chapter 1",
+        chapter_type=ChapterType.CHAPTER,
+        text="Chapter text.",
+    )
+    credits = create_chapter(
+        test_db,
+        book_id=book.id,
+        number=3,
+        title="Closing Credits",
+        chapter_type=ChapterType.CLOSING_CREDITS,
+        text="Credits text.",
+    )
+    for chapter, filename in ((intro, "intro.wav"), (content, "content.wav"), (credits, "credits.wav")):
+        path = tmp_path / filename
+        AudioSegment.silent(duration=500).export(path, format="wav")
+        chapter.audio_path = filename
+        chapter.status = ChapterStatus.GENERATED
+    test_db.commit()
+
+    measured_values = {
+        "intro.wav": -18.4,
+        "content.wav": -18.0,
+        "credits.wav": -15.8,
+    }
+    renormalized: list[tuple[str, float]] = []
+
+    monkeypatch.setattr(
+        Qwen3TTS,
+        "measure_audio_lufs",
+        classmethod(lambda cls, audio: measured_values.get(Path(audio.filename).name if hasattr(audio, "filename") else "", -18.0)),
+    )
+
+    def fake_from_file(path: Path | str):
+        audio = AudioSegment.silent(duration=500)
+        audio.filename = str(path)
+        return audio
+
+    monkeypatch.setattr("src.pipeline.generator.AudioSegment.from_file", fake_from_file)
+
+    def fake_normalize_wav_path(path: Path | str, *, target_lufs: float):
+        renormalized.append((Path(path).name, round(target_lufs, 3)))
+        return -18.2
+
+    monkeypatch.setattr(Qwen3TTS, "normalize_wav_path", classmethod(lambda cls, path, target_lufs=-18.5: fake_normalize_wav_path(path, target_lufs=target_lufs)))
+
+    generator._post_generation_loudness_check(book.id, [intro, content, credits], test_db)
+
+    assert renormalized == [("credits.wav", -18.2)]
+    assert json.loads(credits.generation_metadata)["raw_wav_lufs"] == -18.2
+    assert "Credits loudness drift detected" in caplog.text
+
+
+def test_post_generation_loudness_check_skips_books_without_content_chapters(
+    test_db: Session,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The post-pass should do nothing when a book only has credits audio."""
+
+    generator = AudiobookGenerator(engine=FlakyEngine())
+    generator.output_path = tmp_path
+    book = create_book(test_db, status=BookStatus.GENERATED, title="Credits Only")
+    credits = create_chapter(
+        test_db,
+        book_id=book.id,
+        number=1,
+        title="Closing Credits",
+        chapter_type=ChapterType.CLOSING_CREDITS,
+        text="Credits text.",
+    )
+    path = tmp_path / "credits-only.wav"
+    AudioSegment.silent(duration=500).export(path, format="wav")
+    credits.audio_path = path.name
+    credits.status = ChapterStatus.GENERATED
+    test_db.commit()
+
+    normalize_calls: list[str] = []
+    monkeypatch.setattr(Qwen3TTS, "normalize_wav_path", classmethod(lambda cls, path, target_lufs=-18.5: normalize_calls.append(str(path)) or target_lufs))
+    monkeypatch.setattr("src.pipeline.generator.AudioSegment.from_file", lambda path: AudioSegment.silent(duration=500))
+    monkeypatch.setattr(Qwen3TTS, "measure_audio_lufs", classmethod(lambda cls, audio: -16.0))
+
+    generator._post_generation_loudness_check(book.id, [credits], test_db)
+
+    assert normalize_calls == []
+
+
 class ConsecutiveFailureGenerator:
     """Queue generator stub that marks chapters failed and keeps failing."""
 

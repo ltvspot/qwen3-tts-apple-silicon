@@ -12,6 +12,11 @@ jest.mock("./pages/BookDetail", () => ({
   default: () => <div>Book Detail</div>,
 }));
 
+jest.mock("./pages/BatchProduction", () => ({
+  __esModule: true,
+  default: () => <div>Batch Production</div>,
+}));
+
 jest.mock("./pages/CatalogDashboard", () => ({
   __esModule: true,
   default: () => <div>Catalog Dashboard</div>,
@@ -117,6 +122,14 @@ describe("App routes", () => {
 
     await waitFor(() => {
       expect(container.textContent).toContain("Production Overseer");
+    });
+  });
+
+  test("renders_batch_production_route", async () => {
+    await renderAppAt("/batch-production");
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("Batch Production");
     });
   });
 

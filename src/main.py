@@ -29,6 +29,7 @@ from src.api.overseer_routes import router as overseer_router
 from src.api.qa_routes import router as qa_router
 from src.api.queue_routes import router as queue_router
 from src.api.settings_routes import router as settings_router
+from src.api.system_routes import router as system_router
 from src.api.voice_lab import release_engine, router as voice_lab_router
 from src.api.routes import router as api_router
 from src.api.schemas import HealthCheckResponse, HealthDiskPayload, StartupHealthSummary
@@ -111,6 +112,7 @@ app.include_router(overseer_router)
 app.include_router(qa_router)
 app.include_router(queue_router)
 app.include_router(settings_router)
+app.include_router(system_router)
 app.include_router(voice_lab_router)
 
 

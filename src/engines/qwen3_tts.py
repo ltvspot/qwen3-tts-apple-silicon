@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import gc
 import json
 import logging
 import os
@@ -11,6 +12,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -21,13 +23,15 @@ from pydub.generators import Sine
 from src.config import get_application_settings, settings
 from src.engines.base import AudioGenerationConfig, TTSEngine, Voice
 from src.engines.voice_cloner import VoiceCloner
-from src.pipeline.pronunciation_watchlist import INSTRUCTION_PREFIX, INSTRUCTION_SUFFIX
 
 logger = logging.getLogger(__name__)
 
 MODEL_DIR_NAME = "Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit"
 BASE_MODEL_DIR_NAME = "Qwen3-TTS-12Hz-1.7B-Base-8bit"
 DEFAULT_SAMPLE_RATE = 22050
+RAW_WAV_TARGET_LUFS = -18.5
+RAW_WAV_PEAK_LIMIT_DBFS = -0.5
+DEFAULT_MODEL_RESTART_INTERVAL = 50
 ENGLISH_LANG_CODE = "en"
 VOICE_PRESETS: dict[str, dict[str, str]] = {
     "Ethan": {
@@ -61,10 +65,40 @@ SYNTHETIC_VOICE_FREQUENCIES: dict[str, int] = {
     "Aria": 250,
     "Leo": 175,
 }
+# Keep this inline-instruction wrapper local so importing the engine does not
+# import the pipeline package at module load time.
+INLINE_INSTRUCTION_PREFIX = "[[alexandria-instruct:"
+INLINE_INSTRUCTION_SUFFIX = "]]"
 INLINE_INSTRUCTION_PATTERN = re.compile(
-    rf"^\s*{re.escape(INSTRUCTION_PREFIX)}(?P<instruction>.*?){re.escape(INSTRUCTION_SUFFIX)}\s*",
+    rf"^\s*{re.escape(INLINE_INSTRUCTION_PREFIX)}(?P<instruction>.*?){re.escape(INLINE_INSTRUCTION_SUFFIX)}\s*",
     re.IGNORECASE | re.DOTALL,
 )
+
+
+@lru_cache(maxsize=1)
+def _mlx_core_module() -> Any | None:
+    """Return the mlx.core module when available."""
+
+    try:
+        import mlx.core as mx  # type: ignore[import-not-found]
+    except Exception:
+        return None
+    return mx
+
+
+@lru_cache(maxsize=1)
+def _ffmpeg_binary() -> str | None:
+    """Return the resolved ffmpeg binary when available."""
+
+    return shutil.which("ffmpeg")
+
+
+def _measure_integrated_lufs(audio_path: Path) -> float | None:
+    """Load the QA loudness helper lazily to avoid engine/pipeline import cycles."""
+
+    from src.pipeline.book_qa import measure_integrated_lufs
+
+    return measure_integrated_lufs(audio_path)
 
 
 def compute_adaptive_timeout(text: str, speed: float = 1.0) -> float:
@@ -105,6 +139,8 @@ class Qwen3TTS(TTSEngine):
         self._generation_attempts = 0
         self._timeout_count = 0
         self._min_timeout_samples_before_restart = 10
+        self._chapters_since_restart = 0
+        self._restart_interval = int(os.environ.get("TTS_MODEL_RESTART_INTERVAL", DEFAULT_MODEL_RESTART_INTERVAL))
         self.voice_cloner = VoiceCloner(settings.VOICES_PATH)
 
     @property
@@ -158,6 +194,7 @@ class Qwen3TTS(TTSEngine):
         if model_speakers:
             self._supported_speakers = {str(speaker).lower() for speaker in model_speakers}
         self.loaded = True
+        self._chapters_since_restart = 0
         logger.info("Loaded Qwen3-TTS model from %s", self.model_path)
 
     def unload(self) -> None:
@@ -169,6 +206,18 @@ class Qwen3TTS(TTSEngine):
         self._resolved_backend = None
         self.sample_rate = DEFAULT_SAMPLE_RATE
         logger.info("Qwen3-TTS engine unloaded")
+
+    @property
+    def restart_interval(self) -> int:
+        """Return the configured model restart interval in chapters."""
+
+        return self._restart_interval
+
+    @property
+    def chapters_since_restart(self) -> int:
+        """Return the number of completed chapters since the current model was loaded."""
+
+        return self._chapters_since_restart
 
     def list_voices(self) -> list[Voice]:
         """Return app-facing voice presets and any runtime cloned voices."""
@@ -749,6 +798,8 @@ class Qwen3TTS(TTSEngine):
             return
 
         try:
+            self.clear_cached_model_loaders()
+            self.clear_mlx_metal_cache()
             self.unload()
             self.load()
         except Exception:
@@ -756,6 +807,61 @@ class Qwen3TTS(TTSEngine):
         finally:
             self._generation_attempts = 0
             self._timeout_count = 0
+            self._chapters_since_restart = 0
+
+    @classmethod
+    def clear_cached_model_loaders(cls) -> None:
+        """Clear any cached model-loader helpers before a forced restart."""
+
+        del cls
+        _mlx_core_module.cache_clear()
+        _ffmpeg_binary.cache_clear()
+
+    @classmethod
+    def clear_mlx_metal_cache(cls) -> bool:
+        """Best-effort clear of MLX Metal allocator state on Apple Silicon."""
+
+        del cls
+        mx = _mlx_core_module()
+        if mx is None:
+            return False
+        metal = getattr(mx, "metal", None)
+        clear_cache = getattr(metal, "clear_cache", None)
+        if not callable(clear_cache):
+            return False
+        try:
+            clear_cache()
+        except Exception:
+            logger.exception("Failed to clear MLX Metal cache")
+            return False
+        return True
+
+    @classmethod
+    def current_process_memory_mb(cls) -> float:
+        """Return current process RSS in megabytes when available."""
+
+        del cls
+        try:
+            import psutil
+
+            return round(psutil.Process().memory_info().rss / (1024 * 1024), 3)
+        except Exception:
+            return 0.0
+
+    def record_completed_chapter(self) -> None:
+        """Track one completed chapter for restart-status reporting."""
+
+        self._chapters_since_restart += 1
+
+    def model_status(self) -> dict[str, float | int | bool]:
+        """Return a compact status snapshot for system endpoints."""
+
+        return {
+            "chapters_since_restart": self._chapters_since_restart,
+            "restart_interval": self._restart_interval,
+            "memory_usage_mb": self.current_process_memory_mb(),
+            "model_loaded": self.loaded,
+        }
 
     def _normalize_audio(self, audio: AudioSegment) -> AudioSegment:
         """Normalize audio toward a consistent output level with peak limiting."""
@@ -772,6 +878,83 @@ class Qwen3TTS(TTSEngine):
         if peak_dbfs > -0.5:
             normalized = normalized.apply_gain(-0.5 - peak_dbfs)
         return normalized
+
+    @classmethod
+    def measure_audio_lufs(cls, audio: AudioSegment) -> float | None:
+        """Measure integrated LUFS for an in-memory audio segment."""
+
+        del cls
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
+            temp_path = Path(handle.name)
+        try:
+            audio.set_channels(1).set_sample_width(2).export(temp_path, format="wav")
+            return _measure_integrated_lufs(temp_path)
+        finally:
+            temp_path.unlink(missing_ok=True)
+
+    @classmethod
+    def normalize_audio_to_lufs(
+        cls,
+        audio: AudioSegment,
+        *,
+        target_lufs: float = RAW_WAV_TARGET_LUFS,
+        max_iterations: int = 2,
+    ) -> tuple[AudioSegment, float | None]:
+        """Normalize an audio segment toward the raw-WAV LUFS target."""
+
+        if audio.dBFS == float("-inf"):
+            return audio, None
+
+        normalized = audio.set_channels(1)
+        measured_lufs = cls.measure_audio_lufs(normalized)
+        for _ in range(max_iterations):
+            reference_lufs = measured_lufs if measured_lufs is not None else normalized.dBFS
+            gain_adjustment = target_lufs - float(reference_lufs)
+            if abs(gain_adjustment) <= 0.25:
+                break
+            normalized = normalized.apply_gain(gain_adjustment)
+            peak_dbfs = normalized.max_dBFS
+            if peak_dbfs > RAW_WAV_PEAK_LIMIT_DBFS:
+                normalized = normalized.apply_gain(RAW_WAV_PEAK_LIMIT_DBFS - peak_dbfs)
+            measured_lufs = cls.measure_audio_lufs(normalized)
+
+        peak_dbfs = normalized.max_dBFS
+        if peak_dbfs > RAW_WAV_PEAK_LIMIT_DBFS:
+            normalized = normalized.apply_gain(RAW_WAV_PEAK_LIMIT_DBFS - peak_dbfs)
+            measured_lufs = cls.measure_audio_lufs(normalized)
+        return normalized, measured_lufs
+
+    @classmethod
+    def normalize_wav_path(
+        cls,
+        audio_path: str | Path,
+        *,
+        target_lufs: float = RAW_WAV_TARGET_LUFS,
+    ) -> float | None:
+        """Normalize a persisted WAV file toward the raw-WAV LUFS target."""
+
+        resolved = Path(audio_path)
+        audio = AudioSegment.from_file(resolved)
+        normalized, measured_lufs = cls.normalize_audio_to_lufs(audio, target_lufs=target_lufs)
+        normalized.export(resolved, format="wav")
+        if measured_lufs is None:
+            return _measure_integrated_lufs(resolved)
+        return measured_lufs
+
+    @classmethod
+    def perform_restart_cleanup(cls) -> dict[str, float | bool]:
+        """Run the best-effort cleanup sequence required before lazy reload."""
+
+        before_mb = cls.current_process_memory_mb()
+        cls.clear_cached_model_loaders()
+        gc.collect()
+        metal_cleared = cls.clear_mlx_metal_cache()
+        after_mb = cls.current_process_memory_mb()
+        return {
+            "before_mb": before_mb,
+            "after_mb": after_mb,
+            "metal_cache_cleared": metal_cleared,
+        }
 
     def _float_audio_to_segment(self, waveform: np.ndarray, sample_rate: int) -> AudioSegment:
         """Convert a float waveform in [-1, 1] to a mono 16-bit AudioSegment."""

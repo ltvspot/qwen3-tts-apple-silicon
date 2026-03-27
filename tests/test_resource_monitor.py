@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from src.monitoring import ResourceMonitor, ResourceSnapshot, ResourceThresholds
@@ -60,3 +61,56 @@ def test_capacity_estimate_reports_remaining_books(tmp_path: Path, monkeypatch) 
     assert capacity["estimated_gb_needed"] == 40.0
     assert capacity["estimated_books_can_fit"] == 100
     assert capacity["sufficient"] is True
+
+
+def test_record_chapter_completed_updates_rolling_throughput(tmp_path: Path) -> None:
+    """Completed chapter events should contribute to the rolling throughput metric."""
+
+    monitor = ResourceMonitor(tmp_path)
+    now = datetime.now(timezone.utc)
+    monitor.record_chapter_completed(now - timedelta(minutes=30))
+    monitor.record_chapter_completed(now - timedelta(minutes=10))
+
+    throughput = monitor._throughput_chapters_per_hour(now=now)
+
+    assert throughput > 0
+    assert throughput == 4.0
+
+
+def test_output_directory_size_is_reported(tmp_path: Path) -> None:
+    """Snapshots should include the recursive output directory size."""
+
+    audio_dir = tmp_path / "book-1"
+    audio_dir.mkdir(parents=True)
+    (audio_dir / "chapter.wav").write_bytes(b"a" * 1024 * 1024)
+
+    monitor = ResourceMonitor(tmp_path)
+
+    assert monitor._output_directory_size_gb() > 0
+
+
+def test_history_returns_retained_snapshots(tmp_path: Path, monkeypatch) -> None:
+    """History should retain the latest snapshots in JSON-ready form."""
+
+    monitor = ResourceMonitor(tmp_path)
+    base_time = datetime(2026, 3, 27, 12, 0, tzinfo=timezone.utc)
+    snapshots = [
+        ResourceSnapshot(timestamp=base_time, disk_free_gb=12.0),
+        ResourceSnapshot(timestamp=base_time + timedelta(minutes=6), disk_free_gb=11.5),
+    ]
+
+    def fake_snapshot():
+        snapshot = snapshots.pop(0)
+        monitor._last_snapshot = snapshot
+        monitor._append_history(snapshot)
+        return snapshot
+
+    monkeypatch.setattr(monitor, "snapshot", fake_snapshot)
+
+    first_snapshot = monitor.snapshot()
+    second_snapshot = monitor.snapshot()
+    history = monitor.history()
+
+    assert first_snapshot.disk_free_gb == 12.0
+    assert second_snapshot.disk_free_gb == 11.5
+    assert history[-1]["disk_free_gb"] == 11.5

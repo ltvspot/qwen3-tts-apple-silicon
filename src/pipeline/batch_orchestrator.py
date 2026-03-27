@@ -16,6 +16,7 @@ from src.database import (
     BatchRun,
     Book,
     BookExportStatus,
+    BookStatus,
     GenerationJob,
     GenerationJobStatus,
     GenerationJobType,
@@ -60,6 +61,8 @@ class BatchBookResult:
     started_at: str | None = None
     completed_at: str | None = None
     duration_seconds: float = 0.0
+    qa_average_score: float | None = None
+    qa_ready_for_export: bool | None = None
 
 
 @dataclass(slots=True)
@@ -322,6 +325,12 @@ class BatchOrchestrator:
             result = await self._wait_for_job(result, job_id)
             if result.status == "failed" and not result.error_message:
                 result.error_message = "Book generation failed: unknown"
+            if result.status == "completed":
+                qa_average_score, qa_ready_for_export, qa_message = self._run_post_book_qa(result.book_id)
+                result.qa_average_score = qa_average_score
+                result.qa_ready_for_export = qa_ready_for_export
+                if qa_message:
+                    result.error_message = qa_message
             return result
         except Exception as exc:
             logger.error("Book %s failed with exception: %s", book_id, exc, exc_info=True)
@@ -477,6 +486,57 @@ class BatchOrchestrator:
         self._progress.book_results.append(result)
         self._persist_book_result(result)
         self._persist_run()
+
+    def _run_post_book_qa(self, book_id: int) -> tuple[float | None, bool | None, str | None]:
+        """Run deep QA after one book completes and update export readiness."""
+
+        from src.database import Chapter, QAManualStatus
+        from src.pipeline.audio_qa.qa_scorer import run_book_audio_qa
+        from src.pipeline.qa_checker import apply_manual_review
+
+        with self.db_session_factory() as db_session:
+            book = db_session.query(Book).filter(Book.id == book_id).first()
+            if book is None:
+                return (None, False, "Book disappeared before post-generation QA.")
+
+            try:
+                report = run_book_audio_qa(book, db_session)
+            except Exception as exc:
+                logger.exception("Post-generation deep QA failed for book %s", book_id)
+                book.status = BookStatus.QA
+                db_session.commit()
+                return (None, False, f"Post-generation QA failed: {str(exc)[:500]}")
+
+            ready_for_export = bool(report.chapters) and all(
+                chapter_result.scoring.overall >= 80.0
+                for chapter_result in report.chapters
+            )
+            if ready_for_export:
+                chapters = {
+                    chapter.number: chapter
+                    for chapter in db_session.query(Chapter).filter(Chapter.book_id == book_id).all()
+                }
+                for chapter_result in report.chapters:
+                    chapter = chapters.get(chapter_result.chapter_n)
+                    if chapter is None:
+                        continue
+                    apply_manual_review(
+                        db_session,
+                        chapter,
+                        QAManualStatus.APPROVED,
+                        reviewed_by="Batch Production",
+                        notes=chapter.qa_notes,
+                    )
+                book.status = BookStatus.QA_APPROVED
+            else:
+                book.status = BookStatus.QA
+
+            db_session.commit()
+            return (
+                report.average_score,
+                ready_for_export,
+                None if ready_for_export else "Deep QA flagged this book for manual review.",
+            )
 
     def _persist_run(self) -> None:
         """Persist the current batch summary into the database."""

@@ -9,6 +9,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
 from src.database import (
+    AudioQAResult,
     Book,
     BookStatus,
     Chapter,
@@ -148,6 +149,21 @@ class ApproveAllPassingResponse(BaseModel):
     """Per-book approval response for chapters that fully passed automatic QA."""
 
     approved: int
+
+
+class BatchApproveScoreRequest(BaseModel):
+    """Request payload for score-threshold batch approvals."""
+
+    book_id: int | None = None
+    min_score: int = Field(default=80, ge=0, le=100)
+
+
+class BatchApproveScoreResponse(BaseModel):
+    """Response payload for score-threshold batch approvals."""
+
+    approved: int
+    below_threshold: int
+    already_approved: int
 
 
 class CatalogQASummaryResponse(BaseModel):
@@ -633,6 +649,112 @@ def _batch_approve_records(
     return BatchApproveResponse(approved=approved, skipped=skipped, flagged=flagged)
 
 
+def _score_for_batch_approval(
+    chapter: Chapter,
+    qa_record: ChapterQARecord | None,
+    audio_qa_record: AudioQAResult | None,
+) -> float:
+    """Return the effective score used for threshold-based bulk approval."""
+
+    if audio_qa_record is not None and audio_qa_record.overall_score is not None:
+        return float(audio_qa_record.overall_score)
+    if qa_record is None:
+        return 0.0
+    if qa_record.overall_status == QAAutomaticStatus.PASS:
+        return 100.0
+    if qa_record.overall_status == QAAutomaticStatus.WARNING:
+        return 79.0
+    if chapter.qa_status == QAStatus.APPROVED:
+        return 100.0
+    return 0.0
+
+
+def _batch_approve_by_score(
+    *,
+    records: list[ChapterQARecord],
+    chapter_lookup: dict[tuple[int, int], Chapter],
+    audio_qa_lookup: dict[tuple[int, int], AudioQAResult],
+    min_score: int,
+    db: Session,
+) -> BatchApproveScoreResponse:
+    """Approve chapters whose deep-QA score meets the supplied threshold."""
+
+    approved = 0
+    below_threshold = 0
+    already_approved = 0
+
+    for record in records:
+        chapter = chapter_lookup.get((record.book_id, record.chapter_n))
+        if chapter is None:
+            continue
+
+        if chapter.qa_status == QAStatus.APPROVED or record.manual_status == QAManualStatus.APPROVED:
+            already_approved += 1
+            continue
+
+        score = _score_for_batch_approval(
+            chapter,
+            record,
+            audio_qa_lookup.get((record.book_id, record.chapter_n)),
+        )
+        if score < min_score:
+            below_threshold += 1
+            continue
+
+        apply_manual_review(
+            db,
+            chapter,
+            QAManualStatus.APPROVED,
+            reviewed_by="Batch QA Threshold",
+            notes=record.manual_notes,
+        )
+        approved += 1
+
+    db.commit()
+    return BatchApproveScoreResponse(
+        approved=approved,
+        below_threshold=below_threshold,
+        already_approved=already_approved,
+    )
+
+
+@router.post("/qa/batch-approve", response_model=BatchApproveScoreResponse)
+async def batch_approve_book_by_score(
+    request: BatchApproveScoreRequest,
+    db: Session = Depends(get_db),
+) -> BatchApproveScoreResponse:
+    """Approve all chapters in one book whose QA score meets the supplied threshold."""
+
+    if request.book_id is None:
+        raise HTTPException(status_code=400, detail="book_id is required.")
+
+    book = db.query(Book).filter(Book.id == request.book_id).first()
+    if book is None:
+        raise HTTPException(status_code=404, detail=f"Book {request.book_id} not found")
+
+    records = (
+        db.query(ChapterQARecord)
+        .filter(ChapterQARecord.book_id == request.book_id)
+        .order_by(ChapterQARecord.chapter_n.asc())
+        .all()
+    )
+    chapter_lookup = {
+        (chapter.book_id, chapter.number): chapter
+        for chapter in db.query(Chapter).filter(Chapter.book_id == request.book_id).all()
+    }
+    audio_qa_lookup = {
+        (record.book_id, record.chapter_n): record
+        for record in db.query(AudioQAResult).filter(AudioQAResult.book_id == request.book_id).all()
+    }
+    return _batch_approve_by_score(
+        records=records,
+        chapter_lookup=chapter_lookup,
+        audio_qa_lookup=audio_qa_lookup,
+        min_score=request.min_score,
+        db=db,
+    )
+
+
 @router.post("/qa/batch-approve/{book_id}", response_model=BatchApproveResponse)
 async def batch_approve_book(
     book_id: int,
@@ -658,19 +780,39 @@ async def batch_approve_book(
     return _batch_approve_records(records, chapter_lookup, approve_warnings=approve_warnings, db=db)
 
 
-@router.post("/qa/batch-approve-all", response_model=BatchApproveResponse)
+@router.post("/qa/batch-approve-all")
 async def batch_approve_all(
+    request: BatchApproveScoreRequest | None = None,
     approve_warnings: bool = Query(default=False),
     db: Session = Depends(get_db),
-) -> BatchApproveResponse:
+) -> dict[str, int]:
     """Approve all eligible QA results across the full catalog."""
+
+    if request is not None:
+        records = db.query(ChapterQARecord).order_by(ChapterQARecord.book_id.asc(), ChapterQARecord.chapter_n.asc()).all()
+        chapter_lookup = {
+            (chapter.book_id, chapter.number): chapter
+            for chapter in db.query(Chapter).all()
+        }
+        audio_qa_lookup = {
+            (record.book_id, record.chapter_n): record
+            for record in db.query(AudioQAResult).all()
+        }
+        result = _batch_approve_by_score(
+            records=records,
+            chapter_lookup=chapter_lookup,
+            audio_qa_lookup=audio_qa_lookup,
+            min_score=request.min_score,
+            db=db,
+        )
+        return result.model_dump()
 
     records = db.query(ChapterQARecord).order_by(ChapterQARecord.book_id.asc(), ChapterQARecord.chapter_n.asc()).all()
     chapter_lookup = {
         (chapter.book_id, chapter.number): chapter
         for chapter in db.query(Chapter).all()
     }
-    return _batch_approve_records(records, chapter_lookup, approve_warnings=approve_warnings, db=db)
+    return _batch_approve_records(records, chapter_lookup, approve_warnings=approve_warnings, db=db).model_dump()
 
 
 @router.get("/qa/catalog-summary", response_model=CatalogQASummaryResponse)

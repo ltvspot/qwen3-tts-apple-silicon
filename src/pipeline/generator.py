@@ -26,6 +26,8 @@ from src.database import (
     utc_now,
 )
 from src.engines import AudioStitcher, ModelManager, TTSEngine, TextChunker
+from src.engines.pronunciation_dictionary import PronunciationDictionary
+from src.engines.qwen3_tts import Qwen3TTS, RAW_WAV_TARGET_LUFS
 from src.notifications import send_book_complete_notification, send_qa_failure_notification
 from src.pipeline.chunk_validator import (
     SEVERITY_ORDER,
@@ -76,6 +78,7 @@ class AudiobookGenerator:
         self.retry_backoff_seconds: tuple[float, ...] = (0.5, 1.0)
         self.chunk_validator = ChunkValidator()
         self.pronunciation_watchlist = PronunciationWatchlist()
+        self.pronunciation_dictionary = PronunciationDictionary()
 
     def close(self) -> None:
         """Release the underlying engine if it has been loaded."""
@@ -188,6 +191,9 @@ class AudiobookGenerator:
         final_status = "success"
         if failed_chapters:
             final_status = "failed" if generated_chapters == 0 else "partial"
+
+        if generated_chapters > 0:
+            self._post_generation_loudness_check(book_id, chapters, db_session)
 
         book.status = BookStatus.GENERATED if not failed_chapters else BookStatus.PARSED
         book.generation_status = (
@@ -305,7 +311,12 @@ class AudiobookGenerator:
 
             for chunk_index, chunk_plan in enumerate(chunk_plans):
                 self._raise_if_cancelled(should_cancel)
-                chunk_text = chunk_plan.text
+                validation_text = chunk_plan.text
+                chunk_text = TextChunker.preprocess_for_tts(
+                    validation_text,
+                    book_id=book_id,
+                    pronunciation_dictionary=self.pronunciation_dictionary,
+                )
                 checkpoint_path = self._get_chunk_checkpoint_path(book_id, chapter, chunk_index)
                 checkpoint_audio = self._load_chunk_checkpoint(checkpoint_path)
 
@@ -314,7 +325,7 @@ class AudiobookGenerator:
                     audio = checkpoint_audio
                     validation_report = self.chunk_validator.validate(
                         audio,
-                        chunk_text,
+                        validation_text,
                         voice_name,
                         chapter_speed,
                         chunk_index=chunk_index,
@@ -336,7 +347,7 @@ class AudiobookGenerator:
                     try:
                         audio, validation_report, failed_validation, attempts_used = await self._generate_chunk_with_retry(
                             chunk_prompt,
-                            validation_text=chunk_text,
+                            validation_text=validation_text,
                             chunk_index=chunk_index,
                             voice_name=voice_name,
                             emotion=emotion,
@@ -440,7 +451,7 @@ class AudiobookGenerator:
                 audio_chunks,
                 pause_after_ms=self._chunk_pause_map(chunk_plans, pause_settings),
             )
-            final_audio = stitch_result.audio
+            final_audio, raw_lufs = self._normalize_raw_wav_audio(stitch_result.audio)
             audio_path = self._get_chapter_audio_path(book_id, chapter)
             audio_path.parent.mkdir(parents=True, exist_ok=True)
             await asyncio.to_thread(final_audio.export, str(audio_path), format="wav")
@@ -461,6 +472,7 @@ class AudiobookGenerator:
                         "checkpoint_hits": checkpoint_hits,
                         "chunk_files_written": chunk_files_written,
                     },
+                    "raw_wav_lufs": raw_lufs,
                 }
             )
             chapter.completed_at = utc_now()
@@ -1112,6 +1124,93 @@ class AudiobookGenerator:
             audio_path.unlink(missing_ok=True)
 
         shutil.rmtree(self._get_chunk_checkpoint_dir(book_id, chapter), ignore_errors=True)
+
+    def _normalize_raw_wav_audio(self, audio: AudioSegment) -> tuple[AudioSegment, float | None]:
+        """Normalize raw generation output toward the chapter/credits LUFS target."""
+
+        return Qwen3TTS.normalize_audio_to_lufs(audio, target_lufs=RAW_WAV_TARGET_LUFS)
+
+    def _resolve_stored_audio_path(self, audio_path: str | None) -> Path | None:
+        """Resolve a stored chapter audio path against the outputs directory."""
+
+        if audio_path is None or not audio_path.strip():
+            return None
+        candidate = Path(audio_path)
+        if candidate.is_absolute():
+            return candidate
+        return (self.output_path / candidate).resolve()
+
+    def _post_generation_loudness_check(
+        self,
+        book_id: int,
+        chapters: list[Chapter],
+        db_session: Session,
+    ) -> None:
+        """Re-normalize outlier chapter WAVs after a book has finished generating."""
+
+        del book_id
+        measured: list[tuple[Chapter, float]] = []
+        content_lufs: list[float] = []
+        for chapter in chapters:
+            resolved_path = self._resolve_stored_audio_path(chapter.audio_path)
+            if resolved_path is None or not resolved_path.exists():
+                continue
+            lufs = Qwen3TTS.measure_audio_lufs(AudioSegment.from_file(resolved_path))
+            if lufs is None:
+                continue
+            measured.append((chapter, lufs))
+            if chapter.type in {ChapterType.CHAPTER, ChapterType.INTRODUCTION}:
+                content_lufs.append(lufs)
+
+        if not content_lufs:
+            return
+
+        chapter_mean = sum(content_lufs) / len(content_lufs)
+        for chapter, lufs in measured:
+            deviation = abs(lufs - chapter_mean)
+            if chapter.type in {ChapterType.OPENING_CREDITS, ChapterType.CLOSING_CREDITS} and deviation > 1.0:
+                logger.warning(
+                    "Credits loudness drift detected for book %s chapter %s: %.2f LU from chapter mean %.2f LUFS",
+                    chapter.book_id,
+                    chapter.number,
+                    deviation,
+                    chapter_mean,
+                )
+
+            if deviation <= 1.5:
+                continue
+
+            resolved_path = self._resolve_stored_audio_path(chapter.audio_path)
+            if resolved_path is None or not resolved_path.exists():
+                continue
+            renormalized_lufs = Qwen3TTS.normalize_wav_path(resolved_path, target_lufs=chapter_mean)
+            logger.warning(
+                "Re-normalized book %s chapter %s from %.2f LUFS toward %.2f LUFS (measured %.2f LUFS).",
+                chapter.book_id,
+                chapter.number,
+                lufs,
+                chapter_mean,
+                renormalized_lufs if renormalized_lufs is not None else float("nan"),
+            )
+            try:
+                chapter.audio_file_size_bytes = resolved_path.stat().st_size
+            except OSError:
+                logger.warning("Unable to refresh audio size after re-normalizing %s", resolved_path)
+            self._persist_chapter_loudness_metadata(chapter, renormalized_lufs)
+
+        db_session.commit()
+
+    def _persist_chapter_loudness_metadata(self, chapter: Chapter, lufs: float | None) -> None:
+        """Persist measured raw-WAV loudness in generation metadata when available."""
+
+        if lufs is None:
+            return
+        try:
+            payload = json.loads(chapter.generation_metadata) if chapter.generation_metadata else {}
+        except json.JSONDecodeError:
+            payload = {}
+        payload["raw_wav_lufs"] = round(lufs, 3)
+        chapter.generation_metadata = json.dumps(payload)
 
     def _custom_watchlist_entries(self, chapter: Chapter) -> list[dict[str, str]]:
         """Return the merged per-book watchlist entries for a chapter."""

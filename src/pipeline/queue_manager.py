@@ -927,6 +927,7 @@ class GenerationQueue:
             if not db_job.force and chapter.status == ChapterStatus.GENERATED:
                 continue
 
+            await self._wait_for_model_restart()
             db_session.refresh(db_job)
             if db_job.cancel_requested:
                 self._mark_cancelled(db_job, db_session)
@@ -1054,6 +1055,10 @@ class GenerationQueue:
                     book.generation_eta_seconds = db_job.eta_seconds
                 db_session.commit()
                 self._store_job_snapshot(db_job)
+                if self._resource_monitor is not None:
+                    record_completed = getattr(self._resource_monitor, "record_chapter_completed", None)
+                    if callable(record_completed):
+                        record_completed(chapter.completed_at)
                 await self._post_chapter_housekeeping(db_job, chapter_index=chapter.number)
 
             db_session.refresh(db_job)
@@ -1089,6 +1094,7 @@ class GenerationQueue:
             self._mark_failed(db_job, job_info, db_session, f"Chapter job {db_job.id} points to a missing chapter.")
             return
 
+        await self._wait_for_model_restart()
         book = db_session.query(Book).filter(Book.id == db_job.book_id).first()
         if db_job.force:
             self._reset_chapter_for_force(chapter)
@@ -1170,6 +1176,10 @@ class GenerationQueue:
             book.generation_eta_seconds = 0
         db_session.commit()
         self._store_job_snapshot(db_job)
+        if self._resource_monitor is not None:
+            record_completed = getattr(self._resource_monitor, "record_chapter_completed", None)
+            if callable(record_completed):
+                record_completed(chapter.completed_at)
 
         self._finalize_job(db_job, db_session, job_info, failed=False, failure_message=None)
 
@@ -1385,6 +1395,22 @@ class GenerationQueue:
             self._resource_pause_reason = "; ".join(warnings) or "Resources unavailable."
             logger.warning("Queue waiting for resources: %s", self._resource_pause_reason)
             await asyncio.sleep(self.resource_poll_interval_seconds)
+
+    async def _wait_for_model_restart(self) -> None:
+        """Pause briefly while the shared model is restarting, triggering cooldown when needed."""
+
+        model_manager = getattr(self._generator, "model_manager", None)
+        if model_manager is None:
+            return
+
+        cooldown_if_needed = getattr(model_manager, "cooldown_if_needed", None)
+        wait_for_restart = getattr(model_manager, "wait_for_restart", None)
+        if callable(cooldown_if_needed):
+            restarted = await cooldown_if_needed()
+            if restarted:
+                logger.info("Queue paused for model cooldown restart")
+        if callable(wait_for_restart):
+            await wait_for_restart(timeout_seconds=10.0)
 
     def _record_history(self, db_session: Session, job: GenerationJob, action: str, details: str | dict[str, Any]) -> None:
         """Append a job history entry."""

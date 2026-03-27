@@ -43,6 +43,7 @@ _export_futures: dict[int, Future[None]] = {}
 _batch_export_lock = threading.RLock()
 _batch_export_monitor_task: asyncio.Task[None] | None = None
 _batch_export_progress: "BatchExportProgressResponse | None" = None
+_batch_export_history: dict[str, "BatchExportProgressResponse"] = {}
 
 
 def _track_export_task(task: asyncio.Task[None]) -> asyncio.Task[None]:
@@ -241,6 +242,7 @@ class ExportCancelResponse(BaseModel):
 class BatchExportRequest(BaseModel):
     """Request payload for catalog-wide export queuing."""
 
+    book_ids: list[int] | None = None
     formats: list[str] = Field(default_factory=lambda: ["mp3", "m4b"])
     include_only_approved: bool = True
     skip_already_exported: bool = True
@@ -584,94 +586,131 @@ def _mark_batch_export_book(
     current.completed_at = completed_at
 
 
-async def _monitor_batch_export(
+async def _wait_for_export_job_completion(
+    *,
+    book_id: int,
+    session_factory: sessionmaker[Session],
+) -> ExportJob:
+    """Poll one export job until it reaches a terminal state."""
+
+    while True:
+        with session_factory() as db_session:
+            export_job = db_session.query(ExportJob).filter(ExportJob.book_id == book_id).first()
+            book = db_session.query(Book).filter(Book.id == book_id).first()
+            if export_job is None or book is None:
+                raise RuntimeError(f"Export job for book {book_id} disappeared.")
+            export_job = _reconcile_export_job_if_needed(book, export_job, db_session)
+            if export_job is None:
+                raise RuntimeError(f"Export job for book {book_id} could not be reconciled.")
+            if export_job.export_status != BookExportStatus.PROCESSING:
+                db_session.refresh(export_job)
+                return export_job
+        await asyncio.sleep(1.0)
+
+
+async def _run_batch_export(
     *,
     batch_id: str,
     book_ids: list[int],
+    request: BatchExportRequest,
     session_factory: sessionmaker[Session],
 ) -> None:
-    """Poll queued export jobs until the batch reaches a terminal state."""
+    """Process one export batch sequentially, one book at a time."""
 
     global _batch_export_monitor_task
 
     try:
-        while True:
+        for book_id in book_ids:
             with _batch_export_lock:
                 state = _batch_export_progress
                 if state is None or state.batch_id != batch_id:
                     return
+                state.status = "running"
+                state.in_progress = 1
+                _batch_export_history[batch_id] = state
 
             with session_factory() as db_session:
-                book_rows = (
-                    db_session.query(Book)
-                    .filter(Book.id.in_(book_ids))
-                    .all()
-                )
-                books = {book.id: book.title for book in book_rows}
-                export_jobs = {
-                    job.book_id: job
-                    for job in (
-                        db_session.query(ExportJob)
-                        .filter(ExportJob.book_id.in_(book_ids))
-                        .all()
-                    )
-                }
-                for book in book_rows:
-                    export_job = export_jobs.get(book.id)
-                    reconciled_job = _reconcile_export_job_if_needed(book, export_job, db_session)
-                    if reconciled_job is not None:
-                        export_jobs[book.id] = reconciled_job
-
-            completed = 0
-            failed = 0
-            in_progress = 0
-
-            with _batch_export_lock:
-                state = _batch_export_progress
-                if state is None or state.batch_id != batch_id:
-                    return
-
-                for book_id in book_ids:
-                    book_title = books.get(book_id, f"Book {book_id}")
-                    export_job = export_jobs.get(book_id)
-                    if export_job is None:
+                book = db_session.query(Book).options(selectinload(Book.chapters)).filter(Book.id == book_id).first()
+                if book is None:
+                    with _batch_export_lock:
+                        state = _batch_export_progress
+                        if state is None or state.batch_id != batch_id:
+                            return
+                        state.failed += 1
+                        state.in_progress = 0
                         _mark_batch_export_book(
                             state=state,
                             book_id=book_id,
-                            title=book_title,
-                            status="queued",
+                            title=f"Book {book_id}",
+                            status="failed",
+                            error_message="Book not found.",
+                            completed_at=utc_now(),
                         )
-                        in_progress += 1
-                        continue
+                        _batch_export_history[batch_id] = state
+                    continue
 
-                    status = export_job.export_status.value
-                    if export_job.export_status == BookExportStatus.PROCESSING:
-                        in_progress += 1
-                    elif export_job.export_status == BookExportStatus.COMPLETED:
-                        completed += 1
-                    else:
-                        failed += 1
+                _mark_batch_export_book(
+                    state=state,
+                    book_id=book.id,
+                    title=book.title,
+                    status="processing",
+                    started_at=utc_now(),
+                )
+                _batch_export_history[batch_id] = state
+                export_job, _, _, _ = _queue_export_for_book(
+                    book,
+                    request,
+                    db=db_session,
+                    session_factory=session_factory,
+                )
 
+            try:
+                completed_job = await _wait_for_export_job_completion(book_id=book_id, session_factory=session_factory)
+            except Exception as exc:
+                with _batch_export_lock:
+                    state = _batch_export_progress
+                    if state is None or state.batch_id != batch_id:
+                        return
+                    state.failed += 1
+                    state.in_progress = 0
                     _mark_batch_export_book(
                         state=state,
                         book_id=book_id,
-                        title=book_title,
-                        status=status,
-                        error_message=export_job.error_message,
-                        started_at=export_job.started_at,
-                        completed_at=export_job.completed_at,
+                        title=next((item.title for item in state.books if item.book_id == book_id), f"Book {book_id}"),
+                        status="failed",
+                        error_message=str(exc),
+                        completed_at=utc_now(),
                     )
+                    _batch_export_history[batch_id] = state
+                continue
 
-                state.completed = completed
-                state.failed = failed
-                state.in_progress = in_progress
-                if in_progress == 0:
-                    state.status = "completed"
-                    state.completed_at = utc_now()
+            with _batch_export_lock:
+                state = _batch_export_progress
+                if state is None or state.batch_id != batch_id:
                     return
-                state.status = "running"
+                if completed_job.export_status == BookExportStatus.COMPLETED:
+                    state.completed += 1
+                else:
+                    state.failed += 1
+                state.in_progress = 0
+                _mark_batch_export_book(
+                    state=state,
+                    book_id=book_id,
+                    title=next((item.title for item in state.books if item.book_id == book_id), f"Book {book_id}"),
+                    status=completed_job.export_status.value,
+                    error_message=completed_job.error_message,
+                    started_at=completed_job.started_at,
+                    completed_at=completed_job.completed_at,
+                )
+                _batch_export_history[batch_id] = state
 
-            await asyncio.sleep(1.0)
+        with _batch_export_lock:
+            state = _batch_export_progress
+            if state is not None and state.batch_id == batch_id:
+                state.status = "completed"
+                state.completed_at = utc_now()
+                state.in_progress = 0
+                _batch_export_history[batch_id] = state
     finally:
         _batch_export_monitor_task = None
 
@@ -843,9 +882,13 @@ async def batch_export(
     books = (
         db.query(Book)
         .options(selectinload(Book.chapters))
+        .filter(Book.id.in_(request.book_ids) if request.book_ids else True)
         .order_by(Book.id.asc())
         .all()
     )
+    if request.book_ids:
+        order_lookup = {book_id: index for index, book_id in enumerate(request.book_ids)}
+        books.sort(key=lambda book: order_lookup.get(book.id, len(order_lookup)))
 
     state = BatchExportProgressResponse(
         batch_id=batch_id,
@@ -896,49 +939,30 @@ async def batch_export(
             )
             continue
 
-        try:
-            export_job, _, _, _ = _queue_export_for_book(
-                book,
-                request,
-                db=db,
-                session_factory=session_factory,
-            )
-        except HTTPException as exc:
-            if exc.status_code == 409:
-                state.skipped += 1
-                _mark_batch_export_book(
-                    state=state,
-                    book_id=book.id,
-                    title=book.title,
-                    status="processing",
-                    error_message=exc.detail,
-                )
-                continue
-            raise
-
         state.queued += 1
         queued_book_ids.append(book.id)
         _mark_batch_export_book(
             state=state,
             book_id=book.id,
             title=book.title,
-            status=export_job.export_status.value,
-            started_at=export_job.started_at,
+            status="queued",
         )
 
     state.total_books = state.queued + state.skipped + state.not_ready
-    state.in_progress = state.queued
+    state.in_progress = 0
     state.status = "completed" if state.queued == 0 else "running"
     if state.queued == 0:
         state.completed_at = utc_now()
 
     with _batch_export_lock:
         _batch_export_progress = state
+        _batch_export_history[batch_id] = state
         if queued_book_ids:
             _batch_export_monitor_task = _track_export_task(asyncio.create_task(
-                _monitor_batch_export(
+                _run_batch_export(
                     batch_id=batch_id,
                     book_ids=queued_book_ids,
+                    request=request,
                     session_factory=session_factory,
                 ),
                 name=f"batch-export-{batch_id}",
@@ -963,3 +987,14 @@ async def get_batch_export_progress() -> BatchExportProgressResponse | None:
 
     with _batch_export_lock:
         return _batch_export_progress
+
+
+@router.get("/export/batch/{batch_id}", response_model=BatchExportProgressResponse)
+async def get_batch_export_by_id(batch_id: str) -> BatchExportProgressResponse:
+    """Return one batch export payload by identifier."""
+
+    with _batch_export_lock:
+        payload = _batch_export_history.get(batch_id)
+        if payload is None:
+            raise HTTPException(status_code=404, detail=f"Batch export {batch_id} not found.")
+        return payload

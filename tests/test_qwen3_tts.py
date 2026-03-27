@@ -239,6 +239,67 @@ def test_audio_stitcher_inserts_explicit_pauses() -> None:
     assert len(paragraph_pause) == 1800
 
 
+def test_normalize_audio_to_lufs_moves_audio_toward_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Raw WAV normalization should move measured loudness toward the target."""
+
+    measurements = iter([-15.0, -18.45])
+    monkeypatch.setattr(Qwen3TTS, "measure_audio_lufs", classmethod(lambda cls, audio: next(measurements)))
+    from pydub.generators import Sine
+
+    audio = Sine(220).to_audio_segment(duration=1000, volume=-6.0)
+
+    normalized, measured = Qwen3TTS.normalize_audio_to_lufs(audio, target_lufs=-18.5)
+
+    assert isinstance(normalized, AudioSegment)
+    assert measured == -18.45
+
+
+def test_record_completed_chapter_updates_restart_counter() -> None:
+    """The engine should track completed chapters since the last load."""
+
+    engine = Qwen3TTS(backend="synthetic")
+
+    engine.record_completed_chapter()
+    engine.record_completed_chapter()
+
+    assert engine.chapters_since_restart == 2
+
+
+def test_model_status_reports_restart_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Model status should expose restart interval, counter, and process memory."""
+
+    engine = Qwen3TTS(backend="synthetic")
+    engine.loaded = True
+    engine.record_completed_chapter()
+    monkeypatch.setattr(Qwen3TTS, "current_process_memory_mb", classmethod(lambda cls: 321.0))
+
+    payload = engine.model_status()
+
+    assert payload == {
+        "chapters_since_restart": 1,
+        "restart_interval": engine.restart_interval,
+        "memory_usage_mb": 321.0,
+        "model_loaded": True,
+    }
+
+
+def test_perform_restart_cleanup_clears_metal_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Restart cleanup should clear cached loaders, run GC, and report Metal cache status."""
+
+    calls: list[str] = []
+    monkeypatch.setattr(Qwen3TTS, "clear_cached_model_loaders", classmethod(lambda cls: calls.append("cache")))
+    monkeypatch.setattr(Qwen3TTS, "clear_mlx_metal_cache", classmethod(lambda cls: True))
+    monkeypatch.setattr(Qwen3TTS, "current_process_memory_mb", classmethod(lambda cls: 128.0))
+    monkeypatch.setattr("src.engines.qwen3_tts.gc.collect", lambda: calls.append("gc"))
+
+    payload = Qwen3TTS.perform_restart_cleanup()
+
+    assert calls == ["cache", "gc"]
+    assert payload["before_mb"] == 128.0
+    assert payload["after_mb"] == 128.0
+    assert payload["metal_cache_cleared"] is True
+
+
 def test_voice_test_api(client: TestClient, tmp_path: Path) -> None:
     """Voice lab test endpoint should generate a saved WAV file and return metadata."""
 

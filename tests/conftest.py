@@ -38,6 +38,7 @@ def isolated_generation_runtime() -> Generator[None, None, None]:
     export_routes._shutdown_export_workers(timeout_seconds=0.1, recreate_executor=True)
     export_routes._batch_export_monitor_task = None
     export_routes._batch_export_progress = None
+    export_routes._batch_export_history = {}
     generation_runtime.release_model_manager()
     generation_runtime._generator = None
     generation_runtime._queue = None
@@ -53,6 +54,7 @@ def isolated_generation_runtime() -> Generator[None, None, None]:
             export_routes._batch_export_monitor_task.cancel()
         export_routes._batch_export_monitor_task = None
         export_routes._batch_export_progress = None
+        export_routes._batch_export_history = {}
         generation_runtime.release_model_manager()
         generation_runtime._generator = None
         generation_runtime._queue = None

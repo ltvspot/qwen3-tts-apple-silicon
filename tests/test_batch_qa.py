@@ -5,6 +5,7 @@ from __future__ import annotations
 from sqlalchemy.orm import Session
 
 from src.database import (
+    AudioQAResult,
     Book,
     BookStatus,
     Chapter,
@@ -53,6 +54,18 @@ def _create_qa_record(test_db: Session, *, book_id: int, chapter_n: int, status:
             chapter_n=chapter_n,
             overall_status=status,
             qa_details='{"overall_status":"pass","checks":[]}',
+        )
+    )
+    test_db.commit()
+
+
+def _create_audio_qa(test_db: Session, *, book_id: int, chapter_n: int, score: float) -> None:
+    test_db.add(
+        AudioQAResult(
+            book_id=book_id,
+            chapter_n=chapter_n,
+            overall_score=score,
+            report_json="{}",
         )
     )
     test_db.commit()
@@ -116,3 +129,47 @@ def test_qa_metrics_includes_parsed_books(client, test_db: Session) -> None:
     payload = response.json()
     assert payload["unparsedBooks"] == 0
     assert payload["books_pending_qa"] == 1
+
+
+def test_batch_approve_by_score_only_approves_chapters_above_threshold(client, test_db: Session) -> None:
+    """Score-based approval should only approve chapters meeting the threshold."""
+
+    book = _create_book(test_db, title="Score Approval Book")
+    _create_chapter(test_db, book_id=book.id, number=1, qa_status=QAStatus.NOT_REVIEWED)
+    _create_chapter(test_db, book_id=book.id, number=2, qa_status=QAStatus.NOT_REVIEWED)
+    _create_qa_record(test_db, book_id=book.id, chapter_n=1, status=QAAutomaticStatus.PASS)
+    _create_qa_record(test_db, book_id=book.id, chapter_n=2, status=QAAutomaticStatus.PASS)
+    _create_audio_qa(test_db, book_id=book.id, chapter_n=1, score=88.0)
+    _create_audio_qa(test_db, book_id=book.id, chapter_n=2, score=74.0)
+
+    response = client.post("/api/qa/batch-approve", json={"book_id": book.id, "min_score": 80})
+
+    assert response.status_code == 200
+    assert response.json() == {"approved": 1, "below_threshold": 1, "already_approved": 0}
+
+
+def test_batch_approve_all_by_score_returns_catalog_totals(client, test_db: Session) -> None:
+    """Catalog-wide score approval should aggregate approvals across books."""
+
+    first = _create_book(test_db, title="First Score Book")
+    second = _create_book(test_db, title="Second Score Book")
+    _create_chapter(test_db, book_id=first.id, number=1, qa_status=QAStatus.NOT_REVIEWED)
+    _create_chapter(test_db, book_id=second.id, number=1, qa_status=QAStatus.APPROVED)
+    _create_qa_record(test_db, book_id=first.id, chapter_n=1, status=QAAutomaticStatus.PASS)
+    _create_qa_record(test_db, book_id=second.id, chapter_n=1, status=QAAutomaticStatus.PASS)
+    _create_audio_qa(test_db, book_id=first.id, chapter_n=1, score=92.0)
+    _create_audio_qa(test_db, book_id=second.id, chapter_n=1, score=95.0)
+
+    response = client.post("/api/qa/batch-approve-all", json={"min_score": 85})
+
+    assert response.status_code == 200
+    assert response.json() == {"approved": 1, "below_threshold": 0, "already_approved": 1}
+
+
+def test_batch_approve_requires_existing_book_for_score_mode(client, test_db: Session) -> None:
+    """Score-based batch approval should reject missing books."""
+
+    response = client.post("/api/qa/batch-approve", json={"book_id": 999, "min_score": 80})
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Book 999 not found"

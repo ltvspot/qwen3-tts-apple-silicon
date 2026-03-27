@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import gc
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
@@ -50,8 +51,9 @@ class ModelManager:
         self._engine: Any | None = None
         self._stats = ModelStats()
         self._lock = asyncio.Lock()
+        self._restart_in_progress = False
         self.cooldown_chapter_threshold = (
-            engine_config.cooldown_chapter_threshold
+            int(os.environ.get("TTS_MODEL_RESTART_INTERVAL", engine_config.cooldown_chapter_threshold))
             if cooldown_chapter_threshold is None
             else cooldown_chapter_threshold
         )
@@ -91,14 +93,24 @@ class ModelManager:
             if self._engine is None:
                 await self._load_engine_locked(reload_count=self._stats.reload_count)
             elif self._needs_cooldown():
-                logger.info(
-                    "Model cooldown triggered after %d chapters / %d chunks / %.0fs",
-                    self._stats.chapters_generated,
-                    self._stats.chunks_generated,
-                    time.time() - self._stats.last_reload_time,
-                )
                 await self._reload_engine_locked()
             return self._engine
+
+    async def cooldown_if_needed(self) -> bool:
+        """Proactively restart the engine when the cooldown threshold has been reached."""
+
+        async with self._lock:
+            if self._engine is None or not self._needs_cooldown():
+                return False
+            await self._reload_engine_locked()
+            return True
+
+    async def wait_for_restart(self, timeout_seconds: float = 10.0) -> None:
+        """Wait briefly for an in-flight restart to complete."""
+
+        deadline = time.monotonic() + timeout_seconds
+        while self._restart_in_progress and time.monotonic() < deadline:
+            await asyncio.sleep(0.05)
 
     def _needs_cooldown(self) -> bool:
         """Return whether the shared engine should be reloaded."""
@@ -142,8 +154,20 @@ class ModelManager:
     async def _reload_engine_locked(self) -> None:
         """Unload the current engine and replace it with a fresh instance."""
 
+        logger.info("Model cooldown: restarting after %d chapters", self._stats.chapters_generated)
         reload_count = self._stats.reload_count + 1
-        await self._replace_engine_locked(reload_count=reload_count)
+        before_memory_mb = self._get_process_memory_mb()
+        self._restart_in_progress = True
+        try:
+            await self._replace_engine_locked(reload_count=reload_count)
+        finally:
+            self._restart_in_progress = False
+        after_memory_mb = self._get_process_memory_mb()
+        logger.info(
+            "Model restart complete. Memory before=%.1fMB after=%.1fMB",
+            before_memory_mb,
+            after_memory_mb,
+        )
         await self._run_quality_canary()
 
     async def _replace_engine_locked(self, *, reload_count: int) -> None:
@@ -155,6 +179,9 @@ class ModelManager:
         if old_engine is not None and getattr(old_engine, "loaded", False):
             old_engine.unload()
 
+        cleanup = getattr(type(old_engine), "perform_restart_cleanup", None) if old_engine is not None else None
+        if callable(cleanup):
+            cleanup()
         del old_engine
         gc.collect()
         await asyncio.sleep(3.0)
@@ -260,6 +287,10 @@ class ModelManager:
 
         self._stats.chapters_generated += 1
         self._stats.peak_memory_mb = max(self._stats.peak_memory_mb, self._get_process_memory_mb())
+        if self._engine is not None:
+            record_completed_chapter = getattr(self._engine, "record_completed_chapter", None)
+            if callable(record_completed_chapter):
+                record_completed_chapter()
 
     def _get_process_memory_mb(self) -> float:
         """Return the current process RSS memory in megabytes when available."""
@@ -300,6 +331,7 @@ class ModelManager:
         if self._engine is not None and getattr(self._engine, "loaded", False):
             self._engine.unload()
         self._engine = None
+        self._restart_in_progress = False
         self._stats = ModelStats(
             manager_started_at=self._stats.manager_started_at,
             reload_count=self._stats.reload_count,
@@ -316,15 +348,20 @@ class ModelManager:
         current_memory = self._get_process_memory_mb()
         return {
             "loaded": self._engine is not None,
+            "model_loaded": self._engine is not None,
             "chunks_generated": self._stats.chunks_generated,
             "chapters_generated": self._stats.chapters_generated,
+            "chapters_since_restart": self._stats.chapters_generated,
+            "restart_interval": self.cooldown_chapter_threshold,
             "seconds_since_reload": round(seconds_since_reload, 1),
             "uptime_seconds": round(uptime_seconds, 1),
             "last_reload_at": round(self._stats.last_reload_time, 3),
             "total_generation_seconds": round(self._stats.total_generation_seconds, 1),
             "process_memory_mb": round(current_memory, 1),
+            "memory_usage_mb": round(current_memory, 1),
             "peak_memory_mb": round(max(self._stats.peak_memory_mb, current_memory), 1),
             "reload_count": self._stats.reload_count,
+            "restart_in_progress": self._restart_in_progress,
             "last_canary_status": self._stats.last_canary_status,
             "last_canary_checked_at": (
                 round(self._stats.last_canary_checked_at, 3)

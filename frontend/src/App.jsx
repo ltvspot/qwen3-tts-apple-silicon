@@ -2,6 +2,7 @@ import React from "react";
 import { BrowserRouter as Router, Route, Routes } from "react-router-dom";
 import ErrorBoundary from "./components/ErrorBoundary";
 import BookDetail from "./pages/BookDetail";
+import BatchProduction from "./pages/BatchProduction";
 import CatalogDashboard from "./pages/CatalogDashboard";
 import Library from "./pages/Library";
 import NotFound from "./pages/NotFound";
@@ -17,6 +18,7 @@ function App() {
       <ErrorBoundary>
         <Routes>
           <Route path="/catalog" element={<CatalogDashboard />} />
+          <Route path="/batch-production" element={<BatchProduction />} />
           <Route path="/overseer" element={<ProductionOverseer />} />
           <Route path="/" element={<Library />} />
           <Route path="/book/:id" element={<BookDetail />} />
