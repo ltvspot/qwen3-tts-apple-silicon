@@ -1,8 +1,8 @@
 # Alexandria Audiobook Narrator — Project State
 
 **Owner:** Tim (tim@ltvspot.com)  
-**Last Updated:** 2026-03-26
-**Status:** Prompts 01-35 COMPLETE. First successful end-to-end audiobook export through webapp.
+**Last Updated:** 2026-03-27
+**Status:** Prompts 01-45 COMPLETE. Parser hardened — zero crashes, correct authors for all parseable manuscripts.
 
 ---
 
@@ -24,8 +24,8 @@ The current codebase includes:
 
 Latest verified results on this machine:
 
-- Backend: `./.venv/bin/pytest -q` → `324 passed`
-- Frontend tests: `cd frontend && CI=true npm test -- --watchAll=false` → `13 suites, 55 tests passed`
+- Backend: `./.venv/bin/pytest -q` → `453 passed`
+- Frontend tests: `cd frontend && CI=true npm test -- --watchAll=false` → `17 suites, 74 tests passed`
 - Frontend production build: `cd frontend && npm run build` → passed
 - Smoke: Temporary local app booted cleanly, `/api/health` returned 200, Library page loaded with no browser console errors
 - **Export E2E**: Book 6 "Self-Reliance" exported successfully — MP3 (90.6 MB) + M4B (40.7 MB) with download links in webapp
@@ -50,6 +50,11 @@ Latest verified results on this machine:
 - Prompt 33: QA performance & progress tracking — fast-path QA for long chapters, per-chapter progress, DB session isolation, timeout fixes (commit `a95c4b6`, +890 -273, 317 tests)
 - Prompt 34: Fix export mastering blockers & ACX compliance — peak target -3.5 dBFS, noise gate in fast chain, export_mode for Gate 3, relaxed credit transitions, WAV file size skip, DB enum repair (commit `0d03027`, +306 -29, 323 tests)
 - Prompt 35: Fix export UI and recovery — backfill qa_report on recovery path, set current_stage to "Export completed", defensive frontend guard for null qa_report (commit `24f6503`, +241 -7, 324 tests, 55 frontend tests)
+- Prompts 36-41: Production scale infrastructure (36 files +3446 -166)
+- Prompt 42: Book Detail UX overhaul (+1632 -846, commit `ba257d1`)
+- Prompt 43: UX polish — speed slider, styled modal, export wording, QA terminology, pronunciation quick-add, batch context (commit `395b50e`, +402 -93)
+- Prompt 44: Eliminate all browser dialogs — shared ConfirmDialog component, Toast notifications, zero native prompts/confirms/alerts (commit `dbb1050`, +927 -118, 74 frontend tests)
+- Prompt 45: Parser hardening — zero crash tolerance, author extraction fix. Empty chapters skipped (not crash), "A Modern Translation" blocked, folder-name author fallback with 50+ known authors, non-fatal _find_author(), improved diagnostics (commit `585035d`, +342 -13, 453 backend tests)
 
 ## Operator Notes
 

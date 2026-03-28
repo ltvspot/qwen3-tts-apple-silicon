@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 from docx import Document
+from docx.enum.style import WD_STYLE_TYPE
 
 from src.parser import CreditsGenerator, DocxParser, ManuscriptParserFactory, TextCleaner
 from src.parser.common import should_skip_heading
@@ -27,6 +28,13 @@ def _write_docx(docx_path: Path, paragraphs: list[tuple[str, str | None]]) -> No
     """Create a DOCX file from `(text, style)` paragraph pairs."""
 
     document = Document()
+    available_styles = {style.name for style in document.styles}
+
+    for _text, style in paragraphs:
+        if style is not None and style not in available_styles:
+            document.styles.add_style(style, WD_STYLE_TYPE.PARAGRAPH)
+            available_styles.add(style)
+
     for text, style in paragraphs:
         if style is None:
             document.add_paragraph(text)
@@ -131,6 +139,79 @@ def test_parse_skips_empty_chapter_sections_instead_of_crashing(tmp_path: Path) 
     assert chapters[0].raw_text == "This chapter has actual body text."
 
 
+def test_parse_skips_long_toc_entries_and_finds_real_chapters(tmp_path: Path) -> None:
+    """Long TOC entries with TOC styles should not become empty chapters."""
+
+    long_chapter_one = (
+        "Chapter I: In Which the North Polar Practical Association Decides That It Is "
+        "Absolutely Necessary to Reach the Pole"
+    )
+    long_chapter_two = (
+        "Chapter II: In Which the Delegation Is Sent Forth To Investigate the Frozen "
+        "Regions and Report Back Quickly"
+    )
+    docx_path = tmp_path / "long-toc.docx"
+    _write_docx(
+        docx_path,
+        [
+            ("An Arctic Adventure", "Title"),
+            ("by Jane Doe", None),
+            ("Table of Contents", None),
+            (long_chapter_one, "TOC 1"),
+            (long_chapter_two, "TOC 1"),
+            (long_chapter_one, "Heading 1"),
+            ("The expedition begins in earnest.", None),
+            (long_chapter_two, "Heading 1"),
+            ("The report confirms the danger ahead.", None),
+        ],
+    )
+
+    parser = DocxParser()
+    _metadata, chapters = parser.parse(docx_path)
+
+    assert [chapter.number for chapter in chapters] == [1, 2]
+    assert chapters[0].title == (
+        "In Which the North Polar Practical Association Decides That It Is Absolutely Necessary to Reach the Pole"
+    )
+    assert chapters[1].title == (
+        "In Which the Delegation Is Sent Forth To Investigate the Frozen Regions and Report Back Quickly"
+    )
+    assert parser.last_toc_entries == [long_chapter_one, long_chapter_two]
+
+
+def test_parse_keeps_collecting_toc_for_toc_styled_note_paragraphs(tmp_path: Path) -> None:
+    """TOC-styled note-like lines should not force an early exit from TOC mode."""
+
+    docx_path = tmp_path / "toc-note.docx"
+    _write_docx(
+        docx_path,
+        [
+            ("Collected Speeches", "Title"),
+            ("by Jane Doe", None),
+            ("Table of Contents", None),
+            ("Volume I", "TOC 1"),
+            ("Chapter I. Opening Address", "TOC 1"),
+            ("Chapter I. Opening Address", "Heading 1"),
+            ("Actual chapter body text.", None),
+        ],
+    )
+
+    parser = DocxParser()
+    _metadata, chapters = parser.parse(docx_path)
+
+    assert [chapter.number for chapter in chapters] == [1]
+    assert parser.last_toc_entries == ["Volume I", "Chapter I. Opening Address"]
+
+
+def test_toc_entries_with_page_numbers_are_detected() -> None:
+    """TOC entries with trailing page numbers should be recognized after normalization."""
+
+    parser = DocxParser()
+
+    assert parser._looks_like_toc_entry("Chapter II. The Middle\t42", None) is True
+    assert parser._looks_like_toc_entry("Chapter II. The Middle 42", None) is True
+
+
 def test_modern_translation_line_is_not_treated_as_author(tmp_path: Path) -> None:
     """Edition descriptors should not beat a real author-like line."""
 
@@ -205,6 +286,46 @@ def test_factory_uses_folder_hint_for_unknown_docx_authors(tmp_path: Path) -> No
     assert metadata.author == "Sun Tzu"
     assert len(chapters) == 1
     assert manuscript_path == docx_path
+
+
+def test_parse_with_folder_hint_uses_title_lookup_for_unknown_author(tmp_path: Path) -> None:
+    """Known titles should resolve Unknown Author when the folder name has no author hint."""
+
+    docx_path = tmp_path / "known-title.docx"
+    _write_docx(
+        docx_path,
+        [
+            ("Metaphysics", "Title"),
+            ("Chapter I. First Principles", "Heading 1"),
+            ("All men by nature desire to know.", None),
+        ],
+    )
+
+    metadata, chapters = DocxParser().parse_with_folder_hint(docx_path, folder_name="001-Metaphysics-6x9-250")
+
+    assert metadata.author == "Aristotle"
+    assert len(chapters) == 1
+
+
+def test_folder_author_hint_takes_priority_over_title_lookup(tmp_path: Path) -> None:
+    """Folder-name author extraction should win over title-based fallback."""
+
+    docx_path = tmp_path / "known-title-priority.docx"
+    _write_docx(
+        docx_path,
+        [
+            ("Metaphysics", "Title"),
+            ("Chapter I. First Principles", "Heading 1"),
+            ("All men by nature desire to know.", None),
+        ],
+    )
+
+    metadata, _chapters = DocxParser().parse_with_folder_hint(
+        docx_path,
+        folder_name="001-Metaphysics-Sun-Tzu-6x9-250",
+    )
+
+    assert metadata.author == "Sun Tzu"
 
 
 def test_non_author_phrases_are_rejected_as_author_names() -> None:

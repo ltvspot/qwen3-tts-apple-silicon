@@ -144,6 +144,35 @@ class DocxParser:
         "samuel butler": "Samuel Butler",
         "charlotte perkins gilman": "Charlotte Perkins Gilman",
     }
+    KNOWN_TITLES: dict[str, str] = {
+        "arthashastra": "Kautilya",
+        "instructions to his generals": "Frederick the Great",
+        "history of the peloponnesian war": "Thucydides",
+        "fear and trembling": "Søren Kierkegaard",
+        "on the nature of things": "Lucretius",
+        "the chaldean oracles": "Unknown Author",
+        "the book concerning the tincture of the philosophers": "Paracelsus",
+        "on sense and the sensible": "Aristotle",
+        "on life and death": "Aristotle",
+        "on memory and reminiscence": "Aristotle",
+        "on sleep and sleeplessness": "Aristotle",
+        "on dreams": "Aristotle",
+        "metaphysics": "Aristotle",
+        "on longevity and shortness of life": "Aristotle",
+        "rhetoric": "Aristotle",
+        "the emerald tablet of thoth": "Hermes Trismegistus",
+        "in the year 2889": "Jules Verne",
+        "corpus hermeticum": "Hermes Trismegistus",
+        "the emerald tablet": "Hermes Trismegistus",
+        "the hermetic and alchemical writings of paracelsus": "Paracelsus",
+        "coelum philosophorum": "Paracelsus",
+        "the master key system": "Charles F. Haanel",
+        "aristotles complete works on the mind dreams and the nature of thought": "Aristotle",
+        "aristotle's metaphysical and scientific masterpieces": "Aristotle",
+        "aristotle's insights into memory, sleep, and the mysteries of the human mind": "Aristotle",
+        "the virgin of the world": "Hermes Trismegistus",
+        "the life and teachings of thoth hermes trismegistus": "Hermes Trismegistus",
+    }
 
     def __init__(self) -> None:
         """Initialize chapter detection and skip rules."""
@@ -251,11 +280,19 @@ class DocxParser:
 
         metadata, chapters = self.parse(docx_path)
 
-        if metadata.author == "Unknown Author" and folder_name:
-            folder_author = self._extract_author_from_folder(folder_name)
-            if folder_author:
-                logger.info("Using folder-name author hint: %s", folder_author)
-                metadata = replace(metadata, author=folder_author)
+        if metadata.author == "Unknown Author":
+            if folder_name:
+                folder_author = self._extract_author_from_folder(folder_name)
+                if folder_author:
+                    logger.info("Using folder-name author hint: %s", folder_author)
+                    metadata = replace(metadata, author=folder_author)
+
+            if metadata.author == "Unknown Author" and metadata.title:
+                title_lower = self._normalize_text(metadata.title).casefold().replace("’", "'")
+                known_author = self.KNOWN_TITLES.get(title_lower)
+                if known_author and known_author != "Unknown Author":
+                    logger.info("Using title-based author lookup: %s", known_author)
+                    metadata = replace(metadata, author=known_author)
 
         return metadata, chapters
 
@@ -303,6 +340,9 @@ class DocxParser:
                 if self._looks_like_chapter_style(style):
                     collecting_toc = False
                 elif self._looks_like_toc_entry(text, style):
+                    self.last_toc_entries.append(text)
+                    continue
+                elif style and "toc" in style.lower():
                     self.last_toc_entries.append(text)
                     continue
                 else:
@@ -622,12 +662,16 @@ class DocxParser:
         )
 
     def _looks_like_toc_entry(self, text: str, style: str | None) -> bool:
-        """Return whether a paragraph looks like a short TOC entry."""
+        """Return whether a paragraph looks like a TOC entry."""
 
         if self._looks_like_chapter_style(style):
             return False
         if self._looks_like_credit_or_note(text):
             return False
+        if style and "toc" in style.lower():
+            return True
+        if re.search(r"(?:\t|\s)\d+\s*$", text):
+            return True
         return len(text.split()) <= 16
 
     def _is_toc_heading(self, text: str) -> bool:
