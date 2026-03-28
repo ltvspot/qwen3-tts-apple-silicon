@@ -2,7 +2,7 @@
 
 **Owner:** Tim (tim@ltvspot.com)  
 **Last Updated:** 2026-03-27
-**Status:** Prompts 01-45 COMPLETE. Parser hardened — zero crashes, correct authors for all parseable manuscripts.
+**Status:** Prompts 01-46 COMPLETE. Parser hardened — zero crashes, TOC fix, title-based author fallback. 841/872 books parsed (96.4%), 24,392 total chapters.
 
 ---
 
@@ -24,7 +24,7 @@ The current codebase includes:
 
 Latest verified results on this machine:
 
-- Backend: `./.venv/bin/pytest -q` → `453 passed`
+- Backend: `./.venv/bin/pytest -q` → `457 passed`
 - Frontend tests: `cd frontend && CI=true npm test -- --watchAll=false` → `17 suites, 74 tests passed`
 - Frontend production build: `cd frontend && npm run build` → passed
 - Smoke: Temporary local app booted cleanly, `/api/health` returned 200, Library page loaded with no browser console errors
@@ -55,6 +55,7 @@ Latest verified results on this machine:
 - Prompt 43: UX polish — speed slider, styled modal, export wording, QA terminology, pronunciation quick-add, batch context (commit `395b50e`, +402 -93)
 - Prompt 44: Eliminate all browser dialogs — shared ConfirmDialog component, Toast notifications, zero native prompts/confirms/alerts (commit `dbb1050`, +927 -118, 74 frontend tests)
 - Prompt 45: Parser hardening — zero crash tolerance, author extraction fix. Empty chapters skipped (not crash), "A Modern Translation" blocked, folder-name author fallback with 50+ known authors, non-fatal _find_author(), improved diagnostics (commit `585035d`, +342 -13, 453 backend tests)
+- Prompt 46: TOC parsing fix + title-based author fallback — fix _looks_like_toc_entry() for long chapter titles and toc-styled paragraphs, harden TOC exit condition, add KNOWN_TITLES dict for ~20 books, 5 new tests (commit `a536062`, +393 -10, 457 backend tests). Full library parsed: 841/872 books (96.4%), 24,392 chapters, zero "A Modern Translation" authors.
 
 ## Operator Notes
 
