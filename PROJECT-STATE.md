@@ -2,7 +2,7 @@
 
 **Owner:** Tim (tim@ltvspot.com)  
 **Last Updated:** 2026-03-28
-**Status:** Prompts 01-47 COMPLETE. Parser hardened — whole-document fallback, ~200 title-author mappings, zero Unknown Authors. 868/872 books parsed (99.5%), 26,749 total chapters.
+**Status:** Prompts 01-48 COMPLETE. Parser hardened — whole-document fallback, ~200 title-author mappings, zero Unknown Authors, Introduction sub-headings preserved. 868/872 books parsed (99.5%), 777 books with proper Introduction sections, 466 backend tests.
 
 ---
 
@@ -24,7 +24,7 @@ The current codebase includes:
 
 Latest verified results on this machine:
 
-- Backend: `./.venv/bin/pytest -q` → `463 passed`
+- Backend: `./.venv/bin/pytest -q` → `466 passed`
 - Frontend tests: `cd frontend && CI=true npm test -- --watchAll=false` → `17 suites, 74 tests passed`
 - Frontend production build: `cd frontend && npm run build` → passed
 - Smoke: Temporary local app booted cleanly, `/api/health` returned 200, Library page loaded with no browser console errors
@@ -57,6 +57,7 @@ Latest verified results on this machine:
 - Prompt 45: Parser hardening — zero crash tolerance, author extraction fix. Empty chapters skipped (not crash), "A Modern Translation" blocked, folder-name author fallback with 50+ known authors, non-fatal _find_author(), improved diagnostics (commit `585035d`, +342 -13, 453 backend tests)
 - Prompt 46: TOC parsing fix + title-based author fallback — fix _looks_like_toc_entry() for long chapter titles and toc-styled paragraphs, harden TOC exit condition, add KNOWN_TITLES dict for ~20 books, 5 new tests (commit `a536062`, +393 -10, 457 backend tests). Full library parsed: 841/872 books (96.4%), 24,392 chapters, zero "A Modern Translation" authors.
 - Prompt 47: Whole-document fallback + massive author expansion — _fallback_single_chapter() for books without chapter headings, KNOWN_TITLES expanded to ~200 entries, KNOWN_AUTHORS +35 new entries, title lookup handles &/and/smart quotes/parentheticals, 5 new tests (commit `f810942`, +806 -3, 463 backend tests). Library: 868/872 parsed (99.5%), 0 Unknown Authors, 26,749 chapters. 4 remaining unparsed are corrupt DOCX files.
+- Prompt 48: Preserve Introduction sections with sub-headings — _is_explicit_chapter_heading() method, _extract_chapters() treats sub-headings inside Introduction as body text (only explicit "Chapter N" ends an intro), 3 new tests (commit `e13eb0f`, +198 -0, 466 backend tests). 777 books now have proper Introduction sections; Art of War Introduction restored to 4,566 words.
 
 ## Operator Notes
 
