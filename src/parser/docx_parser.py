@@ -692,6 +692,14 @@ class DocxParser:
                     current_body.append(text)
                     continue
 
+                if (
+                    current_heading is not None
+                    and current_heading["type"] == "introduction"
+                    and not self._is_explicit_chapter_heading(text)
+                ):
+                    current_body.append(text)
+                    continue
+
                 if current_heading is None:
                     current_heading = parsed_heading
                     current_body = []
@@ -729,6 +737,12 @@ class DocxParser:
             self._validate_toc(chapters)
 
         return chapters
+
+    def _is_explicit_chapter_heading(self, text: str) -> bool:
+        """Return whether text is an explicit 'Chapter N' heading."""
+
+        normalized_text = self._normalize_text(text)
+        return bool(normalized_text and self.chapter_patterns[0].match(normalized_text))
 
     def _is_chapter_heading(self, text: str, style: str | None) -> tuple[bool, dict[str, Any] | None]:
         """

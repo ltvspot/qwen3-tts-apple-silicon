@@ -108,6 +108,80 @@ def test_parse_synthetic_docx_skip_rules_and_intro(tmp_path: Path) -> None:
     assert "Thank You for Reading" not in chapters[1].raw_text
 
 
+def test_introduction_with_subheadings(tmp_path: Path) -> None:
+    """Sub-headings inside an introduction should stay inside the introduction body."""
+
+    docx_path = tmp_path / "intro-subheadings.docx"
+    _write_docx(
+        docx_path,
+        [
+            ("The Art of Strategy", "Title"),
+            ("by Jane Doe", None),
+            ("Introduction", "Heading 1"),
+            ("I. Biography", "Heading 3"),
+            ("The introduction opens with a biographical overview of the author and the world that shaped the text.", None),
+            ("II. Historical Context", "Heading 3"),
+            ("A second introductory section explains the political pressures, strategic traditions, and conflicts surrounding the work.", None),
+            ("Chapter 1 - The Beginning", "Heading 1"),
+            ("The first chapter body begins here.", None),
+            ("Chapter 2 - The Middle", "Heading 1"),
+            ("The second chapter body follows.", None),
+        ],
+    )
+
+    _metadata, chapters = DocxParser().parse(docx_path)
+
+    assert [chapter.type for chapter in chapters] == ["introduction", "chapter", "chapter"]
+    assert chapters[0].title == "Introduction"
+    assert "I. Biography" in chapters[0].raw_text
+    assert "II. Historical Context" in chapters[0].raw_text
+    assert "biographical overview" in chapters[0].raw_text
+    assert "political pressures" in chapters[0].raw_text
+    assert chapters[1].number == 1
+    assert chapters[1].title == "The Beginning"
+    assert chapters[2].number == 2
+    assert chapters[2].title == "The Middle"
+
+
+def test_introduction_without_subheadings(tmp_path: Path) -> None:
+    """A simple introduction should still parse exactly as before."""
+
+    docx_path = tmp_path / "intro-regression.docx"
+    _write_docx(
+        docx_path,
+        [
+            ("A Sample Treatise", "Title"),
+            ("by Jane Doe", None),
+            ("Introduction", "Heading 1"),
+            ("This introduction provides context, stakes, and framing before the main numbered chapters begin.", None),
+            ("Chapter 1 - The Beginning", "Heading 1"),
+            ("The first chapter body begins here.", None),
+            ("Chapter 2 - The Middle", "Heading 1"),
+            ("The second chapter body follows.", None),
+        ],
+    )
+
+    _metadata, chapters = DocxParser().parse(docx_path)
+
+    assert [chapter.type for chapter in chapters] == ["introduction", "chapter", "chapter"]
+    assert chapters[0].title == "Introduction"
+    assert "context, stakes, and framing" in chapters[0].raw_text
+    assert chapters[1].title == "The Beginning"
+    assert chapters[2].title == "The Middle"
+
+
+def test_explicit_chapter_heading_detection() -> None:
+    """Only real 'Chapter N' headings should count as explicit chapter boundaries."""
+
+    parser = DocxParser()
+
+    assert parser._is_explicit_chapter_heading("Chapter 1 - Laying Plans") is True
+    assert parser._is_explicit_chapter_heading("Chapter IV") is True
+    assert parser._is_explicit_chapter_heading("I. Brief Biography") is False
+    assert parser._is_explicit_chapter_heading("Historical Context") is False
+    assert parser._is_explicit_chapter_heading("1: Some Title") is False
+
+
 def test_build_chapter_returns_none_for_empty_body() -> None:
     """Empty section bodies should be skipped instead of raising exceptions."""
 
