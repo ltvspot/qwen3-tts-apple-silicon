@@ -253,6 +253,60 @@ def test_parse_falls_back_to_unknown_author_without_crashing(tmp_path: Path) -> 
     assert chapters[0].title == "Opening"
 
 
+def test_fallback_single_chapter(tmp_path: Path) -> None:
+    """Books without headings should fall back to one Full Text chapter."""
+
+    body_opening = (
+        "This manuscript begins immediately with sustained body prose that exceeds thirty words, "
+        "so the parser should treat it as the start of narratable content instead of discarding "
+        "the whole document for lacking explicit chapter headings."
+    )
+    body_followup = (
+        "A second paragraph should stay attached to the same fallback chapter, preserving spacing "
+        "and ensuring the parser emits one continuous narratable section for the full document."
+    )
+    docx_path = tmp_path / "full-text-fallback.docx"
+    _write_docx(
+        docx_path,
+        [
+            ("Dialogues on Strategy", "Title"),
+            ("by Jane Doe", None),
+            ("Copyright 2026", None),
+            (body_opening, None),
+            (body_followup, None),
+            ("Thank You for Reading", None),
+        ],
+    )
+
+    metadata, chapters = DocxParser().parse(docx_path)
+
+    assert metadata.author == "Jane Doe"
+    assert len(chapters) == 1
+    assert chapters[0].number == 1
+    assert chapters[0].title == "Full Text"
+    assert chapters[0].type == "chapter"
+    assert chapters[0].raw_text == f"{body_opening}\n\n{body_followup}"
+
+
+def test_fallback_empty_document(tmp_path: Path) -> None:
+    """Front-matter-only documents should still fail with diagnostics."""
+
+    docx_path = tmp_path / "front-matter-only.docx"
+    _write_docx(
+        docx_path,
+        [
+            ("A Book Without Chapters", "Title"),
+            ("by Jane Doe", None),
+            ("Copyright 2026", None),
+            ("Table of Contents", None),
+            ("Thank You for Reading", None),
+        ],
+    )
+
+    with pytest.raises(ValueError, match=r"No narratable chapters detected in front-matter-only\.docx"):
+        DocxParser().parse(docx_path)
+
+
 def test_extract_author_from_folder_name() -> None:
     """Known-author folder patterns should resolve to canonical author names."""
 
@@ -305,6 +359,53 @@ def test_parse_with_folder_hint_uses_title_lookup_for_unknown_author(tmp_path: P
 
     assert metadata.author == "Aristotle"
     assert len(chapters) == 1
+
+
+def test_known_titles_expansion() -> None:
+    """Expanded title mappings should cover the new canonical works."""
+
+    parser = DocxParser()
+
+    assert parser.KNOWN_TITLES["jane eyre"] == "Charlotte Brontë"
+    assert parser.KNOWN_TITLES["don quixote"] == "Miguel de Cervantes"
+    assert parser.KNOWN_TITLES["the communist manifesto"] == "Karl Marx"
+    assert parser.KNOWN_TITLES["the epic of gilgamesh"] == "Anonymous"
+
+
+def test_known_authors_expansion() -> None:
+    """Expanded folder-author mappings should resolve the new canonical authors."""
+
+    parser = DocxParser()
+
+    assert parser.KNOWN_AUTHORS["xenophon"] == "Xenophon"
+    assert parser.KNOWN_AUTHORS["charlotte brontë"] == "Charlotte Brontë"
+
+
+def test_title_lookup_with_ampersand(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Title lookup should normalize ampersands to 'and' before failing."""
+
+    monkeypatch.setattr(
+        DocxParser,
+        "KNOWN_TITLES",
+        {"the complete strategy and war collection": "Various Authors"},
+    )
+
+    docx_path = tmp_path / "ampersand-title.docx"
+    _write_docx(
+        docx_path,
+        [
+            ("The Complete Strategy & War Collection", "Title"),
+            ("Chapter I. Opening", "Heading 1"),
+            ("Collected strategic writings begin here.", None),
+        ],
+    )
+
+    metadata, _chapters = DocxParser().parse_with_folder_hint(
+        docx_path,
+        folder_name="001-Complete-Strategy-Collection-6x9-250",
+    )
+
+    assert metadata.author == "Various Authors"
 
 
 def test_folder_author_hint_takes_priority_over_title_lookup(tmp_path: Path) -> None:

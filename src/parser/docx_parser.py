@@ -143,6 +143,43 @@ class DocxParser:
         "george macdonald": "George MacDonald",
         "samuel butler": "Samuel Butler",
         "charlotte perkins gilman": "Charlotte Perkins Gilman",
+        "charlotte brontë": "Charlotte Brontë",
+        "charlotte bronte": "Charlotte Brontë",
+        "emily brontë": "Emily Brontë",
+        "emily bronte": "Emily Brontë",
+        "anne brontë": "Anne Brontë",
+        "anne bronte": "Anne Brontë",
+        "xenophon": "Xenophon",
+        "sophocles": "Sophocles",
+        "plutarch": "Plutarch",
+        "apuleius": "Apuleius",
+        "petronius": "Petronius",
+        "lucian": "Lucian",
+        "aristophanes": "Aristophanes",
+        "cervantes": "Miguel de Cervantes",
+        "miguel de cervantes": "Miguel de Cervantes",
+        "alexis de tocqueville": "Alexis de Tocqueville",
+        "tocqueville": "Alexis de Tocqueville",
+        "karl marx": "Karl Marx",
+        "carl von clausewitz": "Carl von Clausewitz",
+        "clausewitz": "Carl von Clausewitz",
+        "boethius": "Boethius",
+        "guy de maupassant": "Guy de Maupassant",
+        "maupassant": "Guy de Maupassant",
+        "théophile gautier": "Théophile Gautier",
+        "theophile gautier": "Théophile Gautier",
+        "washington irving": "Washington Irving",
+        "brothers grimm": "Brothers Grimm",
+        "valmiki": "Valmiki",
+        "vyasa": "Vyasa",
+        "patanjali": "Patanjali",
+        "zhuangzi": "Zhuangzi",
+        "augustine": "Saint Augustine",
+        "saint augustine": "Saint Augustine",
+        "ignatius of loyola": "Ignatius of Loyola",
+        "rené descartes": "René Descartes",
+        "rene descartes": "René Descartes",
+        "descartes": "René Descartes",
     }
     KNOWN_TITLES: dict[str, str] = {
         "arthashastra": "Kautilya",
@@ -150,7 +187,7 @@ class DocxParser:
         "history of the peloponnesian war": "Thucydides",
         "fear and trembling": "Søren Kierkegaard",
         "on the nature of things": "Lucretius",
-        "the chaldean oracles": "Unknown Author",
+        "the chaldean oracles": "Anonymous",
         "the book concerning the tincture of the philosophers": "Paracelsus",
         "on sense and the sensible": "Aristotle",
         "on life and death": "Aristotle",
@@ -172,6 +209,202 @@ class DocxParser:
         "aristotle's insights into memory, sleep, and the mysteries of the human mind": "Aristotle",
         "the virgin of the world": "Hermes Trismegistus",
         "the life and teachings of thoth hermes trismegistus": "Hermes Trismegistus",
+        "micromegas: a philosophical story": "Voltaire",
+        "micromegas": "Voltaire",
+        "candide": "Voltaire",
+        "zadig": "Voltaire",
+        "the wreck of the golden mary": "Charles Dickens",
+        "the perils of certain english prisoners": "Charles Dickens",
+        "the haunted house": "Charles Dickens",
+        "the lazy tour of two idle apprentices": "Charles Dickens",
+        "a house to let": "Charles Dickens",
+        "no thoroughfare": "Charles Dickens",
+        "the battle of life": "Charles Dickens",
+        "jane eyre": "Charlotte Brontë",
+        "villette": "Charlotte Brontë",
+        "shirley": "Charlotte Brontë",
+        "the professor": "Charlotte Brontë",
+        "wuthering heights": "Emily Brontë",
+        "the tenant of wildfell hall": "Anne Brontë",
+        "agnes grey": "Anne Brontë",
+        "the iliad: the fall of troy": "Homer",
+        "the iliad": "Homer",
+        "the odyssey": "Homer",
+        "anabasis": "Xenophon",
+        "memorabilia": "Xenophon",
+        "the last days of socrates": "Plato",
+        "euthyphro": "Plato",
+        "apology": "Plato",
+        "crito": "Plato",
+        "phaedo": "Plato",
+        "the three theban plays": "Sophocles",
+        "oedipus the king": "Sophocles",
+        "oedipus at colonus": "Sophocles",
+        "antigone": "Sophocles",
+        "meno": "Plato",
+        "symposium": "Plato",
+        "the republic": "Plato",
+        "true history": "Lucian",
+        "parallel lives": "Plutarch",
+        "the golden ass": "Apuleius",
+        "the satyricon": "Petronius",
+        "clouds": "Aristophanes",
+        "oeconomicus": "Xenophon",
+        "apology of socrates": "Xenophon",
+        "plato apology": "Plato",
+        "charmides": "Plato",
+        "plato lesser hippias": "Plato",
+        "plato minos": "Plato",
+        "plato clitophon": "Plato",
+        "plato epinomis": "Plato",
+        "plato cratylus": "Plato",
+        "plato alcibiades ii": "Plato",
+        "plato theages": "Plato",
+        "socrates axiochus": "Plato",
+        "axiochus": "Plato",
+        "socrates eryxias": "Plato",
+        "eryxias": "Plato",
+        "socrates demodocus": "Plato",
+        "demodocus": "Plato",
+        "the bhagavad gita": "Vyasa",
+        "the dhammapada": "Buddha",
+        "the tao of chuang tzu (zhuangzi)": "Zhuangzi",
+        "the tao of chuang tzu": "Zhuangzi",
+        "the yoga sutras of patanjali": "Patanjali",
+        "the diamond sutra": "Anonymous",
+        "the ramayana": "Valmiki",
+        "confessions": "Saint Augustine",
+        "the spiritual exercises": "Ignatius of Loyola",
+        "the book of tea": "Kakuzo Okakura",
+        "the pillow book": "Sei Shōnagon",
+        "meditations of descartes": "René Descartes",
+        "el cantar de mio cid": "Anonymous",
+        "the song of roland": "Anonymous",
+        "the egyptian book of the dead": "Anonymous",
+        "the tibetan book of the dead (bardo thodol)": "Padmasambhava",
+        "the tibetan book of the dead": "Padmasambhava",
+        "the popol vuh": "Anonymous",
+        "the epic of gilgamesh": "Anonymous",
+        "the descent of ishtar": "Anonymous",
+        "nergal and ereshkigal": "Anonymous",
+        "the lament for ur": "Anonymous",
+        "the marriage of martu": "Anonymous",
+        "temple hymn to nanna (sin)": "Enheduanna",
+        "temple hymn to nanna": "Enheduanna",
+        "the debate between sheep and grain": "Anonymous",
+        "erra and ishum": "Kabti-ilani-Marduk",
+        "the first book of enoch": "Anonymous",
+        "the first book of maccabees": "Anonymous",
+        "the second book of esdras": "Anonymous",
+        "the second book of the maccabees": "Anonymous",
+        "the third book of maccabees": "Anonymous",
+        "the fourth book of maccabees": "Anonymous",
+        "the book of jubilees": "Anonymous",
+        "the testament of the twelve patriarchs": "Anonymous",
+        "the book of baruch": "Baruch ben Neriah",
+        "the third book of baruch": "Anonymous",
+        "the apocalypse of peter": "Anonymous",
+        "the book of the secrets of enoch": "Anonymous",
+        "the hebrew book of enoch": "Anonymous",
+        "the acts of paul and thecla": "Anonymous",
+        "the book of the watchers": "Anonymous",
+        "pistis sophia": "Anonymous",
+        "the gospel of philip": "Anonymous",
+        "the gospel of thomas": "Anonymous",
+        "the gospel of judas": "Anonymous",
+        "the book of thomas the contender": "Anonymous",
+        "the apocryphon of john (the secret book of john)": "Anonymous",
+        "the apocryphon of john": "Anonymous",
+        "the apocalypse of abraham": "Anonymous",
+        "the sophia of jesus christ": "Anonymous",
+        "the words of gad the seer": "Anonymous",
+        "the gospel of the egyptians": "Anonymous",
+        "thunder, perfect mind": "Anonymous",
+        "the dialogue of the savior": "Anonymous",
+        "the odes of solomon": "Anonymous",
+        "the psalms of solomon": "Anonymous",
+        "the epistle of barnabas": "Anonymous",
+        "the book of creation (sefer yetzirah)": "Anonymous",
+        "the book of creation": "Anonymous",
+        "the gospel of the hebrews": "Anonymous",
+        "the gospel of the nazarenes": "Anonymous",
+        "the epistle to the laodiceans": "Anonymous",
+        "the book of enoch & the fallen angels": "Anonymous",
+        "the book of enoch and the fallen angels": "Anonymous",
+        "the books of baruch & the exiles": "Anonymous",
+        "the books of baruch and the exiles": "Anonymous",
+        "the nag hammadi scriptures": "Anonymous",
+        "the shepherd of hermas": "Hermas",
+        "ecclesiasticus (the wisdom of jesus the son of sirach)": "Ben Sira",
+        "ecclesiasticus": "Ben Sira",
+        "the second treatise of the great seth": "Anonymous",
+        "the acts of peter and the twelve apostles": "Anonymous",
+        "the dead sea scrolls bible": "Anonymous",
+        "don quixote": "Miguel de Cervantes",
+        "the communist manifesto": "Karl Marx",
+        "on war": "Carl von Clausewitz",
+        "the federalist papers": "Alexander Hamilton, James Madison & John Jay",
+        "the us constitution": "United States Founding Fathers",
+        "the declaration of independence": "Thomas Jefferson",
+        "the bill of rights n constitutional amendments": "United States Congress",
+        "the bill of rights and constitutional amendments": "United States Congress",
+        "the constitution of the us n declaration of independence": "United States Founding Fathers",
+        "the constitution of the us and declaration of independence": "United States Founding Fathers",
+        "constitution of the united states pocket edition": "United States Founding Fathers",
+        "constitution of the united states large print": "United States Founding Fathers",
+        "the simple sabotage field manual": "Office of Strategic Services",
+        "democracy in america": "Alexis de Tocqueville",
+        "the complete essays": "Michel de Montaigne",
+        "theological tractates": "Boethius",
+        "on the trinity (de trinitate)": "Boethius",
+        "on the trinity": "Boethius",
+        "grimms' fairy tales (complete)": "Brothers Grimm",
+        "grimms' fairy tales": "Brothers Grimm",
+        "unveiling a parallel": "Alice Ilgenfritz Jones",
+        "varney the vampire": "James Malcolm Rymer",
+        "the horla": "Guy de Maupassant",
+        "the mummy's foot": "Théophile Gautier",
+        "the mummys foot": "Théophile Gautier",
+        "rip van winkle": "Washington Irving",
+        "the unparalleled adventure of one hans pfaall": "Edgar Allan Poe",
+        "the complete ethiopian bible (volume i)": "Anonymous",
+        "the complete ethiopian bible (volume ii)": "Anonymous",
+        "the complete ethiopian bible": "Anonymous",
+        "the ultimate horror collection of 101+ macabre masterpieces (volume i)": "Various Authors",
+        "the ultimate horror collection of 101+ macabre masterpieces (volume ii)": "Various Authors",
+        "the ultimate horror collection of 101+ macabre masterpieces (volume iii)": "Various Authors",
+        "the ultimate horror collection of 101+ macabre masterpieces (volume iv)": "Various Authors",
+        "the ultimate horror collection of 101+ macabre masterpieces (volume vi)": "Various Authors",
+        "the ultimate horror collection of 101+ macabre masterpieces (volume vii)": "Various Authors",
+        "the ultimate horror collection of 101+ macabre masterpieces (volume viii)": "Various Authors",
+        "the ultimate horror collection of 101+ macabre masterpieces (volume ix)": "Various Authors",
+        "the ultimate horror collection of 101+ macabre masterpieces (volume x)": "Various Authors",
+        "the ultimate horror collection of 101+ macabre masterpieces (volume xi)": "Various Authors",
+        "the ultimate horror collection of 101+ macabre masterpieces (volume xii)": "Various Authors",
+        "the ultimate horror collection of 101+ macabre masterpieces (volume xiii)": "Various Authors",
+        "the ultimate horror collection of 101+ macabre masterpieces (volume xiv)": "Various Authors",
+        "the complete strategy collection (volume i)": "Various Authors",
+        "the complete strategy collection (volume ii)": "Various Authors",
+        "the complete strategy collection (volume iii)": "Various Authors",
+        "the complete philosophy collection (vol. i)": "Various Authors",
+        "the complete philosophy collection (vol. iii)": "Various Authors",
+        "the complete philosophy collection (vol. iv)": "Various Authors",
+        "the complete philosophy collection (vol. v)": "Various Authors",
+        "the complete philosophy collection (vol. vi)": "Various Authors",
+        "the complete philosophy collection (vol. viii)": "Various Authors",
+        "the complete leadership collection": "Various Authors",
+        "the complete leadership collection (volume i)": "Various Authors",
+        "the complete leadership collection (volume ii)": "Various Authors",
+        "the complete hermeticism philosophy collection": "Various Authors",
+        "the ancient wisdom collection": "Various Authors",
+        "the ultimate esoteric wisdom collection": "Various Authors",
+        "the classical wisdom collection": "Various Authors",
+        "the complete strategy & war collection": "Various Authors",
+        "the complete strategy and war collection": "Various Authors",
+        "the complete warrior's mindset collection": "Various Authors",
+        "the complete warriors mindset collection": "Various Authors",
+        "mystical hermetic & christian dialogues": "Various Authors",
+        "mystical hermetic and christian dialogues": "Various Authors",
     }
 
     def __init__(self) -> None:
@@ -260,12 +493,20 @@ class DocxParser:
         metadata = self._extract_metadata(document)
         chapters = self._extract_chapters(document)
         if not chapters:
+            chapters = self._fallback_single_chapter(document, path)
+        if not chapters:
             total_paragraphs = len(document.paragraphs)
             non_empty_paragraphs = sum(1 for paragraph in document.paragraphs if paragraph.text.strip())
             raise ValueError(
                 f"No narratable chapters detected in {path.name}. "
                 f"The document has {total_paragraphs} paragraphs ({non_empty_paragraphs} non-empty). "
                 "The parser requires chapter headings with 'Chapter N' format or Heading-styled paragraphs."
+            )
+        if len(chapters) == 1 and chapters[0].title == "Full Text":
+            logger.warning(
+                "No chapter headings found in %s; using whole-document fallback (%s words)",
+                path.name,
+                chapters[0].word_count,
             )
 
         logger.info("Extracted %s narratable chapters from %s", len(chapters), path)
@@ -288,13 +529,90 @@ class DocxParser:
                     metadata = replace(metadata, author=folder_author)
 
             if metadata.author == "Unknown Author" and metadata.title:
-                title_lower = self._normalize_text(metadata.title).casefold().replace("’", "'")
-                known_author = self.KNOWN_TITLES.get(title_lower)
+                known_author = None
+                for title_lower in self._title_lookup_candidates(metadata.title):
+                    known_author = self.KNOWN_TITLES.get(title_lower)
+                    if known_author and known_author != "Unknown Author":
+                        break
                 if known_author and known_author != "Unknown Author":
                     logger.info("Using title-based author lookup: %s", known_author)
                     metadata = replace(metadata, author=known_author)
 
         return metadata, chapters
+
+    def _title_lookup_candidates(self, title: str) -> list[str]:
+        """Return normalized title variants for KNOWN_TITLES lookup."""
+
+        base = self._normalize_text(title).casefold()
+        variants = [
+            base,
+            base.replace("\u2018", "'").replace("\u2019", "'").replace("\u201c", '"').replace("\u201d", '"'),
+        ]
+        transforms = (
+            lambda value: re.sub(r"\s*&\s*", " and ", value),
+            lambda value: re.sub(r"\bn\b", "and", value),
+            lambda value: re.sub(r"\s*\([^)]*\)", "", value),
+        )
+
+        ordered: list[str] = []
+        seen: set[str] = set()
+        queue = list(variants)
+
+        while queue:
+            candidate = self._normalize_text(queue.pop(0))
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            ordered.append(candidate)
+            for transform in transforms:
+                transformed = self._normalize_text(transform(candidate))
+                if transformed and transformed not in seen:
+                    queue.append(transformed)
+
+        return ordered
+
+    def _fallback_single_chapter(self, doc: DocxDocument, path: Path) -> list[Chapter]:
+        """Return a single fallback chapter when no headings are detected."""
+
+        del path
+        paragraphs = self._collect_paragraphs(doc)
+        body_started = False
+        collecting_toc = False
+        body_paragraphs: list[str] = []
+
+        for paragraph in paragraphs:
+            text = paragraph.text
+            style = paragraph.style
+
+            if self._is_toc_heading(text):
+                collecting_toc = True
+                continue
+
+            if collecting_toc:
+                if self._looks_like_toc_entry(text, style) or (style and "toc" in style.lower()):
+                    continue
+                collecting_toc = False
+
+            if self._is_back_matter_section(text):
+                if body_started:
+                    break
+                continue
+
+            if self._is_skip_section(text) or self._looks_like_credit_or_note(text):
+                continue
+
+            if not body_started:
+                if self._count_words(text) <= 30:
+                    continue
+                body_started = True
+
+            body_paragraphs.append(text)
+
+        fallback = self._build_chapter(
+            {"number": 1, "title": "Full Text", "type": "chapter"},
+            body_paragraphs,
+        )
+        return [fallback] if fallback is not None else []
 
     def _extract_metadata(self, doc: DocxDocument) -> BookMetadata:
         """Extract title-page metadata from the first section of the document."""
