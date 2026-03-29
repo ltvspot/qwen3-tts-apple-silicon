@@ -41,6 +41,7 @@ class BookResponse(BaseModel):
     id: int
     title: str
     subtitle: str | None
+    description: str | None
     author: str
     narrator: str
     folder_path: str
@@ -256,6 +257,7 @@ def _serialize_book(book: Book) -> BookResponse:
         id=book.id,
         title=book.title,
         subtitle=book.subtitle,
+        description=book.description,
         author=book.author,
         narrator=book.narrator,
         folder_path=book.folder_path,
@@ -524,6 +526,84 @@ async def get_book(book_id: int, db: Session = Depends(get_db)) -> BookResponse:
     )
     if book is None:
         raise HTTPException(status_code=404, detail=f"Book {book_id} not found")
+    return _serialize_book(book)
+
+
+class BookMetadataUpdate(BaseModel):
+    """Request body for updating book metadata."""
+
+    subtitle: str | None = None
+    description: str | None = None
+
+
+class BulkBookMetadataItem(BaseModel):
+    """One item in a bulk metadata update."""
+
+    book_id: int
+    subtitle: str | None = None
+    description: str | None = None
+
+
+class BulkBookMetadataResponse(BaseModel):
+    """Response from a bulk metadata update."""
+
+    updated: int
+    skipped: int
+    errors: list[str]
+
+
+@router.post("/books/bulk-metadata", response_model=BulkBookMetadataResponse)
+async def bulk_update_book_metadata(
+    items: list[BulkBookMetadataItem],
+    db: Session = Depends(get_db),
+) -> BulkBookMetadataResponse:
+    """Bulk update subtitles and/or descriptions for multiple books."""
+
+    updated = 0
+    skipped = 0
+    errors: list[str] = []
+    for item in items:
+        book = db.query(Book).filter(Book.id == item.book_id).first()
+        if book is None:
+            errors.append(f"Book {item.book_id} not found")
+            continue
+        changed = False
+        if item.subtitle is not None:
+            book.subtitle = item.subtitle
+            changed = True
+        if item.description is not None:
+            book.description = item.description
+            changed = True
+        if changed:
+            updated += 1
+        else:
+            skipped += 1
+    db.commit()
+    return BulkBookMetadataResponse(updated=updated, skipped=skipped, errors=errors)
+
+
+@router.patch("/book/{book_id}", response_model=BookResponse)
+async def update_book_metadata(
+    book_id: int,
+    payload: BookMetadataUpdate,
+    db: Session = Depends(get_db),
+) -> BookResponse:
+    """Update a book's subtitle and/or description."""
+
+    book = (
+        db.query(Book)
+        .options(selectinload(Book.chapters))
+        .filter(Book.id == book_id)
+        .first()
+    )
+    if book is None:
+        raise HTTPException(status_code=404, detail=f"Book {book_id} not found")
+    if payload.subtitle is not None:
+        book.subtitle = payload.subtitle
+    if payload.description is not None:
+        book.description = payload.description
+    db.commit()
+    db.refresh(book)
     return _serialize_book(book)
 
 

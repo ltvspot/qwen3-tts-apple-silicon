@@ -205,6 +205,7 @@ class Book(Base):
         default=BookExportStatus.IDLE,
     )
     pronunciation_watchlist: Mapped[str | None] = mapped_column(Text, nullable=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     chapters: Mapped[list["Chapter"]] = relationship(
         back_populates="book",
@@ -619,6 +620,7 @@ def _migrate_sqlite_schema() -> None:
             "last_export_date": "DATETIME",
             "export_status": "VARCHAR(32) NOT NULL DEFAULT 'idle'",
             "pronunciation_watchlist": "TEXT",
+            "description": "TEXT",
         },
         "chapters": {
             "started_at": "DATETIME",

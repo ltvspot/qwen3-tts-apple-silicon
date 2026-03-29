@@ -1226,6 +1226,13 @@ export default function BookDetail() {
               <p className="mt-4 text-sm uppercase tracking-[0.28em] text-slate-400">
                 by <span className="text-slate-100">{book?.author}</span>
               </p>
+              {book?.description ? (
+                <p className="mt-4 max-w-2xl text-sm leading-relaxed text-slate-300/80">
+                  {book.description.length > 300
+                    ? book.description.slice(0, 300) + "..."
+                    : book.description}
+                </p>
+              ) : null}
             </div>
 
             <div className="w-full rounded-[1.75rem] border border-white/10 bg-white/[0.05] p-4 text-sm text-slate-300 shadow-xl shadow-slate-950/20 lg:max-w-md">
