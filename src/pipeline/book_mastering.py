@@ -10,9 +10,11 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 from pydantic import BaseModel
 from pydub import AudioSegment, silence
 from pydub.effects import compress_dynamic_range, high_pass_filter
+from scipy import signal
 from sqlalchemy.orm import Session, sessionmaker
 
 from src.database import Chapter, ChapterStatus
@@ -49,12 +51,20 @@ class BookMasteringPipeline:
 
     TARGET_LUFS = -20.0
     TARGET_LEAD_IN_MS = 750
-    TARGET_TRAIL_OUT_MS = 1500
+    TARGET_TRAIL_OUT_MS = 2000
     MAX_PEAK_DBFS = ACX_REQUIREMENTS["peak_max_db"]
     PEAK_TARGET_DBFS = -3.5
     NOISE_GATE_THRESHOLD_DBFS = -50.0
     NOISE_GATE_REDUCTION_DB = 18.0
     HIGH_PASS_HZ = 80
+    ROOM_TONE_LEVEL_DBFS = -65.0
+    ROOM_TONE_MIN_DBFS = -80.0
+    ROOM_TONE_MAX_DBFS = -50.0
+    PLOSIVE_THRESHOLD_DB = 12.0
+    PLOSIVE_MAX_DURATION_MS = 20
+    DE_ESS_THRESHOLD_DB = 6.0
+    BREATH_TARGET_DBFS = -40.0
+    BREATH_REDUCTION_TRIGGER_DBFS = -30.0
     COMPRESSION_THRESHOLD_DBFS = -20.0
     COMPRESSION_RATIO = 2.0
     EDGE_TOLERANCE_MS = 20
@@ -62,6 +72,8 @@ class BookMasteringPipeline:
     FAST_CHAIN_BOOK_DURATION_SECONDS = 1800.0
     FAST_CHAIN_BOOK_BYTES = 250 * 1024 * 1024
     FAST_CHAIN_LIMIT_LINEAR = 0.668
+    ROOM_TONE_SEED = 53
+    _room_tone_cache: dict[tuple[int, int], AudioSegment] = {}
 
     async def master_book(
         self,
@@ -215,19 +227,27 @@ class BookMasteringPipeline:
         resampled = self._resample_chapters(chapters, db_session)
         if resampled:
             notes.append(f"Resampled {len(resampled)} chapters to {ACX_SAMPLE_RATE} Hz.")
+        polish = self._apply_frequency_selective_processing(chapters, db_session)
+        if polish["high_passed"]:
+            notes.append(f"Applied an {self.HIGH_PASS_HZ} Hz high-pass filter to {len(polish['high_passed'])} chapters.")
+        if polish["plosive_reduced"]:
+            notes.append(f"Reduced low-band plosives in {len(polish['plosive_reduced'])} chapters.")
+        if polish["de_essed"]:
+            notes.append(f"Applied split-band de-essing to {len(polish['de_essed'])} chapters.")
+        if polish["breath_normalized"]:
+            notes.append(f"Softened loud breaths in {len(polish['breath_normalized'])} chapters.")
         gated = self._apply_noise_gate(chapters, db_session)
         if gated:
             notes.append(f"Noise-gated {len(gated)} chapters below {self.NOISE_GATE_THRESHOLD_DBFS:.0f} dBFS.")
-        filtered = self._apply_high_pass_filter(chapters, db_session)
-        if filtered:
-            notes.append(f"Applied an {self.HIGH_PASS_HZ} Hz high-pass filter to {len(filtered)} chapters.")
-        loudness_adjustments = self._normalize_loudness(chapters, db_session)
         compressed = self._apply_compression(chapters, db_session)
         if compressed:
             notes.append(f"Compressed {len(compressed)} chapters for steadier narration dynamics.")
-        edge_normalized = self._normalize_chapter_edges(chapters, db_session)
+        loudness_adjustments = self._normalize_loudness(chapters, db_session)
         peak_limited = self._apply_final_peak_limit(chapters, db_session)
-        notes.append("Sentence-boundary padding verified via chapter QA after mastering.")
+        edge_normalized = self._normalize_chapter_edges(chapters, db_session)
+        if edge_normalized:
+            notes.append(f"Applied ACX room tone padding to {len(edge_normalized)} chapters.")
+        notes.append("Publishing mastering chain validated via chapter QA after mastering.")
         if progress_callback is not None and chapters:
             progress_callback("mastering", len(chapters), len(chapters), chapters[-1])
         blockers = self._final_verify(chapters, db_session)
@@ -334,7 +354,8 @@ class BookMasteringPipeline:
         temporary_output = audio_path.with_suffix(".mastered.tmp.wav")
         filter_chain = ",".join(
             [
-                "agate=threshold=-60dB:ratio=4:attack=0.5:release=50",
+                f"agate=threshold={self.NOISE_GATE_THRESHOLD_DBFS}dB:ratio=4:attack=10:release=100",
+                "acompressor=threshold=0.063:ratio=2:attack=15:release=100:makeup=1",
                 f"loudnorm=I={self.TARGET_LUFS}:TP={self.PEAK_TARGET_DBFS}:LRA=11",
                 f"alimiter=limit={self.FAST_CHAIN_LIMIT_LINEAR}",
             ]
@@ -379,6 +400,15 @@ class BookMasteringPipeline:
     ) -> tuple[list[dict[str, Any]], list[int], list[int], list[str]]:
         """Run a bounded ffmpeg mastering chain suitable for large export jobs."""
 
+        polish = self._apply_frequency_selective_processing(chapters, db_session)
+        if polish["high_passed"]:
+            notes.append(f"Applied an {self.HIGH_PASS_HZ} Hz high-pass filter to {len(polish['high_passed'])} chapters.")
+        if polish["plosive_reduced"]:
+            notes.append(f"Reduced low-band plosives in {len(polish['plosive_reduced'])} chapters before ffmpeg mastering.")
+        if polish["de_essed"]:
+            notes.append(f"Applied split-band de-essing to {len(polish['de_essed'])} chapters before ffmpeg mastering.")
+        if polish["breath_normalized"]:
+            notes.append(f"Softened loud breaths in {len(polish['breath_normalized'])} chapters before ffmpeg mastering.")
         resampled: list[int] = []
         peak_limited: list[int] = []
 
@@ -408,11 +438,11 @@ class BookMasteringPipeline:
         db_session.flush()
         if resampled:
             notes.append(f"Resampled {len(resampled)} chapters to {ACX_SAMPLE_RATE} Hz.")
-        notes.append(f"Applied fast ffmpeg loudness/peak mastering to {len(chapters)} chapters.")
+        notes.append(f"Applied fast ffmpeg gate/compression/loudness/peak mastering to {len(chapters)} chapters.")
         edge_normalized = self._normalize_chapter_edges(chapters, db_session)
         if edge_normalized:
-            notes.append(f"Normalized chapter edge silence for {len(edge_normalized)} chapters.")
-        notes.append("Sentence-boundary padding verified via chapter QA after mastering.")
+            notes.append(f"Applied ACX room tone padding to {len(edge_normalized)} chapters.")
+        notes.append("Publishing mastering chain validated via chapter QA after mastering.")
         blockers = self._final_verify(chapters, db_session)
         return [], edge_normalized, peak_limited, blockers
 
@@ -430,6 +460,323 @@ class BookMasteringPipeline:
 
         db_session.flush()
         return resampled
+
+    @staticmethod
+    def _audio_to_samples(audio: AudioSegment) -> np.ndarray:
+        """Convert a mono AudioSegment into normalized float samples."""
+
+        mono_audio = audio.set_channels(1)
+        samples = np.array(mono_audio.get_array_of_samples(), dtype=np.float32)
+        if samples.size == 0:
+            return samples
+        max_amplitude = float(1 << ((8 * mono_audio.sample_width) - 1))
+        return samples / max_amplitude
+
+    @staticmethod
+    def _samples_to_audio(samples: np.ndarray, frame_rate: int) -> AudioSegment:
+        """Convert normalized float samples back into a 16-bit mono AudioSegment."""
+
+        clipped = np.clip(samples, -0.999969, 0.999969)
+        int_samples = np.round(clipped * np.iinfo(np.int16).max).astype(np.int16)
+        return AudioSegment(
+            data=int_samples.tobytes(),
+            sample_width=2,
+            frame_rate=frame_rate,
+            channels=1,
+        )
+
+    @staticmethod
+    def _dbfs_from_amplitude(value: float) -> float:
+        """Convert linear amplitude into dBFS with a practical floor."""
+
+        if value <= 1e-9:
+            return -100.0
+        return float(20 * np.log10(value))
+
+    @staticmethod
+    def _linear_rms(samples: np.ndarray) -> float:
+        """Return RMS amplitude for normalized samples."""
+
+        if samples.size == 0:
+            return 0.0
+        return float(np.sqrt(np.mean(np.square(samples))))
+
+    @staticmethod
+    def _spectral_flatness(samples: np.ndarray) -> float:
+        """Estimate spectral flatness for breath/noise-like discrimination."""
+
+        if samples.size == 0:
+            return 0.0
+        spectrum = np.abs(np.fft.rfft(samples.astype(np.float32))) + 1e-9
+        geometric = float(np.exp(np.mean(np.log(spectrum))))
+        arithmetic = float(np.mean(spectrum))
+        if arithmetic <= 1e-9:
+            return 0.0
+        return geometric / arithmetic
+
+    @staticmethod
+    def _apply_sos_filter(
+        samples: np.ndarray,
+        frame_rate: int,
+        *,
+        low_hz: float | None = None,
+        high_hz: float | None = None,
+        order: int = 4,
+    ) -> np.ndarray:
+        """Apply a Butterworth high-pass or band-pass filter safely."""
+
+        if samples.size == 0 or frame_rate <= 0:
+            return samples.copy()
+
+        nyquist = frame_rate / 2.0
+        if low_hz is not None and high_hz is not None:
+            low = max(low_hz / nyquist, 1e-5)
+            high = min(high_hz / nyquist, 0.999)
+            if low >= high:
+                return samples.copy()
+            sos = signal.butter(order, [low, high], btype="bandpass", output="sos")
+        elif low_hz is not None:
+            cutoff = max(low_hz / nyquist, 1e-5)
+            sos = signal.butter(order, cutoff, btype="highpass", output="sos")
+        else:
+            return samples.copy()
+
+        try:
+            return signal.sosfiltfilt(sos, samples.astype(np.float32)).astype(np.float32)
+        except ValueError:
+            return signal.sosfilt(sos, samples.astype(np.float32)).astype(np.float32)
+
+    @staticmethod
+    def _frame_ranges(total_samples: int, frame_size: int) -> list[tuple[int, int]]:
+        """Return sample ranges for fixed-size frame analysis."""
+
+        return [
+            (start, min(start + frame_size, total_samples))
+            for start in range(0, total_samples, frame_size)
+        ]
+
+    def _frame_dbfs_series(self, samples: np.ndarray, frame_rate: int, *, frame_ms: int) -> list[float]:
+        """Return RMS dBFS per analysis frame."""
+
+        if samples.size == 0 or frame_rate <= 0:
+            return []
+        frame_size = max(int(frame_rate * (frame_ms / 1000.0)), 1)
+        values: list[float] = []
+        for start, end in self._frame_ranges(samples.size, frame_size):
+            values.append(self._dbfs_from_amplitude(self._linear_rms(samples[start:end])))
+        return values
+
+    @staticmethod
+    def _contiguous_regions(mask: list[bool]) -> list[tuple[int, int]]:
+        """Collapse a boolean mask into inclusive frame ranges."""
+
+        if not mask:
+            return []
+        regions: list[tuple[int, int]] = []
+        start: int | None = None
+        for index, active in enumerate(mask):
+            if active and start is None:
+                start = index
+            elif not active and start is not None:
+                regions.append((start, index - 1))
+                start = None
+        if start is not None:
+            regions.append((start, len(mask) - 1))
+        return regions
+
+    @staticmethod
+    def _frame_gain_to_sample_envelope(
+        frame_gains: list[float],
+        total_samples: int,
+        frame_size: int,
+    ) -> np.ndarray:
+        """Expand frame-level gain values into a sample-rate envelope."""
+
+        if not frame_gains:
+            return np.ones(total_samples, dtype=np.float32)
+        envelope = np.repeat(np.array(frame_gains, dtype=np.float32), frame_size)
+        if envelope.size < total_samples:
+            envelope = np.pad(envelope, (0, total_samples - envelope.size), constant_values=frame_gains[-1])
+        return envelope[:total_samples]
+
+    def _apply_de_esser_to_audio(self, audio: AudioSegment) -> tuple[AudioSegment, bool]:
+        """Reduce short bursts of excessive 4-10kHz sibilance before compression."""
+
+        samples = self._audio_to_samples(audio)
+        if samples.size == 0:
+            return audio, False
+
+        frame_rate = audio.frame_rate
+        sibilance = self._apply_sos_filter(samples, frame_rate, low_hz=4000.0, high_hz=10000.0)
+        remainder = samples - sibilance
+        frame_ms = 5
+        frame_size = max(int(frame_rate * (frame_ms / 1000.0)), 1)
+        frame_gains: list[float] = []
+        current_gain = 1.0
+        attack_frames = 1
+        release_frames = max(int(round(50 / frame_ms)), 1)
+        changed = False
+
+        for start, end in self._frame_ranges(samples.size, frame_size):
+            sib_rms = self._linear_rms(sibilance[start:end])
+            rest_rms = self._linear_rms(remainder[start:end])
+            excess_db = self._dbfs_from_amplitude(sib_rms) - self._dbfs_from_amplitude(max(rest_rms, 1e-9))
+            if excess_db > self.DE_ESS_THRESHOLD_DB:
+                reduction_db = min(max(3.0 + ((excess_db - self.DE_ESS_THRESHOLD_DB) * 0.35), 3.0), 6.0)
+                target_gain = float(10 ** (-reduction_db / 20.0))
+                changed = True
+            else:
+                target_gain = 1.0
+            smoothing = attack_frames if target_gain < current_gain else release_frames
+            current_gain += (target_gain - current_gain) / max(smoothing, 1)
+            frame_gains.append(current_gain)
+
+        if not changed:
+            return audio, False
+
+        gain_envelope = self._frame_gain_to_sample_envelope(frame_gains, samples.size, frame_size)
+        processed = remainder + (sibilance * gain_envelope)
+        return self._samples_to_audio(processed, frame_rate), True
+
+    def _apply_plosive_reduction_to_audio(self, audio: AudioSegment) -> tuple[AudioSegment, bool]:
+        """Attenuate short low-frequency bursts that read like plosive thumps."""
+
+        samples = self._audio_to_samples(audio)
+        if samples.size == 0:
+            return audio, False
+
+        frame_rate = audio.frame_rate
+        low_band = self._apply_sos_filter(samples, frame_rate, low_hz=20.0, high_hz=300.0)
+        remainder = samples - low_band
+        frame_ms = 10
+        frame_size = max(int(frame_rate * (frame_ms / 1000.0)), 1)
+        low_db = self._frame_dbfs_series(low_band, frame_rate, frame_ms=frame_ms)
+        if len(low_db) < 3:
+            return audio, False
+
+        frame_gains = [1.0] * len(low_db)
+        changed = False
+        for index, current_db in enumerate(low_db):
+            start = max(index - 6, 0)
+            end = min(index + 7, len(low_db))
+            context = [low_db[i] for i in range(start, end) if i != index]
+            if not context:
+                continue
+            context_db = float(np.median(np.array(context, dtype=np.float32)))
+            burst_db = current_db - context_db
+            if burst_db < self.PLOSIVE_THRESHOLD_DB or current_db < -45.0:
+                continue
+            attenuation_db = min(max(burst_db - 9.0, 3.0), 6.0)
+            frame_gains[index] = min(frame_gains[index], float(10 ** (-attenuation_db / 20.0)))
+            changed = True
+
+        regions = self._contiguous_regions([gain < 0.999 for gain in frame_gains])
+        valid_regions = {
+            index
+            for start, end in regions
+            if ((end - start) + 1) * frame_ms <= self.PLOSIVE_MAX_DURATION_MS
+            for index in range(start, end + 1)
+        }
+        if not valid_regions:
+            return audio, False
+
+        filtered_gains = [gain if index in valid_regions else 1.0 for index, gain in enumerate(frame_gains)]
+        gain_envelope = self._frame_gain_to_sample_envelope(filtered_gains, samples.size, frame_size)
+        processed = remainder + (low_band * gain_envelope)
+        return self._samples_to_audio(processed, frame_rate), changed
+
+    def _apply_breath_normalization_to_audio(self, audio: AudioSegment) -> tuple[AudioSegment, bool]:
+        """Soften loud inhalations without removing natural breathing entirely."""
+
+        samples = self._audio_to_samples(audio)
+        if samples.size == 0:
+            return audio, False
+
+        frame_rate = audio.frame_rate
+        breath_band = self._apply_sos_filter(samples, frame_rate, low_hz=100.0, high_hz=1000.0)
+        frame_ms = 50
+        frame_size = max(int(frame_rate * (frame_ms / 1000.0)), 1)
+        breath_db = self._frame_dbfs_series(breath_band, frame_rate, frame_ms=frame_ms)
+        full_db = self._frame_dbfs_series(samples, frame_rate, frame_ms=frame_ms)
+        flatness_series = [
+            self._spectral_flatness(breath_band[start:start + frame_size])
+            for start in range(0, samples.size, frame_size)
+        ]
+        if not breath_db:
+            return audio, False
+
+        candidate_mask = [
+            breath_db[index] > -48.0
+            and full_db[index] < -20.0
+            and flatness_series[index] > 0.05
+            and abs(breath_db[index] - full_db[index]) >= 6.0
+            for index in range(len(breath_db))
+        ]
+        changed = False
+        processed = samples.copy()
+
+        for start_frame, end_frame in self._contiguous_regions(candidate_mask):
+            duration_ms = ((end_frame - start_frame) + 1) * frame_ms
+            if duration_ms < 100 or duration_ms > 800:
+                continue
+            preceding_start = max(start_frame - 3, 0)
+            preceding_db = max(full_db[preceding_start:start_frame] or [-100.0])
+            if preceding_db > -30.0:
+                continue
+            sample_start = start_frame * frame_size
+            sample_end = min((end_frame + 1) * frame_size, samples.size)
+            segment = processed[sample_start:sample_end]
+            if self._spectral_flatness(breath_band[sample_start:sample_end]) < 0.05:
+                continue
+            peak_db = self._dbfs_from_amplitude(float(np.max(np.abs(segment))))
+            if peak_db <= self.BREATH_REDUCTION_TRIGGER_DBFS:
+                continue
+            attenuation_db = self.BREATH_TARGET_DBFS - peak_db
+            gain = float(10 ** (attenuation_db / 20.0))
+            processed[sample_start:sample_end] *= gain
+            changed = True
+
+        if not changed:
+            return audio, False
+        return self._samples_to_audio(processed, frame_rate), True
+
+    def _apply_frequency_selective_processing(
+        self,
+        chapters: list[Chapter],
+        db_session: Session,
+    ) -> dict[str, list[int]]:
+        """Run HPF, plosive control, de-essing, and breath softening in order."""
+
+        results = {
+            "high_passed": [],
+            "plosive_reduced": [],
+            "de_essed": [],
+            "breath_normalized": [],
+        }
+
+        for chapter in chapters:
+            audio_path = self._resolve_audio_path(chapter)
+            original = AudioSegment.from_file(audio_path).set_channels(1).set_sample_width(2)
+            processed = high_pass_filter(original, cutoff=self.HIGH_PASS_HZ)
+            if processed.raw_data != original.raw_data:
+                results["high_passed"].append(chapter.number)
+
+            processed, plosive_changed = self._apply_plosive_reduction_to_audio(processed)
+            if plosive_changed:
+                results["plosive_reduced"].append(chapter.number)
+
+            processed, de_ess_changed = self._apply_de_esser_to_audio(processed)
+            if de_ess_changed:
+                results["de_essed"].append(chapter.number)
+
+            processed, breath_changed = self._apply_breath_normalization_to_audio(processed)
+            if breath_changed:
+                results["breath_normalized"].append(chapter.number)
+
+            self._persist_audio_if_changed(chapter, audio_path, original, processed)
+
+        db_session.flush()
+        return results
 
     def _apply_noise_gate(self, chapters: list[Chapter], db_session: Session) -> list[int]:
         """Reduce low-level hiss between phrases before loudness normalization."""
@@ -519,9 +866,9 @@ class BookMasteringPipeline:
             audio = AudioSegment.from_file(audio_path).set_channels(1).set_sample_width(2)
             processed = compress_dynamic_range(
                 audio,
-                threshold=self.COMPRESSION_THRESHOLD_DBFS,
+                threshold=-24.0,
                 ratio=self.COMPRESSION_RATIO,
-                attack=10,
+                attack=15,
                 release=100,
             )
             if self._persist_audio_if_changed(chapter, audio_path, audio, processed):
@@ -531,7 +878,7 @@ class BookMasteringPipeline:
         return compressed
 
     def _normalize_chapter_edges(self, chapters: list[Chapter], db_session: Session) -> list[int]:
-        """Ensure consistent lead-in and trail-out silence on every chapter."""
+        """Replace digital silence with deterministic low-level room tone padding."""
 
         normalized: list[int] = []
         for chapter in chapters:
@@ -543,18 +890,53 @@ class BookMasteringPipeline:
                 abs(leading_ms - self.TARGET_LEAD_IN_MS) <= self.EDGE_TOLERANCE_MS
                 and abs(trailing_ms - self.TARGET_TRAIL_OUT_MS) <= self.EDGE_TOLERANCE_MS
             ):
-                continue
+                head_db = audio[:500].dBFS if len(audio) >= 500 else audio.dBFS
+                tail_db = audio[-1000:].dBFS if len(audio) >= 1000 else audio.dBFS
+                if (
+                    head_db != float("-inf")
+                    and tail_db != float("-inf")
+                    and self.ROOM_TONE_MIN_DBFS <= head_db <= self.ROOM_TONE_MAX_DBFS
+                    and self.ROOM_TONE_MIN_DBFS <= tail_db <= self.ROOM_TONE_MAX_DBFS
+                ):
+                    continue
             trimmed = self._strip_silence(audio)
+            head_tone = self._generate_room_tone(audio.frame_rate, self.TARGET_LEAD_IN_MS)
+            tail_tone = self._generate_room_tone(audio.frame_rate, self.TARGET_TRAIL_OUT_MS)
             padded = (
-                AudioSegment.silent(duration=self.TARGET_LEAD_IN_MS, frame_rate=audio.frame_rate).set_channels(1)
+                head_tone
                 + trimmed
-                + AudioSegment.silent(duration=self.TARGET_TRAIL_OUT_MS, frame_rate=audio.frame_rate).set_channels(1)
+                + tail_tone
             )
             if self._persist_audio_if_changed(chapter, audio_path, audio, padded):
                 normalized.append(chapter.number)
 
         db_session.flush()
         return normalized
+
+    def _generate_room_tone(self, frame_rate: int, duration_ms: int) -> AudioSegment:
+        """Return cached deterministic pink-noise room tone at the target level."""
+
+        cache_key = (frame_rate, duration_ms)
+        cached = self._room_tone_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        sample_count = max(int(frame_rate * (duration_ms / 1000.0)), 1)
+        rng = np.random.default_rng(self.ROOM_TONE_SEED + frame_rate + duration_ms)
+        white = rng.standard_normal(sample_count).astype(np.float32)
+        spectrum = np.fft.rfft(white)
+        frequencies = np.fft.rfftfreq(sample_count, d=1.0 / frame_rate)
+        scale = np.ones_like(frequencies, dtype=np.float32)
+        scale[1:] = 1.0 / np.sqrt(frequencies[1:])
+        pink = np.fft.irfft(spectrum * scale, n=sample_count).astype(np.float32)
+        peak = float(np.max(np.abs(pink))) if pink.size else 0.0
+        if peak > 0:
+            pink /= peak
+        tone = self._samples_to_audio(pink, frame_rate)
+        if tone.dBFS != float("-inf"):
+            tone = tone.apply_gain(self.ROOM_TONE_LEVEL_DBFS - float(tone.dBFS))
+        self._room_tone_cache[cache_key] = tone
+        return tone
 
     def _apply_final_peak_limit(self, chapters: list[Chapter], db_session: Session) -> list[int]:
         """Ensure no chapter exceeds the ACX true-peak ceiling."""
@@ -582,12 +964,25 @@ class BookMasteringPipeline:
         for chapter in chapters:
             audio_path = self._resolve_audio_path(chapter)
             frame_rate, channels, sample_width, _ = self._read_wav_metadata(audio_path)
+            audio = AudioSegment.from_file(audio_path).set_channels(1).set_sample_width(2)
             if frame_rate != ACX_SAMPLE_RATE:
                 blockers.append(f"Chapter {chapter.number} is {frame_rate}Hz after mastering.")
             if channels != ACX_REQUIREMENTS["channels"]:
                 blockers.append(f"Chapter {chapter.number} is not mono after mastering.")
             if sample_width * 8 != ACX_REQUIREMENTS["bit_depth"]:
                 blockers.append(f"Chapter {chapter.number} is not 16-bit PCM after mastering.")
+            trimmed = self._strip_silence(audio)
+            rms_db = float(trimmed.dBFS) if len(trimmed) > 0 and trimmed.dBFS != float("-inf") else -100.0
+            if not (ACX_REQUIREMENTS["rms_min_db"] <= rms_db <= ACX_REQUIREMENTS["rms_max_db"]):
+                blockers.append(f"Chapter {chapter.number} RMS is {rms_db:.1f} dBFS after mastering.")
+            if float(audio.max_dBFS) > self.MAX_PEAK_DBFS:
+                blockers.append(f"Chapter {chapter.number} peak remains above {self.MAX_PEAK_DBFS:.1f} dBFS after mastering.")
+            head_db = audio[:500].dBFS if len(audio) >= 500 else audio.dBFS
+            tail_db = audio[-1000:].dBFS if len(audio) >= 1000 else audio.dBFS
+            if head_db == float("-inf") or not (self.ROOM_TONE_MIN_DBFS <= head_db <= self.ROOM_TONE_MAX_DBFS):
+                blockers.append(f"Chapter {chapter.number} is missing compliant head room tone.")
+            if tail_db == float("-inf") or not (self.ROOM_TONE_MIN_DBFS <= tail_db <= self.ROOM_TONE_MAX_DBFS):
+                blockers.append(f"Chapter {chapter.number} is missing compliant tail room tone.")
 
         db_session.flush()
         return blockers

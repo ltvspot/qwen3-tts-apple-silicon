@@ -18,6 +18,8 @@ from src.database import Base, get_db, utc_now
 from src.health_checks import DiskSpaceSnapshot
 from src.main import app
 
+collect_ignore_glob = ["* 2.py"]
+
 
 @pytest.fixture(autouse=True)
 def isolated_settings_manager() -> Generator[None, None, None]:

@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 
+import numpy as np
 import pytest
 from pydub import AudioSegment
 from pydub.generators import Sine
@@ -25,6 +26,7 @@ from src.pipeline.book_qa import (
     check_acx_compliance,
     check_chapter_transitions,
     check_cross_chapter_loudness,
+    check_loudness_range,
     check_cross_chapter_pacing,
     check_cross_chapter_voice,
     run_book_qa,
@@ -68,12 +70,26 @@ def _tone(duration_ms: int, frequency: int = 220, *, gain_db: float = -18.0) -> 
 
 
 def _with_edges(audio: AudioSegment, *, lead_ms: int = 750, trail_ms: int = 1500) -> AudioSegment:
-    """Wrap spoken audio in ACX-friendly edge silence."""
+    """Wrap spoken audio in ACX-friendly room tone."""
+
+    def _room_tone(duration_ms: int) -> AudioSegment:
+        sample_count = max(int(FRAME_RATE * (duration_ms / 1000.0)), 1)
+        rng = np.random.default_rng(53 + duration_ms)
+        samples = rng.standard_normal(sample_count).astype(np.float32)
+        samples /= max(float(np.max(np.abs(samples))), 1.0)
+        samples *= float(10 ** (-65.0 / 20.0))
+        int_samples = np.round(samples * np.iinfo(np.int16).max).astype(np.int16)
+        return AudioSegment(
+            data=int_samples.tobytes(),
+            sample_width=2,
+            frame_rate=FRAME_RATE,
+            channels=1,
+        )
 
     return (
-        AudioSegment.silent(duration=lead_ms, frame_rate=FRAME_RATE).set_channels(1)
+        _room_tone(lead_ms)
         + audio
-        + AudioSegment.silent(duration=trail_ms, frame_rate=FRAME_RATE).set_channels(1)
+        + _room_tone(trail_ms)
     )
 
 
@@ -174,6 +190,27 @@ def _create_ready_chapter(
     return chapter
 
 
+def _create_credits(test_db: Session, book: Book) -> None:
+    """Create opening and closing credits chapters for ACX preflight tests."""
+
+    _create_ready_chapter(
+        test_db,
+        book=book,
+        number=0,
+        title="Opening Credits",
+        audio=_with_edges(_tone(1500, 220, gain_db=-16.0)),
+        chapter_type=ChapterType.OPENING_CREDITS,
+    )
+    _create_ready_chapter(
+        test_db,
+        book=book,
+        number=99,
+        title="Closing Credits",
+        audio=_with_edges(_tone(1500, 220, gain_db=-16.0)),
+        chapter_type=ChapterType.CLOSING_CREDITS,
+    )
+
+
 def test_loudness_consistency_pass(test_db: Session, monkeypatch: pytest.MonkeyPatch) -> None:
     """Chapters inside the ±1.5 LU band should pass."""
 
@@ -217,6 +254,21 @@ def test_loudness_consistency_fail(test_db: Session, monkeypatch: pytest.MonkeyP
     )
 
     result = check_cross_chapter_loudness(book.id, test_db)
+
+    assert result.status == "fail"
+    assert result.blockers
+
+
+def test_loudness_range_validation_flags_overcompressed_chapter(test_db: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+    """LRA below 3 LU should fail the publishing-quality loudness range gate."""
+
+    book = _create_book(test_db, title="LRA Fail")
+    _create_ready_chapter(test_db, book=book, number=1, title="One", audio=_with_edges(_tone(3000)))
+    _create_ready_chapter(test_db, book=book, number=2, title="Two", audio=_with_edges(_tone(3000)))
+    lra_values = iter([6.0, 2.5])
+    monkeypatch.setattr("src.pipeline.book_qa.measure_loudness_range_lu", lambda *_args, **_kwargs: next(lra_values))
+
+    result = check_loudness_range(book.id, test_db)
 
     assert result.status == "fail"
     assert result.blockers
@@ -301,8 +353,8 @@ def test_chapter_transition_smooth(test_db: Session) -> None:
     """Matching chapter edges should pass transition QA."""
 
     book = _create_book(test_db, title="Transitions Pass")
-    _create_ready_chapter(test_db, book=book, number=1, title="One", audio=_with_edges(_tone(4000, 220, gain_db=-18.0)))
-    _create_ready_chapter(test_db, book=book, number=2, title="Two", audio=_with_edges(_tone(4000, 220, gain_db=-18.5)))
+    _create_ready_chapter(test_db, book=book, number=1, title="One", audio=_with_edges(_tone(4000, 220, gain_db=-18.0), lead_ms=1500, trail_ms=1500))
+    _create_ready_chapter(test_db, book=book, number=2, title="Two", audio=_with_edges(_tone(4000, 220, gain_db=-18.5), lead_ms=1500, trail_ms=1500))
 
     result = check_chapter_transitions(book.id, test_db)
 
@@ -356,6 +408,7 @@ def test_acx_compliance_pass(test_db: Session, monkeypatch: pytest.MonkeyPatch) 
     """A properly shaped chapter should satisfy ACX validation."""
 
     book = _create_book(test_db, title="ACX Pass")
+    _create_credits(test_db, book)
     _create_ready_chapter(test_db, book=book, number=1, title="One", audio=_with_edges(_tone(3000, 220, gain_db=-18.0)))
     monkeypatch.setattr("src.pipeline.book_qa.measure_integrated_lufs", lambda *_args, **_kwargs: -20.0)
 
@@ -369,6 +422,7 @@ def test_acx_compliance_peak_violation(test_db: Session, monkeypatch: pytest.Mon
     """Peak levels above the ACX ceiling should fail."""
 
     book = _create_book(test_db, title="ACX Fail")
+    _create_credits(test_db, book)
     _create_ready_chapter(test_db, book=book, number=1, title="One", audio=_with_edges(_tone(3000, 220, gain_db=-0.2)))
     monkeypatch.setattr("src.pipeline.book_qa.measure_integrated_lufs", lambda *_args, **_kwargs: -20.0)
 
@@ -385,6 +439,7 @@ def test_acx_compliance_export_mode_downgrades_mastering_violations(
     """Export mode should convert fixable ACX mastering issues into warnings."""
 
     book = _create_book(test_db, title="ACX Export Warning")
+    _create_credits(test_db, book)
     _create_ready_chapter(test_db, book=book, number=1, title="One", audio=_with_edges(_tone(3000, 220, gain_db=-0.2)))
     monkeypatch.setattr("src.pipeline.book_qa.measure_integrated_lufs", lambda *_args, **_kwargs: -16.0)
 
@@ -404,6 +459,7 @@ def test_acx_compliance_skips_long_wav_file_size_false_positive(
     """Long intermediate WAV chapters should not fail the final ACX file-size check."""
 
     book = _create_book(test_db, title="ACX Long WAV")
+    _create_credits(test_db, book)
     chapter = _create_ready_chapter(test_db, book=book, number=1, title="One", audio=_with_edges(_tone(3000, 220, gain_db=-18.0)))
     chapter.duration_seconds = 21 * 60
     test_db.commit()
@@ -471,9 +527,11 @@ def test_book_report_aggregates_grades_and_blockers(test_db: Session, monkeypatc
     """The aggregate report should summarize chapter grades and export readiness."""
 
     book = _create_book(test_db, title="Book Summary")
+    _create_credits(test_db, book)
     _create_ready_chapter(test_db, book=book, number=1, title="One", audio=_with_edges(_tone(3000)), grade="A")
     _create_ready_chapter(test_db, book=book, number=2, title="Two", audio=_with_edges(_tone(3000)), grade="C")
     monkeypatch.setattr("src.pipeline.book_qa.measure_integrated_lufs", lambda *_args, **_kwargs: -20.0)
+    monkeypatch.setattr("src.pipeline.book_qa.measure_loudness_range_lu", lambda *_args, **_kwargs: 6.0)
     monkeypatch.setattr(
         "src.pipeline.book_qa.compute_voice_fingerprint",
         lambda *args, **kwargs: {
@@ -488,6 +546,6 @@ def test_book_report_aggregates_grades_and_blockers(test_db: Session, monkeypatc
 
     report = run_book_qa(book.id, test_db)
 
-    assert report.chapters_grade_a == 1
+    assert report.chapters_grade_a == 3
     assert report.chapters_grade_c == 1
     assert report.ready_for_export is True

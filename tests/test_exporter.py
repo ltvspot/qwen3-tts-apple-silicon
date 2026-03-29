@@ -266,6 +266,7 @@ def test_export_book_sync_writes_mp3_m4b_and_qa_report(
 
     monkeypatch.setattr("src.pipeline.book_mastering.measure_integrated_lufs", lambda *_args, **_kwargs: -20.0)
     monkeypatch.setattr("src.pipeline.book_mastering.run_qa_checks_for_chapter", fake_run_qa_checks_for_chapter)
+    monkeypatch.setattr("src.pipeline.book_mastering.BookMasteringPipeline._final_verify", lambda self, chapters, db_session: [])
     monkeypatch.setattr(
         "src.pipeline.book_mastering.run_book_qa",
         lambda book_id, db_session, export_mode=False: BookQAReport(

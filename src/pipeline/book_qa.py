@@ -36,14 +36,23 @@ ACX_REQUIREMENTS = {
     "channels": 1,
     "lufs_min": -23.0,
     "lufs_max": -18.0,
+    "rms_min_db": -23.0,
+    "rms_max_db": -18.0,
     "peak_max_db": -3.0,
     "noise_floor_max_db": -60.0,
     "min_leading_silence_ms": 500,
     "max_leading_silence_ms": 1000,
     "min_trailing_silence_ms": 1000,
     "max_trailing_silence_ms": 5000,
+    "room_tone_min_db": -80.0,
+    "room_tone_max_db": -50.0,
     "min_chapter_duration_s": 1.0,
+    "max_chapter_duration_s": 120 * 60.0,
     "max_file_size_mb": 170.0,
+    "lra_warning_min_lu": 4.0,
+    "lra_warning_max_lu": 15.0,
+    "lra_fail_min_lu": 3.0,
+    "lra_fail_max_lu": 18.0,
 }
 
 
@@ -198,31 +207,57 @@ def _require_gate3_ready(book_id: int, db_session: Session) -> tuple[Book, list[
     return (book, generated_chapters, qa_records)
 
 
-def measure_integrated_lufs(audio_path: str | Path) -> float | None:
-    """Return integrated LUFS using ffmpeg loudnorm when available."""
+def _loudnorm_metrics(audio_path: str | Path) -> dict[str, float | None]:
+    """Return integrated loudness stats, preferring pyloudnorm and falling back to ffmpeg."""
 
     resolved_path = Path(audio_path)
-    measurement_path = resolved_path
     temp_path: Path | None = None
+    measurement_audio: AudioSegment | None = None
+    measurement_path = resolved_path
 
     try:
         try:
-            original_audio = AudioSegment.from_file(resolved_path)
+            original_audio = AudioSegment.from_file(resolved_path).set_channels(1).set_sample_width(2)
             trimmed_audio = _trimmed_audio(original_audio)
-            if 0 < len(trimmed_audio) < len(original_audio):
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
-                    temp_path = Path(handle.name)
-                trimmed_audio.set_channels(1).set_sample_width(2).export(temp_path, format="wav")
-                measurement_path = temp_path
+            measurement_audio = trimmed_audio if 0 < len(trimmed_audio) <= len(original_audio) else original_audio
         except Exception:
-            measurement_path = resolved_path
+            measurement_audio = None
+
+        if measurement_audio is not None:
+            try:
+                import pyloudnorm as pyln  # type: ignore
+
+                samples = _mono_samples(measurement_audio).astype(np.float64, copy=False)
+                if samples.size > 0:
+                    meter = pyln.Meter(measurement_audio.frame_rate)
+                    loudness_range = None
+                    loudness_range_method = getattr(meter, "loudness_range", None)
+                    if callable(loudness_range_method):
+                        loudness_range = float(loudness_range_method(samples))
+                    return {
+                        "integrated_lufs": round(float(meter.integrated_loudness(samples)), 3),
+                        "loudness_range_lu": round(loudness_range, 3) if loudness_range is not None else None,
+                    }
+            except Exception as exc:
+                logger.debug("pyloudnorm unavailable for %s: %s", resolved_path, exc)
+
+        if measurement_audio is not None and measurement_audio.duration_seconds > 0:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as handle:
+                temp_path = Path(handle.name)
+            measurement_audio.export(temp_path, format="wav")
+            measurement_path = temp_path
 
         ffmpeg_path = shutil.which("ffmpeg")
         if ffmpeg_path is None:
             try:
-                return round(float(AudioSegment.from_file(measurement_path).dBFS), 3)
+                fallback_audio = measurement_audio or AudioSegment.from_file(measurement_path)
+                fallback_db = float(fallback_audio.dBFS)
+                return {
+                    "integrated_lufs": round(fallback_db, 3) if fallback_db != float("-inf") else None,
+                    "loudness_range_lu": None,
+                }
             except Exception:
-                return None
+                return {"integrated_lufs": None, "loudness_range_lu": None}
 
         command = [
             ffmpeg_path,
@@ -238,25 +273,39 @@ def measure_integrated_lufs(audio_path: str | Path) -> float | None:
         try:
             completed = subprocess.run(command, check=True, capture_output=True, text=True)
         except subprocess.CalledProcessError as exc:
-            logger.warning("Unable to measure LUFS for %s: %s", resolved_path, exc)
-            try:
-                return round(float(AudioSegment.from_file(measurement_path).dBFS), 3)
-            except Exception:
-                return None
+            logger.warning("Unable to measure loudness for %s: %s", resolved_path, exc)
+            return {"integrated_lufs": None, "loudness_range_lu": None}
 
         output = "\n".join(part for part in (completed.stdout, completed.stderr) if part)
         match = re.search(r"(\{\s*\"input_i\".*?\})", output, re.DOTALL)
         if match is None:
-            return None
+            return {"integrated_lufs": None, "loudness_range_lu": None}
 
         try:
             metrics = json.loads(match.group(1))
-            return round(float(metrics["input_i"]), 3)
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-            return None
+            integrated = metrics.get("input_i")
+            loudness_range = metrics.get("input_lra")
+            return {
+                "integrated_lufs": round(float(integrated), 3) if integrated is not None else None,
+                "loudness_range_lu": round(float(loudness_range), 3) if loudness_range is not None else None,
+            }
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {"integrated_lufs": None, "loudness_range_lu": None}
     finally:
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
+
+
+def measure_integrated_lufs(audio_path: str | Path) -> float | None:
+    """Return integrated LUFS using the shared loudness measurement helper."""
+
+    return _loudnorm_metrics(audio_path).get("integrated_lufs")
+
+
+def measure_loudness_range_lu(audio_path: str | Path) -> float | None:
+    """Return loudness range in LU when the underlying meter can provide it."""
+
+    return _loudnorm_metrics(audio_path).get("loudness_range_lu")
 
 
 def _leading_silence_ms(audio: AudioSegment, *, silence_thresh: float = -45.0, step_ms: int = 10) -> int:
@@ -735,6 +784,73 @@ def _silence_noise_floor_db(audio: AudioSegment) -> float:
     return max(floors) if floors else -100.0
 
 
+def _trimmed_rms_db(audio: AudioSegment) -> float:
+    """Return RMS dBFS for the speaking portion of a chapter."""
+
+    trimmed = _trimmed_audio(audio)
+    if len(trimmed) == 0 or trimmed.dBFS == float("-inf"):
+        return -100.0
+    return round(float(trimmed.dBFS), 3)
+
+
+def _edge_room_tone_db(audio: AudioSegment, *, duration_ms: int, trailing: bool = False) -> float:
+    """Measure the RMS level of a leading or trailing room-tone window."""
+
+    if len(audio) == 0:
+        return -100.0
+    segment = audio[-duration_ms:] if trailing else audio[:duration_ms]
+    if len(segment) == 0 or segment.dBFS == float("-inf"):
+        return -100.0
+    return round(float(segment.dBFS), 3)
+
+
+def check_loudness_range(book_id: int, db_session: Session) -> BookQACheck:
+    """Validate narration loudness range so chapters are neither crushed nor too dynamic."""
+
+    _, chapters, _ = _require_gate3_ready(book_id, db_session)
+    chapters = _content_chapters(chapters)
+    chapter_ranges: list[dict[str, float | int | None]] = []
+    statuses: list[str] = []
+    recommendations: list[str] = []
+    blockers: list[str] = []
+
+    for chapter in chapters:
+        lra = measure_loudness_range_lu(_chapter_audio_path(chapter))
+        chapter_ranges.append({"chapter_n": chapter.number, "lra_lu": lra})
+        if lra is None:
+            statuses.append(QAAutomaticStatus.WARNING.value)
+            recommendations.append(f"Chapter {chapter.number} loudness range could not be measured.")
+            continue
+        if lra < ACX_REQUIREMENTS["lra_fail_min_lu"] or lra > ACX_REQUIREMENTS["lra_fail_max_lu"]:
+            statuses.append(QAAutomaticStatus.FAIL.value)
+            blockers.append(f"Chapter {chapter.number} LRA is {lra:.1f} LU; target is 4-15 LU.")
+        elif lra < ACX_REQUIREMENTS["lra_warning_min_lu"] or lra > ACX_REQUIREMENTS["lra_warning_max_lu"]:
+            statuses.append(QAAutomaticStatus.WARNING.value)
+            recommendations.append(f"Chapter {chapter.number} LRA is {lra:.1f} LU and should be re-mastered.")
+        else:
+            statuses.append(QAAutomaticStatus.PASS.value)
+
+    status = _summarize_status(statuses or [QAAutomaticStatus.PASS.value])
+    values = [float(entry["lra_lu"]) for entry in chapter_ranges if entry["lra_lu"] is not None]
+    message = (
+        "All chapters fall within the narration loudness-range target."
+        if status == QAAutomaticStatus.PASS.value
+        else "One or more chapters fall outside the narration loudness-range target."
+    )
+    return BookQACheck(
+        status=status,
+        message=message,
+        details={
+            "chapters": chapter_ranges,
+            "mean_lra_lu": round(float(np.mean(np.array(values, dtype=np.float32))), 3) if values else None,
+            "min_lra_lu": min(values) if values else None,
+            "max_lra_lu": max(values) if values else None,
+        },
+        recommendations=recommendations or ["Narration loudness range is in the preferred 4-15 LU band."],
+        blockers=blockers,
+    )
+
+
 def check_acx_compliance(book_id: int, db_session: Session, *, export_mode: bool = False) -> BookQACheck:
     """Ensure every chapter meets ACX/Audible production requirements."""
 
@@ -742,26 +858,29 @@ def check_acx_compliance(book_id: int, db_session: Session, *, export_mode: bool
     violations: list[dict[str, Any]] = []
     blockers: list[str] = []
     recommendations: list[str] = []
-    export_warning_issues = {"lufs", "true_peak_db", "noise_floor_db", "file_size_mb"}
+    export_warning_issues = {"lufs", "rms_db", "true_peak_db", "noise_floor_db", "file_size_mb"}
 
     for chapter in chapters:
         audio_path = _chapter_audio_path(chapter)
-        audio = AudioSegment.from_file(audio_path)
+        audio = AudioSegment.from_file(audio_path).set_channels(1).set_sample_width(2)
         lufs = measure_integrated_lufs(audio_path)
+        rms_db = _trimmed_rms_db(audio)
         true_peak_db = _true_peak_dbfs(audio)
         noise_floor_db = _silence_noise_floor_db(audio)
         leading_silence_ms = _leading_silence_ms(audio)
         trailing_silence_ms = _trailing_silence_ms(audio)
+        head_room_tone_db = _edge_room_tone_db(audio, duration_ms=500)
+        tail_room_tone_db = _edge_room_tone_db(audio, duration_ms=1000, trailing=True)
         duration_seconds = chapter.duration_seconds or (len(audio) / 1000.0)
         file_size_mb = audio_path.stat().st_size / (1024 * 1024)
         bit_depth = audio.sample_width * 8
 
-        def add_violation(issue: str, remediation: str, value: Any) -> None:
+        def add_violation(issue: str, remediation: str, value: Any, *, chapter_n: int | None = None) -> None:
             severity = "warning" if export_mode and issue in export_warning_issues else "blocker"
-            message = f"Chapter {chapter.number} {issue}: {remediation}"
+            label = f"Chapter {chapter_n if chapter_n is not None else chapter.number} {issue}: {remediation}"
             violations.append(
                 {
-                    "chapter_n": chapter.number,
+                    "chapter_n": chapter_n if chapter_n is not None else chapter.number,
                     "issue": issue,
                     "value": value,
                     "remediation": remediation,
@@ -769,9 +888,9 @@ def check_acx_compliance(book_id: int, db_session: Session, *, export_mode: bool
                 }
             )
             if severity == "warning":
-                recommendations.append(message)
+                recommendations.append(label)
             else:
-                blockers.append(message)
+                blockers.append(label)
 
         if audio.frame_rate != ACX_REQUIREMENTS["sample_rate"]:
             add_violation("sample_rate", "Resample chapter masters to 44.1kHz.", audio.frame_rate)
@@ -779,21 +898,66 @@ def check_acx_compliance(book_id: int, db_session: Session, *, export_mode: bool
             add_violation("bit_depth", "Export chapter masters at 16-bit PCM.", bit_depth)
         if audio.channels != ACX_REQUIREMENTS["channels"]:
             add_violation("channels", "Convert chapter audio to mono.", audio.channels)
+        if not (ACX_REQUIREMENTS["rms_min_db"] <= rms_db <= ACX_REQUIREMENTS["rms_max_db"]):
+            add_violation("rms_db", "Adjust chapter RMS into the -23 to -18 dBFS publishing range.", rms_db)
         if lufs is None or not (ACX_REQUIREMENTS["lufs_min"] <= lufs <= ACX_REQUIREMENTS["lufs_max"]):
             add_violation("lufs", "Adjust chapter loudness into the ACX range of -23 to -18 LUFS.", lufs)
         if true_peak_db > ACX_REQUIREMENTS["peak_max_db"]:
             add_violation("true_peak_db", "Apply final peak limiting below -3 dBFS.", round(true_peak_db, 3))
         if noise_floor_db > ACX_REQUIREMENTS["noise_floor_max_db"]:
             add_violation("noise_floor_db", "Lower the silence noise floor below -60 dBFS.", round(noise_floor_db, 3))
+        if not (ACX_REQUIREMENTS["room_tone_min_db"] <= head_room_tone_db <= ACX_REQUIREMENTS["room_tone_max_db"]):
+            add_violation("room_tone_head_db", "Provide 0.5s+ low-level head room tone between -80 and -50 dBFS.", head_room_tone_db)
+        if not (ACX_REQUIREMENTS["room_tone_min_db"] <= tail_room_tone_db <= ACX_REQUIREMENTS["room_tone_max_db"]):
+            add_violation("room_tone_tail_db", "Provide 1.0s+ low-level tail room tone between -80 and -50 dBFS.", tail_room_tone_db)
         if not (ACX_REQUIREMENTS["min_leading_silence_ms"] <= leading_silence_ms <= ACX_REQUIREMENTS["max_leading_silence_ms"]):
             add_violation("leading_silence_ms", "Normalize chapter lead-in silence to 500-1000ms.", leading_silence_ms)
         if not (ACX_REQUIREMENTS["min_trailing_silence_ms"] <= trailing_silence_ms <= ACX_REQUIREMENTS["max_trailing_silence_ms"]):
             add_violation("trailing_silence_ms", "Normalize chapter tail silence to 1000-5000ms.", trailing_silence_ms)
         if duration_seconds < ACX_REQUIREMENTS["min_chapter_duration_s"]:
             add_violation("duration_seconds", "Ensure the chapter contains at least one second of audio.", chapter.duration_seconds)
+        if duration_seconds > ACX_REQUIREMENTS["max_chapter_duration_s"]:
+            add_violation("duration_seconds_max", "Split files so no chapter exceeds 120 minutes.", chapter.duration_seconds)
         skip_file_size_check = audio_path.suffix.lower() == ".wav" and duration_seconds > (20 * 60)
         if not skip_file_size_check and file_size_mb > ACX_REQUIREMENTS["max_file_size_mb"]:
             add_violation("file_size_mb", "Reduce chapter size below the ACX upload limit.", round(file_size_mb, 3))
+
+    opening_credits_exists = any(
+        chapter.type == ChapterType.OPENING_CREDITS
+        or (chapter.number in {0, 1} and "opening" in (chapter.title or "").lower())
+        for chapter in chapters
+    )
+    closing_credits_exists = any(chapter.type == ChapterType.CLOSING_CREDITS for chapter in chapters) or (
+        bool(chapters) and "closing" in ((chapters[-1].title or "").lower())
+    )
+    if not opening_credits_exists:
+        severity = "warning" if export_mode else "blocker"
+        violations.append(
+            {
+                "chapter_n": None,
+                "issue": "opening_credits",
+                "value": None,
+                "remediation": "Ensure an opening credits chapter exists before export.",
+                "severity": severity,
+            }
+        )
+        (recommendations if severity == "warning" else blockers).append(
+            "Opening credits chapter is missing from the export sequence."
+        )
+    if not closing_credits_exists:
+        severity = "warning" if export_mode else "blocker"
+        violations.append(
+            {
+                "chapter_n": None,
+                "issue": "closing_credits",
+                "value": None,
+                "remediation": "Ensure a closing credits chapter exists as the final chapter.",
+                "severity": severity,
+            }
+        )
+        (recommendations if severity == "warning" else blockers).append(
+            "Closing credits chapter is missing from the export sequence."
+        )
 
     if blockers:
         status = QAAutomaticStatus.FAIL.value
@@ -809,7 +973,11 @@ def check_acx_compliance(book_id: int, db_session: Session, *, export_mode: bool
     return BookQACheck(
         status=status,
         message=message,
-        details={"violations": violations},
+        details={
+            "violations": violations,
+            "opening_credits_present": opening_credits_exists,
+            "closing_credits_present": closing_credits_exists,
+        },
         recommendations=recommendations or (["All chapters satisfy ACX/Audible requirements."] if not violations else []),
         blockers=blockers,
     )
@@ -833,6 +1001,7 @@ def run_book_qa(book_id: int, db_session: Session, *, export_mode: bool = False)
 
     book, chapters, qa_records = _require_gate3_ready(book_id, db_session)
     loudness = check_cross_chapter_loudness(book_id, db_session)
+    loudness_range = check_loudness_range(book_id, db_session)
     voice = check_cross_chapter_voice(book_id, db_session)
     pacing = check_cross_chapter_pacing(book_id, db_session)
     transitions = check_chapter_transitions(book_id, db_session)
@@ -846,6 +1015,7 @@ def run_book_qa(book_id: int, db_session: Session, *, export_mode: bool = False)
 
     checks = {
         "loudness_consistency": loudness,
+        "loudness_range": loudness_range,
         "voice_consistency": voice,
         "pacing_consistency": pacing,
         "chapter_transitions": transitions,
@@ -885,6 +1055,12 @@ def run_book_qa(book_id: int, db_session: Session, *, export_mode: bool = False)
                 "status": voice.status,
                 "outlier_chapters": voice.details.get("outlier_chapters", []),
                 "message": voice.message,
+            },
+            "loudness_range": {
+                "status": loudness_range.status,
+                "chapters": loudness_range.details.get("chapters", []),
+                "mean_lra_lu": loudness_range.details.get("mean_lra_lu"),
+                "message": loudness_range.message,
             },
             "pacing_consistency": {
                 "status": pacing.status,

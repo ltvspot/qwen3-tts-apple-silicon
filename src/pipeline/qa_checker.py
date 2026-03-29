@@ -17,6 +17,7 @@ from typing import Any
 import numpy as np
 from pydantic import BaseModel
 from pydub import AudioSegment, silence
+from scipy import signal
 from sqlalchemy.orm import Session
 
 from src.config import settings
@@ -54,6 +55,9 @@ CHECK_NAMES = (
     "stitch_quality",
     "pacing_detailed",
     "spectral_quality",
+    "plosive_artifacts",
+    "breath_levels",
+    "room_tone_padding",
     "lufs_compliance",
 )
 _DFT_MATRIX_CACHE: dict[int, np.ndarray] = {}
@@ -441,6 +445,171 @@ def _linear_rms(samples: np.ndarray) -> float:
     if samples.size == 0:
         return 0.0
     return float(np.sqrt(np.mean(np.square(samples))))
+
+
+def _band_limited_signal(
+    samples: np.ndarray,
+    sample_rate: int,
+    *,
+    low_hz: float,
+    high_hz: float,
+    order: int = 4,
+) -> np.ndarray:
+    """Return a band-limited copy of the signal for artifact-specific analysis."""
+
+    if samples.size == 0 or sample_rate <= 0:
+        return samples.copy()
+
+    nyquist = sample_rate / 2.0
+    low = max(low_hz / nyquist, 1e-5)
+    high = min(high_hz / nyquist, 0.999)
+    if low >= high:
+        return samples.copy()
+
+    sos = signal.butter(order, [low, high], btype="bandpass", output="sos")
+    try:
+        return signal.sosfiltfilt(sos, samples.astype(np.float32)).astype(np.float32)
+    except ValueError:
+        return signal.sosfilt(sos, samples.astype(np.float32)).astype(np.float32)
+
+
+def _frame_dbfs_series(samples: np.ndarray, sample_rate: int, *, frame_ms: int) -> list[float]:
+    """Return RMS dBFS values for a fixed analysis frame size."""
+
+    if samples.size == 0 or sample_rate <= 0:
+        return []
+    frame_size = max(int(sample_rate * (frame_ms / 1000.0)), 1)
+    values: list[float] = []
+    for start in range(0, samples.size, frame_size):
+        values.append(_dbfs_from_amplitude(_linear_rms(samples[start:start + frame_size])))
+    return values
+
+
+def _contiguous_regions(mask: list[bool]) -> list[tuple[int, int]]:
+    """Collapse a boolean series into inclusive contiguous frame ranges."""
+
+    if not mask:
+        return []
+    regions: list[tuple[int, int]] = []
+    start: int | None = None
+    for index, active in enumerate(mask):
+        if active and start is None:
+            start = index
+        elif not active and start is not None:
+            regions.append((start, index - 1))
+            start = None
+    if start is not None:
+        regions.append((start, len(mask) - 1))
+    return regions
+
+
+def _spectral_flatness(samples: np.ndarray) -> float:
+    """Return spectral flatness to separate broadband breaths from tonal speech."""
+
+    if samples.size == 0:
+        return 0.0
+    spectrum = np.abs(np.fft.rfft(samples.astype(np.float32))) + 1e-9
+    geometric = float(np.exp(np.mean(np.log(spectrum))))
+    arithmetic = float(np.mean(spectrum))
+    if arithmetic <= 1e-9:
+        return 0.0
+    return geometric / arithmetic
+
+
+def _detect_plosive_events(audio: AudioSegment) -> list[dict[str, float]]:
+    """Detect short 20-300Hz bursts that behave like plosive pops."""
+
+    samples = _mono_samples(audio)
+    if samples.size == 0:
+        return []
+
+    low_band = _band_limited_signal(samples, audio.frame_rate, low_hz=20.0, high_hz=300.0)
+    frame_ms = 10
+    frame_db = _frame_dbfs_series(low_band, audio.frame_rate, frame_ms=frame_ms)
+    if len(frame_db) < 3:
+        return []
+
+    candidate_mask: list[bool] = []
+    context_deltas: list[float] = []
+    for index, current_db in enumerate(frame_db):
+        start = max(index - 6, 0)
+        end = min(index + 7, len(frame_db))
+        context = [frame_db[i] for i in range(start, end) if i != index]
+        context_db = float(np.median(np.array(context, dtype=np.float32))) if context else -100.0
+        delta = current_db - context_db
+        context_deltas.append(delta)
+        candidate_mask.append(delta >= 15.0 and current_db > -45.0)
+
+    events: list[dict[str, float]] = []
+    for start_frame, end_frame in _contiguous_regions(candidate_mask):
+        duration_ms = ((end_frame - start_frame) + 1) * frame_ms
+        if duration_ms > 20:
+            continue
+        peak_delta = max(context_deltas[start_frame:end_frame + 1])
+        events.append(
+            {
+                "start_ms": float(start_frame * frame_ms),
+                "end_ms": float((end_frame + 1) * frame_ms),
+                "duration_ms": float(duration_ms),
+                "peak_diff_db": round(float(peak_delta), 3),
+            }
+        )
+    return events
+
+
+def _detect_breath_events(audio: AudioSegment) -> list[dict[str, float]]:
+    """Detect breath-like segments using band-limited energy, silence lead-in, and flatness."""
+
+    samples = _mono_samples(audio)
+    if samples.size == 0:
+        return []
+
+    breath_band = _band_limited_signal(samples, audio.frame_rate, low_hz=100.0, high_hz=1000.0)
+    frame_ms = 50
+    frame_size = max(int(audio.frame_rate * (frame_ms / 1000.0)), 1)
+    band_db = _frame_dbfs_series(breath_band, audio.frame_rate, frame_ms=frame_ms)
+    full_db = _frame_dbfs_series(samples, audio.frame_rate, frame_ms=frame_ms)
+    flatness_series = [
+        _spectral_flatness(breath_band[start:start + frame_size])
+        for start in range(0, samples.size, frame_size)
+    ]
+    if not band_db:
+        return []
+
+    candidate_mask = [
+        band_db[index] > -48.0
+        and full_db[index] < -20.0
+        and flatness_series[index] > 0.05
+        and abs(band_db[index] - full_db[index]) >= 6.0
+        for index in range(len(band_db))
+    ]
+
+    events: list[dict[str, float]] = []
+    for start_frame, end_frame in _contiguous_regions(candidate_mask):
+        duration_ms = ((end_frame - start_frame) + 1) * frame_ms
+        if duration_ms < 100 or duration_ms > 800:
+            continue
+        preceding_start = max(start_frame - 3, 0)
+        preceding_db = max(full_db[preceding_start:start_frame] or [-100.0])
+        if preceding_db > -30.0:
+            continue
+        sample_start = start_frame * frame_size
+        sample_end = min((end_frame + 1) * frame_size, samples.size)
+        segment = samples[sample_start:sample_end]
+        flatness = _spectral_flatness(breath_band[sample_start:sample_end])
+        if flatness < 0.05:
+            continue
+        peak_db = _dbfs_from_amplitude(float(np.max(np.abs(segment)))) if segment.size else -100.0
+        events.append(
+            {
+                "start_ms": float(start_frame * frame_ms),
+                "end_ms": float((end_frame + 1) * frame_ms),
+                "duration_ms": float(duration_ms),
+                "peak_dbfs": round(float(peak_db), 3),
+                "flatness": round(float(flatness), 3),
+            }
+        )
+    return events
 
 
 def _median(values: list[float] | np.ndarray) -> float | None:
@@ -1693,6 +1862,112 @@ def check_pacing_consistency(audio: AudioSegment, text: str) -> QACheckResult:
     )
 
 
+def check_plosive_artifacts(audio_path: str | Path) -> QACheckResult:
+    """Detect residual low-frequency plosive pops after mastering or generation."""
+
+    analysis = _load_audio_analysis(audio_path)
+    events = _detect_plosive_events(analysis.audio)
+    if not events:
+        return QACheckResult(
+            name="plosive_artifacts",
+            status=QAAutomaticStatus.PASS.value,
+            message="No problematic plosive bursts detected.",
+            value=0,
+            details={"plosives_per_minute": 0.0, "events": []},
+        )
+
+    minutes = max(analysis.actual_duration / 60.0, 1 / 60.0)
+    per_minute = len(events) / minutes
+    if per_minute > 8.0:
+        status = QAAutomaticStatus.FAIL.value
+        message = f"Heavy plosive artifact rate detected ({per_minute:.1f}/min)."
+    elif per_minute >= 3.0:
+        status = QAAutomaticStatus.WARNING.value
+        message = f"Plosive artifacts detected at {per_minute:.1f}/min."
+    else:
+        status = QAAutomaticStatus.PASS.value
+        message = "Plosive artifact rate is within narration tolerance."
+
+    return QACheckResult(
+        name="plosive_artifacts",
+        status=status,
+        message=message,
+        value=round(per_minute, 3),
+        details={"plosives_per_minute": round(per_minute, 3), "events": events},
+    )
+
+
+def check_breath_levels(audio_path: str | Path) -> QACheckResult:
+    """Detect breath sounds and flag inhalations that are too exposed for publishing."""
+
+    analysis = _load_audio_analysis(audio_path)
+    events = _detect_breath_events(analysis.audio)
+    if not events:
+        return QACheckResult(
+            name="breath_levels",
+            status=QAAutomaticStatus.PASS.value,
+            message="No breath events exceeded the QA detector thresholds.",
+            value=0,
+            details={"breaths_per_minute": 0.0, "max_peak_dbfs": None, "events": []},
+        )
+
+    minutes = max(analysis.actual_duration / 60.0, 1 / 60.0)
+    per_minute = len(events) / minutes
+    max_peak = max(float(event["peak_dbfs"]) for event in events)
+
+    if max_peak > -20.0:
+        status = QAAutomaticStatus.FAIL.value
+        message = f"A breath peaks at {max_peak:.1f} dBFS and is too loud for release."
+    elif max_peak > -25.0:
+        status = QAAutomaticStatus.WARNING.value
+        message = f"One or more breaths peak at {max_peak:.1f} dBFS and should be softened."
+    elif analysis.actual_duration >= 60.0 and not (4.0 <= per_minute <= 12.0):
+        status = QAAutomaticStatus.WARNING.value
+        message = f"Breath cadence is unusual for narration ({per_minute:.1f}/min)."
+    else:
+        status = QAAutomaticStatus.PASS.value
+        message = "Breath levels are within the publishing target range."
+
+    return QACheckResult(
+        name="breath_levels",
+        status=status,
+        message=message,
+        value=round(max_peak, 3),
+        details={
+            "breaths_per_minute": round(per_minute, 3),
+            "max_peak_dbfs": round(max_peak, 3),
+            "events": events,
+        },
+    )
+
+
+def check_room_tone_padding(audio_path: str | Path) -> QACheckResult:
+    """Fail chapters that begin or end with exposed speech instead of padded ambience."""
+
+    analysis = _load_audio_analysis(audio_path)
+    head = analysis.audio[:500]
+    tail = analysis.audio[-1000:] if len(analysis.audio) >= 1000 else analysis.audio
+    head_db = float(head.dBFS) if len(head) > 0 and head.dBFS != float("-inf") else -100.0
+    tail_db = float(tail.dBFS) if len(tail) > 0 and tail.dBFS != float("-inf") else -100.0
+
+    if head_db > -50.0 or tail_db > -50.0:
+        return QACheckResult(
+            name="room_tone_padding",
+            status=QAAutomaticStatus.FAIL.value,
+            message="Chapter starts or ends with exposed speech instead of padded room tone.",
+            value=max(round(head_db, 3), round(tail_db, 3)),
+            details={"head_dbfs": round(head_db, 3), "tail_dbfs": round(tail_db, 3)},
+        )
+
+    return QACheckResult(
+        name="room_tone_padding",
+        status=QAAutomaticStatus.PASS.value,
+        message="Chapter edges stay below the room-tone speech threshold.",
+        value=round(max(head_db, tail_db), 3),
+        details={"head_dbfs": round(head_db, 3), "tail_dbfs": round(tail_db, 3)},
+    )
+
+
 def check_lufs_compliance(
     audio_path: str | Path,
     *,
@@ -1788,6 +2063,9 @@ def _analysis_error_results(message: str) -> list[QACheckResult]:
         QACheckResult(name="stitch_quality", status=QAAutomaticStatus.FAIL.value, message=message, value=None),
         QACheckResult(name="pacing_detailed", status=QAAutomaticStatus.FAIL.value, message=message, value=None),
         QACheckResult(name="spectral_quality", status=QAAutomaticStatus.FAIL.value, message=message, value=None),
+        QACheckResult(name="plosive_artifacts", status=QAAutomaticStatus.FAIL.value, message=message, value=None),
+        QACheckResult(name="breath_levels", status=QAAutomaticStatus.FAIL.value, message=message, value=None),
+        QACheckResult(name="room_tone_padding", status=QAAutomaticStatus.FAIL.value, message=message, value=None),
         QACheckResult(name="lufs_compliance", status=QAAutomaticStatus.FAIL.value, message=message, value=None),
     ]
 
@@ -1853,6 +2131,9 @@ def _run_qa_checks_sync(
                 check_stitch_quality(audio_path, parsed_chunk_boundaries),
                 check_pacing_detailed(audio_path, text_content),
                 check_spectral_quality(audio_path),
+                check_plosive_artifacts(audio_path),
+                check_breath_levels(audio_path),
+                check_room_tone_padding(audio_path),
                 check_lufs_compliance(audio_path),
             ]
         )

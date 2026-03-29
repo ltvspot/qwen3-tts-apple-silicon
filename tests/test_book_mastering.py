@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pytest
 from pydub import AudioSegment
 from pydub.generators import Sine
@@ -83,6 +84,23 @@ def _tone(duration_ms: int, *, gain_db: float = -18.0) -> AudioSegment:
         .apply_gain(gain_db)
         .set_frame_rate(FRAME_RATE)
         .set_channels(1)
+    )
+
+
+def _noise(duration_ms: int, *, peak_dbfs: float = -24.0) -> AudioSegment:
+    """Create deterministic broadband noise with a controlled peak."""
+
+    sample_count = max(int(FRAME_RATE * (duration_ms / 1000.0)), 1)
+    rng = np.random.default_rng(53 + duration_ms + int(abs(peak_dbfs) * 10))
+    samples = rng.standard_normal(sample_count).astype(np.float32)
+    samples /= max(float(np.max(np.abs(samples))), 1.0)
+    samples *= float(10 ** (peak_dbfs / 20.0))
+    int_samples = np.round(samples * np.iinfo(np.int16).max).astype(np.int16)
+    return AudioSegment(
+        data=int_samples.tobytes(),
+        sample_width=2,
+        frame_rate=FRAME_RATE,
+        channels=1,
     )
 
 
@@ -271,7 +289,68 @@ def test_master_book_preserves_good_audio(test_db: Session, monkeypatch: pytest.
 
     mastered = AudioSegment.from_file(audio_path)
     assert report.loudness_adjustments == []
-    assert report.edge_normalized_chapters == []
+    assert report.edge_normalized_chapters == [1]
     assert report.peak_limited_chapters in ([], [1])
     assert abs(_leading_silence_ms(mastered) - BookMasteringPipeline.TARGET_LEAD_IN_MS) <= 20
     assert abs(_trailing_silence_ms(mastered) - BookMasteringPipeline.TARGET_TRAIL_OUT_MS) <= 20
+
+
+def test_de_esser_targets_sibilance_band() -> None:
+    """The de-esser should reduce 4-10kHz energy without muting the whole signal."""
+
+    pipeline = BookMasteringPipeline()
+    base = _tone(1200, gain_db=-18.0)
+    sibilant = Sine(6500).to_audio_segment(duration=1200).apply_gain(-4.0).set_frame_rate(FRAME_RATE).set_channels(1)
+    audio = base.overlay(sibilant)
+
+    before_samples = pipeline._audio_to_samples(audio)
+    before_sibilance = pipeline._linear_rms(
+        pipeline._apply_sos_filter(before_samples, FRAME_RATE, low_hz=4000.0, high_hz=10000.0)
+    )
+
+    processed, changed = pipeline._apply_de_esser_to_audio(audio)
+
+    after_samples = pipeline._audio_to_samples(processed)
+    after_sibilance = pipeline._linear_rms(
+        pipeline._apply_sos_filter(after_samples, FRAME_RATE, low_hz=4000.0, high_hz=10000.0)
+    )
+
+    assert changed is True
+    assert after_sibilance < before_sibilance
+    assert processed.dBFS < audio.dBFS + 0.5
+
+
+def test_breath_normalization_softens_loud_inhalations() -> None:
+    """Breath normalization should pull loud inhalations down toward -40 dBFS."""
+
+    pipeline = BookMasteringPipeline()
+    breath_audio = AudioSegment.silent(duration=300, frame_rate=FRAME_RATE) + _noise(250, peak_dbfs=-22.0) + _tone(800, gain_db=-18.0)
+
+    before_peak = breath_audio[450:550].max_dBFS
+    processed, changed = pipeline._apply_breath_normalization_to_audio(breath_audio)
+    after_peak = processed[450:550].max_dBFS
+
+    assert changed is True
+    assert after_peak < before_peak
+    assert after_peak <= -38.0
+
+
+def test_master_book_replaces_edge_silence_with_room_tone(test_db: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Mastering should add non-zero room tone at the chapter head and tail."""
+
+    book = _create_book(test_db, title="Room Tone")
+    chapter = _create_chapter(
+        test_db,
+        book=book,
+        number=1,
+        audio=AudioSegment.silent(duration=750, frame_rate=FRAME_RATE) + _tone(2500, gain_db=-18.0) + AudioSegment.silent(duration=1500, frame_rate=FRAME_RATE),
+    )
+    audio_path = Path(settings.OUTPUTS_PATH) / chapter.audio_path
+    monkeypatch.setattr("src.pipeline.book_mastering.measure_integrated_lufs", lambda *_args, **_kwargs: -20.0)
+
+    report = BookMasteringPipeline().master_book_sync(book.id, test_db)
+    mastered = AudioSegment.from_file(audio_path)
+
+    assert report.edge_normalized_chapters == [1]
+    assert -80.0 <= float(mastered[:500].dBFS) <= -50.0
+    assert -80.0 <= float(mastered[-1000:].dBFS) <= -50.0
