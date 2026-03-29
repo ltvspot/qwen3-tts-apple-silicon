@@ -12,7 +12,7 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -160,9 +160,14 @@ if _frontend_build.exists() and (_frontend_build / "index.html").exists():
     async def asset_manifest():
         return FileResponse(str(_frontend_build / "asset-manifest.json"))
 
-    @app.get("/{full_path:path}")
-    async def serve_spa(full_path: str):
-        """Catch-all: serve index.html for any non-API route (React Router handles client routing)."""
+    @app.api_route("/{full_path:path}", methods=["GET", "HEAD", "POST", "PUT", "DELETE", "PATCH"])
+    async def serve_spa(request: Request, full_path: str):
+        """Catch-all: serve index.html for any non-API route (React Router handles client routing).
+
+        Accepts all HTTP methods so that it never shadows API routes with 405.
+        API paths always get a 404 here; the actual API handlers are registered
+        before this route and take priority for valid API endpoints.
+        """
 
         if full_path.startswith("api/"):
             raise HTTPException(status_code=404, detail=f"API route '/{full_path}' not found.")

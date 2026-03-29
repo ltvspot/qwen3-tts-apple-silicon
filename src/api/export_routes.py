@@ -858,6 +858,85 @@ async def download_export(book_id: int, export_format: str, db: Session = Depend
     )
 
 
+class GoogleDriveExportResponse(BaseModel):
+    """Response from uploading export files to Google Drive."""
+
+    book_id: int
+    book_title: str
+    files_copied: list[str]
+    google_drive_folder: str
+    message: str
+
+
+GOOGLE_DRIVE_EXPORT_PATH = (
+    "/Users/timzengerink/Library/CloudStorage/"
+    "GoogleDrive-tim.zengerink7@gmail.com/My Drive/"
+    "Audiobook Production - Project Gutenberg"
+)
+
+
+@router.post("/book/{book_id}/export/gdrive", response_model=GoogleDriveExportResponse)
+async def export_to_google_drive(
+    book_id: int,
+    db: Session = Depends(get_db),
+) -> GoogleDriveExportResponse:
+    """Copy completed export files (MP3 + M4B) to the Google Drive sync folder."""
+
+    import shutil
+    from pathlib import Path
+
+    book = _load_book_or_404(book_id, db)
+
+    export_job = db.query(ExportJob).filter(ExportJob.book_id == book_id).first()
+    if export_job is None or export_job.export_status != BookExportStatus.COMPLETED:
+        raise HTTPException(
+            status_code=400,
+            detail="Book must be fully exported before uploading to Google Drive.",
+        )
+
+    gdrive_dir = Path(GOOGLE_DRIVE_EXPORT_PATH)
+    if not gdrive_dir.exists():
+        raise HTTPException(
+            status_code=503,
+            detail="Google Drive sync folder not found. Is Google Drive for Desktop running?",
+        )
+
+    book_folder_name = f"{book.id:03d}. {book.title} - {book.author}"
+    book_folder_name = "".join(
+        c if c not in r'\/:*?"<>|' else "_" for c in book_folder_name
+    )
+    book_gdrive_dir = gdrive_dir / book_folder_name
+    book_gdrive_dir.mkdir(parents=True, exist_ok=True)
+
+    files_copied: list[str] = []
+    for fmt in ("mp3", "m4b"):
+        src_path = get_export_output_path(book, fmt)
+        if src_path.exists():
+            dest_path = book_gdrive_dir / src_path.name
+            shutil.copy2(str(src_path), str(dest_path))
+            files_copied.append(src_path.name)
+            logger.info(
+                "Copied %s to Google Drive: %s -> %s",
+                fmt.upper(),
+                src_path,
+                dest_path,
+            )
+
+    if not files_copied:
+        raise HTTPException(
+            status_code=404,
+            detail="No export files found on disk to copy.",
+        )
+
+    return GoogleDriveExportResponse(
+        book_id=book.id,
+        book_title=book.title,
+        files_copied=files_copied,
+        google_drive_folder=book_folder_name,
+        message=f"Copied {len(files_copied)} file(s) to Google Drive. They will sync automatically.",
+    )
+
+
 @router.post("/export/batch", response_model=BatchExportQueuedResponse)
 async def batch_export(
     request: BatchExportRequest,

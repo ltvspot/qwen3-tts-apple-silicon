@@ -222,6 +222,8 @@ export default function BookDetail() {
     createIdleExportSnapshot(id),
   );
   const [exportSubmitting, setExportSubmitting] = useState(false);
+  const [gdriveUploading, setGdriveUploading] = useState(false);
+  const [gdriveMessage, setGdriveMessage] = useState("");
   const [generationAction, setGenerationAction] = useState(null);
   const [generationErrorMessage, setGenerationErrorMessage] = useState("");
   const [generationSnapshot, setGenerationSnapshot] = useState(null);
@@ -1115,6 +1117,33 @@ export default function BookDetail() {
       );
     } finally {
       setExportSubmitting(false);
+    }
+  }
+
+  async function handleGoogleDriveUpload() {
+    setGdriveUploading(true);
+    setGdriveMessage("");
+    try {
+      const response = await fetch(`/api/book/${id}/export/gdrive`, {
+        method: "POST",
+      });
+      if (!response.ok) {
+        const errorPayload = await response.json().catch(() => null);
+        const detail =
+          typeof errorPayload?.detail === "string"
+            ? errorPayload.detail
+            : "Failed to upload to Google Drive.";
+        throw new Error(detail);
+      }
+      const result = await response.json();
+      setGdriveMessage(result.message);
+      showToast(`Uploaded ${result.files_copied.length} file(s) to Google Drive`);
+    } catch (error) {
+      setGdriveMessage(
+        error instanceof Error ? error.message : "Google Drive upload failed.",
+      );
+    } finally {
+      setGdriveUploading(false);
     }
   }
 
@@ -2285,7 +2314,24 @@ export default function BookDetail() {
                         ? "Re-export Audiobook"
                         : "Export Audiobook"}
                     </button>
+                    {exportCompletedFormats.length > 0 ? (
+                      <button
+                        className="inline-flex items-center justify-center rounded-full border border-emerald-300/25 bg-emerald-400/10 px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-emerald-100 transition hover:bg-emerald-400/20 disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/[0.04] disabled:text-slate-500"
+                        disabled={gdriveUploading}
+                        onClick={handleGoogleDriveUpload}
+                        type="button"
+                      >
+                        {gdriveUploading
+                          ? "Uploading..."
+                          : "Upload to Google Drive"}
+                      </button>
+                    ) : null}
                   </div>
+                  {gdriveMessage ? (
+                    <div className="rounded-2xl border border-emerald-400/20 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-100">
+                      {gdriveMessage}
+                    </div>
+                  ) : null}
                 </div>
               </section>
             </div>
