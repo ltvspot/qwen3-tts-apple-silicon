@@ -1122,17 +1122,34 @@ def check_stitch_quality(audio_path: str | Path, chunk_boundaries: list[float]) 
         )
 
     analysis = _load_audio_analysis(audio_path)
-    click_result = check_stitch_clicks(analysis.audio)
+    total_stitches = max(len(chunk_boundaries) - 1, 0)
+    click_result = check_stitch_clicks(
+        analysis.audio,
+        chapter_duration_seconds=analysis.actual_duration,
+        stitch_boundaries=chunk_boundaries[1:],
+        total_stitches=total_stitches,
+    )
     issues: list[dict[str, Any]] = []
     warning_count = 0
     failure_count = 0
 
     if click_result.status != QAAutomaticStatus.PASS.value:
-        issues.append({"type": "clicks", "status": click_result.status, "message": click_result.message})
+        click_details = click_result.details or {}
+        click_warning_regions = int(click_details.get("warning_regions", 0))
+        click_failure_regions = int(click_details.get("hard_clicks", 0))
         if click_result.status == QAAutomaticStatus.FAIL.value:
-            failure_count += 1
+            warning_count += click_warning_regions
+            failure_count += click_failure_regions
         else:
-            warning_count += 1
+            warning_count += click_warning_regions + click_failure_regions
+        issues.append(
+            {
+                "type": "clicks",
+                "status": click_result.status,
+                "message": click_result.message,
+                "details": click_details,
+            }
+        )
 
     for stitch_index, boundary_seconds in enumerate(chunk_boundaries[1:], start=1):
         boundary_ms = int(boundary_seconds * 1000)
@@ -1180,8 +1197,8 @@ def check_stitch_quality(audio_path: str | Path, chunk_boundaries: list[float]) 
         status = QAAutomaticStatus.PASS.value
 
     stitch_quality = {
-        "total_stitches": max(len(chunk_boundaries) - 1, 0),
-        "clean": max(max(len(chunk_boundaries) - 1, 0) - warning_count - failure_count, 0),
+        "total_stitches": total_stitches,
+        "clean": max(total_stitches - warning_count - failure_count, 0),
         "warnings": warning_count,
         "failures": failure_count,
     }
@@ -1190,8 +1207,9 @@ def check_stitch_quality(audio_path: str | Path, chunk_boundaries: list[float]) 
         message = "No stitch quality issues detected."
         value = 0
     else:
-        message = f"{len(issues)} stitch issue(s) detected."
-        value = float(len(issues))
+        total_issues = warning_count + failure_count
+        message = f"{total_issues} stitch issue(s) detected."
+        value = float(total_issues)
 
     return QACheckResult(
         name="stitch_quality",
@@ -1361,10 +1379,15 @@ def check_spectral_quality(audio_path: str | Path) -> QACheckResult:
     )
 
 
-def check_stitch_clicks(audio: AudioSegment, crossfade_ms: int = 30) -> QACheckResult:
+def check_stitch_clicks(
+    audio: AudioSegment,
+    crossfade_ms: int = 30,
+    *,
+    chapter_duration_seconds: float | None = None,
+    stitch_boundaries: list[float] | None = None,
+    total_stitches: int | None = None,
+) -> QACheckResult:
     """Detect likely click or pop artifacts introduced near stitch boundaries."""
-
-    del crossfade_ms
 
     if len(audio) < 250:
         return QACheckResult(
@@ -1374,63 +1397,228 @@ def check_stitch_clicks(audio: AudioSegment, crossfade_ms: int = 30) -> QACheckR
             value=0,
         )
 
-    samples = _mono_samples(audio)
-    window_ms = 5
-    surrounding_ms = 100
-    window_size = max(int(audio.frame_rate * (window_ms / 1000.0)), 1)
-    surrounding_windows = max(int(surrounding_ms / window_ms), 1)
-
-    peaks_dbfs: list[float] = []
-    for start in range(0, samples.size, window_size):
-        window = samples[start:start + window_size]
-        if window.size == 0:
-            continue
-        peaks_dbfs.append(_dbfs_from_amplitude(float(np.max(np.abs(window)))))
-
-    if len(peaks_dbfs) <= (surrounding_windows * 2):
-        return QACheckResult(
-            name="stitch_clicks",
-            status=QAAutomaticStatus.PASS.value,
-            message="Audio too short to analyze stitch boundaries reliably.",
-            value=0,
-        )
-
-    click_indices: list[int] = []
-    for index in range(surrounding_windows, len(peaks_dbfs) - surrounding_windows):
-        surrounding = [
-            *peaks_dbfs[index - surrounding_windows:index],
-            *peaks_dbfs[index + 1:index + 1 + surrounding_windows],
-        ]
-        surrounding_average = float(np.mean(surrounding))
-        if peaks_dbfs[index] - surrounding_average >= 12.0:
-            click_indices.append(index)
-
-    collapsed_indices: list[int] = []
-    for index in click_indices:
-        if not collapsed_indices or index - collapsed_indices[-1] > 1:
-            collapsed_indices.append(index)
-
-    click_count = len(collapsed_indices)
-    if click_count == 0:
+    click_events = _detect_stitch_click_events(audio)
+    if not click_events:
         return QACheckResult(
             name="stitch_clicks",
             status=QAAutomaticStatus.PASS.value,
             message="No likely stitch clicks detected.",
             value=0,
         )
-    if click_count <= 2:
+
+    boundary_details = _match_clicks_to_boundaries(
+        click_events,
+        stitch_boundaries=stitch_boundaries or [],
+        match_window_ms=max(crossfade_ms, 15),
+        chapter_duration_seconds=chapter_duration_seconds,
+    )
+    classified_regions = boundary_details or _classify_click_regions(
+        click_events,
+        chapter_duration_seconds=chapter_duration_seconds,
+    )
+
+    hard_clicks = sum(1 for region in classified_regions if region["category"] == "hard")
+    micro_clicks = sum(1 for region in classified_regions if region["category"] == "micro")
+    soft_warnings = sum(1 for region in classified_regions if region["category"] == "soft")
+    warning_regions = micro_clicks + soft_warnings
+    affected_regions = hard_clicks + warning_regions
+    if affected_regions == 0:
         return QACheckResult(
             name="stitch_clicks",
-            status=QAAutomaticStatus.WARNING.value,
-            message=f"Possible click artifacts detected at {click_count} boundary region(s).",
-            value=float(click_count),
+            status=QAAutomaticStatus.PASS.value,
+            message="No likely stitch clicks detected.",
+            value=0,
         )
+
+    effective_total_stitches = total_stitches
+    click_ratio = None
+    if effective_total_stitches is not None and effective_total_stitches > 0:
+        click_ratio = hard_clicks / effective_total_stitches
+
+    if click_ratio is not None and click_ratio > 0.25:
+        status = QAAutomaticStatus.FAIL.value
+        message = (
+            f"Likely stitch clicks detected at {hard_clicks} of {effective_total_stitches} "
+            f"stitch point(s) ({click_ratio:.0%})."
+        )
+    elif click_ratio is None and hard_clicks >= 3:
+        status = QAAutomaticStatus.FAIL.value
+        message = f"Repeated click artifacts detected at {hard_clicks} boundary region(s)."
+    else:
+        status = QAAutomaticStatus.WARNING.value
+        message = f"Possible click artifacts detected at {affected_regions} boundary region(s)."
+
+    threshold_db = 15.0 if chapter_duration_seconds is not None and chapter_duration_seconds < 120.0 else 12.0
     return QACheckResult(
         name="stitch_clicks",
-        status=QAAutomaticStatus.FAIL.value,
-        message=f"Repeated click artifacts detected at {click_count} boundary region(s).",
-        value=float(click_count),
+        status=status,
+        message=message,
+        value=float(affected_regions),
+        details={
+            "threshold_db": threshold_db,
+            "hard_clicks": hard_clicks,
+            "warning_regions": warning_regions,
+            "micro_clicks": micro_clicks,
+            "click_ratio": round(click_ratio, 4) if click_ratio is not None else None,
+            "regions": classified_regions,
+        },
     )
+
+
+def _detect_stitch_click_events(audio: AudioSegment) -> list[dict[str, float]]:
+    """Find short transient events by comparing sub-millisecond peaks against local context."""
+
+    samples = _mono_samples(audio)
+    if samples.size == 0:
+        return []
+
+    window_ms = 0.5
+    surrounding_ms = 100.0
+    window_size = max(int(audio.frame_rate * (window_ms / 1000.0)), 1)
+    surrounding_windows = max(int(round(surrounding_ms / window_ms)), 1)
+    window_count = int(np.ceil(samples.size / window_size))
+    padded_length = (window_count * window_size) - samples.size
+    padded = np.pad(np.abs(samples), (0, padded_length))
+    peaks = padded.reshape(window_count, window_size).max(axis=1)
+    peaks_dbfs = np.array([_dbfs_from_amplitude(float(peak)) for peak in peaks], dtype=np.float32)
+
+    if peaks_dbfs.size <= (surrounding_windows * 2):
+        return []
+
+    kernel = np.ones((surrounding_windows * 2) + 1, dtype=np.float32)
+    surrounding_sums = np.convolve(peaks_dbfs, kernel, mode="same") - peaks_dbfs
+    surrounding_counts = np.convolve(np.ones_like(peaks_dbfs), kernel, mode="same") - 1.0
+    surrounding_average = surrounding_sums / np.maximum(surrounding_counts, 1.0)
+
+    valid = np.zeros(peaks_dbfs.shape[0], dtype=bool)
+    valid[surrounding_windows:peaks_dbfs.shape[0] - surrounding_windows] = True
+    candidate_indices = np.flatnonzero(valid & ((peaks_dbfs - surrounding_average) >= 12.0))
+    if candidate_indices.size == 0:
+        return []
+
+    events: list[dict[str, float]] = []
+    start_index = int(candidate_indices[0])
+    previous_index = int(candidate_indices[0])
+
+    for raw_index in candidate_indices[1:]:
+        index = int(raw_index)
+        if index - previous_index > 1:
+            events.append(
+                _build_click_event(
+                    start_index,
+                    previous_index,
+                    peaks_dbfs=peaks_dbfs,
+                    surrounding_average=surrounding_average,
+                    window_ms=window_ms,
+                )
+            )
+            start_index = index
+        previous_index = index
+
+    events.append(
+        _build_click_event(
+            start_index,
+            previous_index,
+            peaks_dbfs=peaks_dbfs,
+            surrounding_average=surrounding_average,
+            window_ms=window_ms,
+        )
+    )
+    return events
+
+
+def _build_click_event(
+    start_index: int,
+    end_index: int,
+    *,
+    peaks_dbfs: np.ndarray,
+    surrounding_average: np.ndarray,
+    window_ms: float,
+) -> dict[str, float]:
+    """Summarize one contiguous transient event."""
+
+    event_slice = slice(start_index, end_index + 1)
+    peak_diff = float(np.max(peaks_dbfs[event_slice] - surrounding_average[event_slice]))
+    start_ms = start_index * window_ms
+    end_ms = (end_index + 1) * window_ms
+    center_ms = (start_ms + end_ms) / 2.0
+    return {
+        "start_ms": round(start_ms, 3),
+        "end_ms": round(end_ms, 3),
+        "center_ms": round(center_ms, 3),
+        "duration_ms": round((end_index - start_index + 1) * window_ms, 3),
+        "peak_diff_db": round(peak_diff, 3),
+    }
+
+
+def _match_clicks_to_boundaries(
+    click_events: list[dict[str, float]],
+    *,
+    stitch_boundaries: list[float],
+    match_window_ms: int,
+    chapter_duration_seconds: float | None,
+) -> list[dict[str, Any]]:
+    """Collapse detected click events down to one severity per stitch boundary."""
+
+    if not stitch_boundaries:
+        return []
+
+    matched_regions: list[dict[str, Any]] = []
+    severity_order = {"micro": 0, "soft": 1, "hard": 2}
+
+    for stitch_index, boundary_seconds in enumerate(stitch_boundaries, start=1):
+        boundary_ms = boundary_seconds * 1000.0
+        boundary_matches = [
+            event
+            for event in click_events
+            if abs(float(event["center_ms"]) - boundary_ms) <= float(match_window_ms)
+        ]
+        if not boundary_matches:
+            continue
+
+        classified = _classify_click_regions(
+            boundary_matches,
+            chapter_duration_seconds=chapter_duration_seconds,
+        )
+        if not classified:
+            continue
+        worst_region = max(classified, key=lambda region: severity_order[str(region["category"])])
+        matched_regions.append(
+            {
+                "stitch_index": stitch_index,
+                "boundary_ms": round(boundary_ms, 3),
+                **worst_region,
+            }
+        )
+
+    return matched_regions
+
+
+def _classify_click_regions(
+    click_events: list[dict[str, float]],
+    *,
+    chapter_duration_seconds: float | None,
+) -> list[dict[str, Any]]:
+    """Assign click severity using short-chapter and micro-click rules."""
+
+    hard_threshold = 15.0 if chapter_duration_seconds is not None and chapter_duration_seconds < 120.0 else 12.0
+    regions: list[dict[str, Any]] = []
+
+    for event in click_events:
+        peak_diff = float(event["peak_diff_db"])
+        duration_ms = float(event["duration_ms"])
+        if 12.0 <= peak_diff < 15.0 and duration_ms <= 1.0:
+            category = "micro"
+        elif peak_diff >= hard_threshold:
+            category = "hard"
+        elif peak_diff >= 12.0:
+            category = "soft"
+        else:
+            continue
+
+        regions.append({**event, "category": category})
+
+    return regions
 
 
 def check_pacing_consistency(audio: AudioSegment, text: str) -> QACheckResult:

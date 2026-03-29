@@ -28,8 +28,8 @@ def _tone(duration_ms: int, *, gain_db: float = -18.0) -> AudioSegment:
     return Sine(220).to_audio_segment(duration=duration_ms).apply_gain(gain_db).set_frame_rate(FRAME_RATE).set_channels(1)
 
 
-def _spike(duration_ms: int = 3, amplitude: float = 0.999) -> AudioSegment:
-    sample_count = int(FRAME_RATE * (duration_ms / 1000))
+def _spike(duration_ms: float = 3, amplitude: float = 0.999) -> AudioSegment:
+    sample_count = max(1, int(FRAME_RATE * (duration_ms / 1000)))
     samples = np.full(sample_count, int(np.iinfo(np.int16).max * amplitude), dtype=np.int16)
     return AudioSegment(
         data=samples.tobytes(),
@@ -68,6 +68,44 @@ def test_check_stitch_clicks_fails_on_repeated_clicks() -> None:
 
     assert result.status == "fail"
     assert result.value >= 3
+
+
+def test_check_stitch_clicks_uses_ratio_based_failure_when_stitch_count_is_known() -> None:
+    """Hard clicks should fail once they affect more than a quarter of stitch points."""
+
+    audio = _tone(300) + _spike() + _tone(300) + _spike() + _tone(300)
+
+    result = check_stitch_clicks(audio, chapter_duration_seconds=180.0, total_stitches=4)
+
+    assert result.status == "fail"
+    assert result.details is not None
+    assert result.details["click_ratio"] == pytest.approx(0.5)
+
+
+def test_check_stitch_clicks_relaxes_short_chapter_thresholds() -> None:
+    """Short chapters should treat 12-15dB peaks as warnings instead of hard failures."""
+
+    audio = _tone(300) + _spike(amplitude=0.55) + _tone(300) + _spike(amplitude=0.55) + _tone(300)
+
+    result = check_stitch_clicks(audio, chapter_duration_seconds=60.0, total_stitches=4)
+
+    assert result.status == "warning"
+    assert result.details is not None
+    assert result.details["hard_clicks"] == 0
+    assert result.details["threshold_db"] == pytest.approx(15.0)
+
+
+def test_check_stitch_clicks_marks_micro_clicks_as_warnings() -> None:
+    """Sub-millisecond 12-15dB peaks should be tracked as micro-click warnings."""
+
+    audio = _tone(500) + _spike(duration_ms=0.5, amplitude=0.5) + _tone(500)
+
+    result = check_stitch_clicks(audio, chapter_duration_seconds=180.0, total_stitches=4)
+
+    assert result.status == "warning"
+    assert result.details is not None
+    assert result.details["micro_clicks"] >= 1
+    assert result.details["hard_clicks"] == 0
 
 
 def test_check_pacing_consistency_passes_balanced_audio() -> None:

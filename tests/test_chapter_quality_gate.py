@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 from pydub import AudioSegment
 from pydub.generators import Sine
 
@@ -30,6 +31,19 @@ def _tone(duration_ms: int, frequency_hz: int = 220, *, gain_db: float = -18.0) 
         .apply_gain(gain_db)
         .set_frame_rate(FRAME_RATE)
         .set_channels(1)
+    )
+
+
+def _spike(duration_ms: float = 3, amplitude: float = 0.55) -> AudioSegment:
+    """Return a short full-scale-ish transient used for click QA tests."""
+
+    sample_count = max(1, int(FRAME_RATE * (duration_ms / 1000)))
+    samples = np.full(sample_count, int(np.iinfo(np.int16).max * amplitude), dtype=np.int16)
+    return AudioSegment(
+        data=samples.tobytes(),
+        sample_width=2,
+        frame_rate=FRAME_RATE,
+        channels=1,
     )
 
 
@@ -139,6 +153,34 @@ def test_stitch_quality_single_chunk_passes(tmp_path: Path) -> None:
     assert result.details["stitch_quality"]["total_stitches"] == 0
 
 
+def test_stitch_quality_short_chapter_clicks_warn_instead_of_failing(tmp_path: Path) -> None:
+    """Short chapters with moderate stitch transients should no longer get automatic F grades."""
+
+    audio = _tone(300, 220) + _spike() + _tone(300, 220) + _spike() + _tone(300, 220)
+    audio_path = _write_audio(tmp_path / "short-stitch.wav", audio)
+
+    result = check_stitch_quality(audio_path, [0.0, 0.3, 0.603])
+
+    assert result.status == "warning"
+    assert result.details is not None
+    assert result.details["stitch_quality"]["failures"] == 0
+    assert any(issue["type"] == "clicks" and issue["status"] == "warning" for issue in result.details["issues"])
+
+
+def test_stitch_quality_low_ratio_hard_clicks_remain_warning(tmp_path: Path) -> None:
+    """Hard clicks below the fail ratio should not escalate the whole chapter to fail."""
+
+    audio = _tone(300, 220) + _spike(amplitude=0.999) + _tone(300, 220) + _tone(300, 220) + _tone(300, 220)
+    audio_path = _write_audio(tmp_path / "low-ratio-stitch.wav", audio)
+
+    result = check_stitch_quality(audio_path, [0.0, 0.3, 0.603, 0.903, 1.203])
+
+    assert result.status == "warning"
+    assert result.details is not None
+    assert result.details["stitch_quality"]["failures"] == 0
+    assert result.details["stitch_quality"]["warnings"] >= 1
+
+
 def test_pacing_consistent(tmp_path: Path) -> None:
     """Evenly spoken windows should pass the detailed pacing check."""
 
@@ -168,9 +210,17 @@ def test_pacing_inconsistent(tmp_path: Path) -> None:
 def test_adaptive_crossfade_similar() -> None:
     """Similar chunks should get the shortest adaptive crossfade."""
 
-    crossfade = AudioStitcher.compute_adaptive_crossfade(_tone(1000, 220), _tone(1000, 220))
+    crossfade = AudioStitcher.compute_adaptive_crossfade(_tone(6000, 220), _tone(6000, 220))
 
     assert crossfade == AudioStitcher.SIMILAR_CROSSFADE_MS
+
+
+def test_adaptive_crossfade_short_chunks_are_extended() -> None:
+    """Short chunks should get a longer overlap to smooth weak stitch context."""
+
+    crossfade = AudioStitcher.compute_adaptive_crossfade(_tone(1000, 220), _tone(1000, 220))
+
+    assert crossfade == 30
 
 
 def test_adaptive_crossfade_different() -> None:

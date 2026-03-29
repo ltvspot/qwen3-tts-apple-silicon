@@ -215,6 +215,18 @@ def test_text_chunker_marks_paragraph_boundaries() -> None:
     assert chunk_plans[1].ends_paragraph is False
 
 
+def test_text_chunker_merges_short_trailing_chunks() -> None:
+    """A tiny trailing fragment should be absorbed to avoid a low-value stitch point."""
+
+    text = ("Longword " * 12) + "stop. Tiny close."
+
+    chunk_plans = TextChunker.chunk_text_with_metadata(text, max_chars=120)
+
+    assert len(chunk_plans) == 1
+    assert "".join(plan.text for plan in chunk_plans) == text
+    assert len(chunk_plans[0].text) > 120
+
+
 def test_audio_stitcher() -> None:
     """Audio stitching should combine clips with only a tiny overlap."""
 
