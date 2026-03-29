@@ -100,6 +100,43 @@ function createExportSnapshot(overrides = {}) {
   };
 }
 
+function createExportReadiness(overrides = {}) {
+  return {
+    ready: true,
+    export_anyway_allowed: false,
+    status_label: "READY FOR EXPORT",
+    acx_checks: [
+      {
+        critical: true,
+        detail: "All generated chapters are at 44.1 kHz.",
+        key: "sample_rate",
+        label: "Sample rate 44.1 kHz",
+        passed: true,
+      },
+      {
+        critical: true,
+        detail: "All generated chapters are mono.",
+        key: "mono",
+        label: "All chapters mono",
+        passed: true,
+      },
+    ],
+    blocking_issues: [],
+    chapters: [
+      {
+        duration_seconds: 600,
+        grade: "A",
+        id: 701,
+        issues: [],
+        number: 1,
+        title: "Chapter One",
+      },
+    ],
+    warnings: [],
+    ...overrides,
+  };
+}
+
 function createVoiceListPayload(overrides = {}) {
   return {
     engine: "qwen3_tts",
@@ -386,6 +423,16 @@ describe("BookDetail page", () => {
     root = ReactDOM.createRoot(container);
 
     fetchMock = jest.fn();
+    fetchMock.mockImplementation((input) => {
+      if (
+        typeof input === "string" &&
+        input.endsWith("/export-readiness")
+      ) {
+        return Promise.resolve(createJsonResponse(createExportReadiness()));
+      }
+
+      throw new Error(`Unexpected fetch: ${String(input)}`);
+    });
     global.fetch = fetchMock;
     mockNavigate.mockReset();
 
@@ -1160,6 +1207,7 @@ describe("BookDetail page", () => {
       .mockResolvedValueOnce(createJsonResponse(statusSnapshot))
       .mockResolvedValueOnce(createJsonResponse(createExportSnapshot()))
       .mockResolvedValueOnce(createJsonResponse(createVoiceListPayload()))
+      .mockResolvedValueOnce(createJsonResponse(createExportReadiness()))
       .mockResolvedValueOnce(
         createJsonResponse({
           book_id: 7,
@@ -1186,10 +1234,16 @@ describe("BookDetail page", () => {
 
     await waitFor(() => {
       expect(container.textContent).toContain("Include M4B");
+      expect(container.textContent).toContain("M4B Bitrate");
       expect(container.textContent).toContain("Skip flagged chapters");
       expect(container.textContent).toContain(
         "Will export 1 of 1 chapters (4m estimated)",
       );
+    });
+
+    const bitrateSelect = container.querySelector("#m4b-bitrate");
+    await act(async () => {
+      setFormValue(bitrateSelect, "256k", "change");
     });
 
     await act(async () => {
@@ -1205,6 +1259,7 @@ describe("BookDetail page", () => {
           body: JSON.stringify({
             formats: ["mp3", "m4b"],
             include_only_approved: true,
+            m4b_bitrate: "256k",
           }),
           method: "POST",
         }),
@@ -1320,6 +1375,64 @@ describe("BookDetail page", () => {
       expect(container.textContent).toContain(
         "Generate the remaining chapters and re-export for a complete audiobook.",
       );
+    });
+  });
+
+  test("renders export readiness summary and exposes export anyway for warning-only books", async () => {
+    const book = createBook({ status: "generated" });
+    const chapters = [
+      createChapter({
+        audio_path: "7-the-test-chronicle/chapters/01-chapter-one.wav",
+        duration_seconds: 240,
+        id: 701,
+        number: 1,
+        qa_status: "approved",
+        status: "generated",
+        title: "Chapter One",
+        type: "chapter",
+      }),
+    ];
+
+    fetchMock.mockImplementation((input) => {
+      if (typeof input === "string" && input.endsWith("/export-readiness")) {
+        return Promise.resolve(
+          createJsonResponse(
+            createExportReadiness({
+              ready: false,
+              export_anyway_allowed: true,
+              status_label: "NEEDS ATTENTION",
+              chapters: [
+                {
+                  duration_seconds: 240,
+                  grade: "C",
+                  id: 701,
+                  issues: ["Chapter needs a final review."],
+                  number: 1,
+                  title: "Chapter One",
+                },
+              ],
+              warnings: ["Chapter One is grade C and should be reviewed before export."],
+            }),
+          ),
+        );
+      }
+
+      throw new Error(`Unexpected fetch: ${String(input)}`);
+    });
+
+    fetchMock
+      .mockResolvedValueOnce(createJsonResponse(book))
+      .mockResolvedValueOnce(createJsonResponse(chapters))
+      .mockResolvedValueOnce(createJsonResponse(createStatusSnapshot()))
+      .mockResolvedValueOnce(createJsonResponse(createExportSnapshot()))
+      .mockResolvedValueOnce(createJsonResponse(createVoiceListPayload()));
+
+    await renderBookDetail();
+
+    await waitFor(() => {
+      expect(container.textContent).toContain("Publishing QA Summary");
+      expect(container.textContent).toContain("NEEDS ATTENTION");
+      expect(container.textContent).toContain("Export Anyway");
     });
   });
 
@@ -1550,6 +1663,7 @@ describe("BookDetail page", () => {
       .mockResolvedValueOnce(createJsonResponse(createStatusSnapshot()))
       .mockResolvedValueOnce(createJsonResponse(createExportSnapshot()))
       .mockResolvedValueOnce(createJsonResponse(createVoiceListPayload()))
+      .mockResolvedValueOnce(createJsonResponse(createExportReadiness()))
       .mockResolvedValueOnce(createJsonResponse(createBookQualityReport()))
       .mockResolvedValueOnce(createJsonResponse(createVoiceConsistencyChart()));
 
@@ -1614,6 +1728,7 @@ describe("BookDetail page", () => {
       .mockResolvedValueOnce(createJsonResponse(createStatusSnapshot()))
       .mockResolvedValueOnce(createJsonResponse(createExportSnapshot()))
       .mockResolvedValueOnce(createJsonResponse(createVoiceListPayload()))
+      .mockResolvedValueOnce(createJsonResponse(createExportReadiness()))
       .mockResolvedValueOnce(createJsonResponse(createDeepQaReport()));
 
     await renderBookDetail();
@@ -1664,6 +1779,7 @@ describe("BookDetail page", () => {
       .mockResolvedValueOnce(createJsonResponse(createStatusSnapshot()))
       .mockResolvedValueOnce(createJsonResponse(createExportSnapshot()))
       .mockResolvedValueOnce(createJsonResponse(createVoiceListPayload()))
+      .mockResolvedValueOnce(createJsonResponse(createExportReadiness()))
       .mockResolvedValueOnce(createJsonResponse({ ok: true }))
       .mockResolvedValueOnce(
         createJsonResponse(

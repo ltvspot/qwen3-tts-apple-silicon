@@ -125,6 +125,7 @@ def test_get_settings_schema_returns_json_schema(client) -> None:
     voice_name = payload["$defs"]["VoiceSettings"]["properties"]["name"]
     assert "Ethan" in voice_name["enum"]
     assert payload["$defs"]["OutputSettings"]["properties"]["mp3_bitrate"]["enum"] == [128, 192, 256, 320]
+    assert payload["$defs"]["OutputSettings"]["properties"]["m4b_bitrate"]["enum"] == ["64k", "96k", "128k", "192k", "256k"]
     assert payload["$defs"]["EngineSettings"]["properties"]["chunk_timeout_seconds"]["default"] == 120
 
 

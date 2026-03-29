@@ -6,16 +6,20 @@ import atexit
 import asyncio
 import json
 import logging
+import shutil
 import threading
+import time
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from datetime import datetime
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.orm import Session, selectinload, sessionmaker
 
 from src.api.cache import invalidate_library_cache
+from src.config import VALID_EXPORT_M4B_BITRATES
 from src.database import Book, BookExportStatus, Chapter, ChapterQARecord, ChapterStatus, ExportJob, SessionLocal, get_db, utc_now
 from src.pipeline.exporter import (
     ExportFormatResult,
@@ -44,6 +48,12 @@ _batch_export_lock = threading.RLock()
 _batch_export_monitor_task: asyncio.Task[None] | None = None
 _batch_export_progress: "BatchExportProgressResponse | None" = None
 _batch_export_history: dict[str, "BatchExportProgressResponse"] = {}
+GOOGLE_DRIVE_COPY_RETRIES = 3
+GOOGLE_DRIVE_COPY_BACKOFF_SECONDS = 5.0
+GOOGLE_DRIVE_VERIFY_TIMEOUT_SECONDS = 30.0
+GOOGLE_DRIVE_VERIFY_POLL_SECONDS = 1.0
+GOOGLE_DRIVE_SIZE_TOLERANCE_RATIO = 0.01
+GOOGLE_DRIVE_RECENT_WINDOW_SECONDS = 3600.0
 
 
 def _track_export_task(task: asyncio.Task[None]) -> asyncio.Task[None]:
@@ -200,6 +210,15 @@ class ExportRequest(BaseModel):
     formats: list[str] = Field(default_factory=lambda: ["mp3", "m4b"])
     include_only_approved: bool = True
     force_export: bool = False
+    m4b_bitrate: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_bitrate(self) -> "ExportRequest":
+        """Reject unsupported M4B bitrates early."""
+
+        if self.m4b_bitrate is not None and self.m4b_bitrate not in VALID_EXPORT_M4B_BITRATES:
+            raise ValueError(f"m4b_bitrate must be one of: {', '.join(VALID_EXPORT_M4B_BITRATES)}")
+        return self
 
 
 class ExportQueuedResponse(BaseModel):
@@ -304,6 +323,16 @@ def _effective_include_only_approved(request: ExportRequest | BatchExportRequest
     """Return whether QA approval filtering should be enforced for this request."""
 
     return request.include_only_approved and not getattr(request, "force_export", False)
+
+
+def _request_format_artifacts(request: ExportRequest | BatchExportRequest) -> dict[str, object]:
+    """Persist request-scoped export options alongside format details."""
+
+    artifacts: dict[str, object] = {}
+    m4b_bitrate = getattr(request, "m4b_bitrate", None)
+    if isinstance(m4b_bitrate, str) and m4b_bitrate:
+        artifacts["request_options"] = {"m4b_bitrate": m4b_bitrate}
+    return artifacts
 
 
 def _serialize_format_details(export_job: ExportJob, formats_requested: list[str]) -> dict[str, ExportFormatResult]:
@@ -466,12 +495,14 @@ def _queue_export_for_book(
 
     started_at = utc_now()
     job_token = f"export_{book.id}_{started_at.strftime('%Y%m%d_%H%M%S')}"
-    pending_details = json.dumps(
-        {
-            name: result.model_dump(mode="json")
-            for name, result in _empty_format_details(formats).items()
-        }
-    )
+    pending_details_payload = {
+        name: result.model_dump(mode="json")
+        for name, result in _empty_format_details(formats).items()
+    }
+    artifacts = _request_format_artifacts(request)
+    if artifacts:
+        pending_details_payload["_artifacts"] = artifacts
+    pending_details = json.dumps(pending_details_payload)
 
     if existing_job is None:
         export_job = ExportJob(
@@ -866,6 +897,31 @@ class GoogleDriveExportResponse(BaseModel):
     files_copied: list[str]
     google_drive_folder: str
     message: str
+    verified: bool = False
+    warnings: list[str] = Field(default_factory=list)
+    files: list["GoogleDriveFileStatus"] = Field(default_factory=list)
+
+
+class GoogleDriveFileStatus(BaseModel):
+    """One synced-file status inside the Google Drive export folder."""
+
+    name: str
+    size: int | None = None
+    expected_size: int
+    status: str
+    modified_at: datetime | None = None
+
+
+class GoogleDriveStatusResponse(BaseModel):
+    """Status payload for the book's Google Drive sync folder."""
+
+    synced: bool
+    google_drive_folder: str
+    files: list[GoogleDriveFileStatus]
+    warnings: list[str] = Field(default_factory=list)
+
+
+GoogleDriveExportResponse.model_rebuild()
 
 
 GOOGLE_DRIVE_EXPORT_PATH = (
@@ -875,15 +931,106 @@ GOOGLE_DRIVE_EXPORT_PATH = (
 )
 
 
+def _google_drive_folder_name(book: Book) -> str:
+    """Return the sanitized Google Drive folder name for one book."""
+
+    folder_name = f"{book.id:03d}. {book.title} - {book.author}"
+    return "".join(character if character not in r'\/:*?"<>|' else "_" for character in folder_name)
+
+
+def _google_drive_status_for_file(
+    destination_path: Path,
+    *,
+    expected_size: int,
+) -> GoogleDriveFileStatus:
+    """Return the sync status for one copied export artifact."""
+
+    if not destination_path.exists():
+        return GoogleDriveFileStatus(
+            name=destination_path.name,
+            expected_size=expected_size,
+            status="missing",
+        )
+
+    size = destination_path.stat().st_size
+    modified_at = datetime.fromtimestamp(destination_path.stat().st_mtime)
+    tolerance_bytes = max(int(expected_size * GOOGLE_DRIVE_SIZE_TOLERANCE_RATIO), 1)
+    size_matches = abs(size - expected_size) <= tolerance_bytes
+    age_seconds = max(time.time() - destination_path.stat().st_mtime, 0.0)
+    status = "synced" if size_matches and age_seconds <= GOOGLE_DRIVE_RECENT_WINDOW_SECONDS else (
+        "size_mismatch" if not size_matches else "stale"
+    )
+    return GoogleDriveFileStatus(
+        name=destination_path.name,
+        size=size,
+        expected_size=expected_size,
+        status=status,
+        modified_at=modified_at,
+    )
+
+
+def _copy_export_with_retries(source_path: Path, destination_path: Path) -> None:
+    """Copy one export artifact into the Drive sync folder with bounded retries."""
+
+    last_error: OSError | None = None
+    for attempt in range(1, GOOGLE_DRIVE_COPY_RETRIES + 1):
+        try:
+            shutil.copy2(str(source_path), str(destination_path))
+            logger.info(
+                "Copied export to Google Drive on attempt %s: %s -> %s",
+                attempt,
+                source_path,
+                destination_path,
+            )
+            return
+        except OSError as exc:
+            last_error = exc
+            logger.warning(
+                "Google Drive copy attempt %s/%s failed for %s: %s",
+                attempt,
+                GOOGLE_DRIVE_COPY_RETRIES,
+                source_path.name,
+                exc,
+            )
+            if attempt < GOOGLE_DRIVE_COPY_RETRIES:
+                time.sleep(GOOGLE_DRIVE_COPY_BACKOFF_SECONDS)
+
+    detail = str(last_error) if last_error is not None else "Unknown Google Drive copy error."
+    raise HTTPException(status_code=503, detail=f"Failed to copy {source_path.name} to Google Drive: {detail}")
+
+
+def _verify_google_drive_copy(
+    source_path: Path,
+    destination_path: Path,
+) -> GoogleDriveFileStatus:
+    """Wait briefly for the synced file to appear with the expected size."""
+
+    deadline = time.monotonic() + GOOGLE_DRIVE_VERIFY_TIMEOUT_SECONDS
+    while time.monotonic() <= deadline:
+        status = _google_drive_status_for_file(destination_path, expected_size=source_path.stat().st_size)
+        if status.status == "synced":
+            return status
+        time.sleep(GOOGLE_DRIVE_VERIFY_POLL_SECONDS)
+    return _google_drive_status_for_file(destination_path, expected_size=source_path.stat().st_size)
+
+
+def _google_drive_expected_files(book: Book) -> list[tuple[str, Path]]:
+    """Return the export artifacts that should be present for Drive sync."""
+
+    expected: list[tuple[str, Path]] = []
+    for export_format in ("mp3", "m4b"):
+        export_path = get_export_output_path(book, export_format)
+        if export_path.exists():
+            expected.append((export_format, export_path))
+    return expected
+
+
 @router.post("/book/{book_id}/export/gdrive", response_model=GoogleDriveExportResponse)
 async def export_to_google_drive(
     book_id: int,
     db: Session = Depends(get_db),
 ) -> GoogleDriveExportResponse:
     """Copy completed export files (MP3 + M4B) to the Google Drive sync folder."""
-
-    import shutil
-    from pathlib import Path
 
     book = _load_book_or_404(book_id, db)
 
@@ -901,26 +1048,29 @@ async def export_to_google_drive(
             detail="Google Drive sync folder not found. Is Google Drive for Desktop running?",
         )
 
-    book_folder_name = f"{book.id:03d}. {book.title} - {book.author}"
-    book_folder_name = "".join(
-        c if c not in r'\/:*?"<>|' else "_" for c in book_folder_name
-    )
+    book_folder_name = _google_drive_folder_name(book)
     book_gdrive_dir = gdrive_dir / book_folder_name
     book_gdrive_dir.mkdir(parents=True, exist_ok=True)
 
     files_copied: list[str] = []
-    for fmt in ("mp3", "m4b"):
-        src_path = get_export_output_path(book, fmt)
-        if src_path.exists():
-            dest_path = book_gdrive_dir / src_path.name
-            shutil.copy2(str(src_path), str(dest_path))
-            files_copied.append(src_path.name)
-            logger.info(
-                "Copied %s to Google Drive: %s -> %s",
-                fmt.upper(),
-                src_path,
-                dest_path,
+    file_statuses: list[GoogleDriveFileStatus] = []
+    warnings: list[str] = []
+    for export_format, source_path in _google_drive_expected_files(book):
+        destination_path = book_gdrive_dir / source_path.name
+        _copy_export_with_retries(source_path, destination_path)
+        files_copied.append(source_path.name)
+        status = _verify_google_drive_copy(source_path, destination_path)
+        file_statuses.append(status)
+        if status.status != "synced":
+            warnings.append(
+                f"{source_path.name} is still {status.status.replace('_', ' ')} in the Google Drive sync folder."
             )
+        logger.info(
+            "Verified Google Drive %s copy for book %s: %s",
+            export_format.upper(),
+            book.id,
+            status.status,
+        )
 
     if not files_copied:
         raise HTTPException(
@@ -928,12 +1078,56 @@ async def export_to_google_drive(
             detail="No export files found on disk to copy.",
         )
 
+    verified = all(file_status.status == "synced" for file_status in file_statuses)
+    message = (
+        f"Copied {len(files_copied)} file(s) to Google Drive and verified sync."
+        if verified
+        else f"Copied {len(files_copied)} file(s) to Google Drive. Sync verification is still pending."
+    )
     return GoogleDriveExportResponse(
         book_id=book.id,
         book_title=book.title,
         files_copied=files_copied,
         google_drive_folder=book_folder_name,
-        message=f"Copied {len(files_copied)} file(s) to Google Drive. They will sync automatically.",
+        message=message,
+        verified=verified,
+        warnings=warnings,
+        files=file_statuses,
+    )
+
+
+@router.get("/book/{book_id}/gdrive-status", response_model=GoogleDriveStatusResponse)
+async def get_google_drive_status(book_id: int, db: Session = Depends(get_db)) -> GoogleDriveStatusResponse:
+    """Return the current sync status for a book's copied Google Drive export files."""
+
+    book = _load_book_or_404(book_id, db)
+    book_folder_name = _google_drive_folder_name(book)
+    gdrive_dir = Path(GOOGLE_DRIVE_EXPORT_PATH)
+    book_gdrive_dir = gdrive_dir / book_folder_name
+
+    warnings: list[str] = []
+    if not gdrive_dir.exists():
+        warnings.append("Google Drive sync folder is not currently available.")
+        return GoogleDriveStatusResponse(
+            synced=False,
+            google_drive_folder=book_folder_name,
+            files=[],
+            warnings=warnings,
+        )
+
+    file_statuses = [
+        _google_drive_status_for_file(book_gdrive_dir / source_path.name, expected_size=source_path.stat().st_size)
+        for _export_format, source_path in _google_drive_expected_files(book)
+    ]
+    if not file_statuses:
+        warnings.append("No local export artifacts are available to verify against Google Drive.")
+
+    synced = bool(file_statuses) and all(file_status.status == "synced" for file_status in file_statuses)
+    return GoogleDriveStatusResponse(
+        synced=synced,
+        google_drive_folder=book_folder_name,
+        files=file_statuses,
+        warnings=warnings,
     )
 
 

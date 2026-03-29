@@ -102,6 +102,27 @@ def _write_decodable_mp3(path) -> None:
     AudioSegment.silent(duration=1000).export(path, format="mp3")
 
 
+def _create_completed_export_job(test_db: Session, book: Book, *, formats: list[str] | None = None) -> ExportJob:
+    """Persist a completed export job for Drive-sync tests."""
+
+    export_job = ExportJob(
+        book_id=book.id,
+        job_token=f"export_{book.id}_20260329_120000",
+        export_status=BookExportStatus.COMPLETED,
+        formats_requested=json.dumps(formats or ["mp3", "m4b"]),
+        format_details=json.dumps({format_name: {"status": "completed"} for format_name in (formats or ["mp3", "m4b"])}),
+        include_only_approved=True,
+        started_at=utc_now(),
+        completed_at=utc_now(),
+        updated_at=utc_now(),
+    )
+    test_db.add(export_job)
+    book.export_status = BookExportStatus.COMPLETED
+    test_db.commit()
+    test_db.refresh(export_job)
+    return export_job
+
+
 def test_export_accepts_fully_generated_book(
     client,
     test_db: Session,
@@ -960,3 +981,137 @@ def test_download_export_serves_audio_file(client, test_db: Session) -> None:
     assert response.content == b"mp3-bytes"
     assert response.headers["content-type"].startswith("audio/mpeg")
     assert "Download Ready Book.mp3" in unquote(response.headers["content-disposition"])
+
+
+def test_export_endpoint_persists_custom_m4b_bitrate(
+    client,
+    test_db: Session,
+    monkeypatch,
+) -> None:
+    """Manual exports should persist the requested M4B bitrate for the background worker."""
+
+    book = _create_book(test_db, title="Custom Bitrate Export")
+    _create_ready_chapter(test_db, book_id=book.id)
+    launched_jobs: list[int] = []
+
+    monkeypatch.setattr(export_routes, "estimate_export_seconds", lambda *args, **kwargs: 90)
+    monkeypatch.setattr(
+        export_routes,
+        "_launch_export_job",
+        lambda export_job_id, session_factory=None: launched_jobs.append(export_job_id),
+    )
+
+    response = client.post(
+        f"/api/book/{book.id}/export",
+        json={
+            "formats": ["m4b"],
+            "include_only_approved": True,
+            "m4b_bitrate": "256k",
+        },
+    )
+
+    assert response.status_code == 200
+    export_job = test_db.query(ExportJob).filter(ExportJob.book_id == book.id).one()
+    payload = json.loads(export_job.format_details)
+    assert payload["_artifacts"]["request_options"]["m4b_bitrate"] == "256k"
+    assert launched_jobs == [export_job.id]
+
+
+def test_export_endpoint_rejects_invalid_m4b_bitrate(client, test_db: Session) -> None:
+    """Unsupported M4B bitrates should be rejected at request validation time."""
+
+    book = _create_book(test_db, title="Invalid Bitrate Export")
+    _create_ready_chapter(test_db, book_id=book.id)
+
+    response = client.post(
+        f"/api/book/{book.id}/export",
+        json={
+            "formats": ["m4b"],
+            "include_only_approved": True,
+            "m4b_bitrate": "320k",
+        },
+    )
+
+    assert response.status_code == 422
+    assert "m4b_bitrate" in response.text
+
+
+def test_google_drive_export_verifies_copy_and_status_endpoint(
+    client,
+    test_db: Session,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """Drive upload should verify copied files and expose synced status afterwards."""
+
+    outputs_root = tmp_path / "outputs"
+    gdrive_root = tmp_path / "gdrive"
+    gdrive_root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(export_routes, "GOOGLE_DRIVE_EXPORT_PATH", str(gdrive_root))
+    monkeypatch.setattr("src.pipeline.exporter.settings.OUTPUTS_PATH", str(outputs_root))
+    monkeypatch.setattr(export_routes, "GOOGLE_DRIVE_VERIFY_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(export_routes, "GOOGLE_DRIVE_COPY_BACKOFF_SECONDS", 0.0)
+
+    book = _create_book(test_db, title="Drive Sync Ready")
+    _create_completed_export_job(test_db, book)
+
+    mp3_path = get_export_output_path(book, "mp3")
+    mp3_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_decodable_mp3(mp3_path)
+    m4b_path = get_export_output_path(book, "m4b")
+    m4b_path.write_bytes(b"m4b-test-bytes")
+
+    response = client.post(f"/api/book/{book.id}/export/gdrive")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["verified"] is True
+    assert {item["status"] for item in payload["files"]} == {"synced"}
+
+    status_response = client.get(f"/api/book/{book.id}/gdrive-status")
+
+    assert status_response.status_code == 200
+    status_payload = status_response.json()
+    assert status_payload["synced"] is True
+    assert {item["status"] for item in status_payload["files"]} == {"synced"}
+
+
+def test_google_drive_export_retries_failed_copy_attempts(
+    client,
+    test_db: Session,
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """Drive upload should retry copy failures before succeeding."""
+
+    outputs_root = tmp_path / "outputs"
+    gdrive_root = tmp_path / "gdrive"
+    gdrive_root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(export_routes, "GOOGLE_DRIVE_EXPORT_PATH", str(gdrive_root))
+    monkeypatch.setattr("src.pipeline.exporter.settings.OUTPUTS_PATH", str(outputs_root))
+    monkeypatch.setattr(export_routes, "GOOGLE_DRIVE_VERIFY_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(export_routes, "GOOGLE_DRIVE_COPY_BACKOFF_SECONDS", 0.0)
+
+    book = _create_book(test_db, title="Drive Retry Ready")
+    _create_completed_export_job(test_db, book, formats=["mp3"])
+
+    mp3_path = get_export_output_path(book, "mp3")
+    mp3_path.parent.mkdir(parents=True, exist_ok=True)
+    _write_decodable_mp3(mp3_path)
+
+    attempts = {"count": 0}
+    real_copy2 = export_routes.shutil.copy2
+
+    def flaky_copy(source, destination, *args, **kwargs):
+        attempts["count"] += 1
+        if attempts["count"] < 3:
+            raise OSError("temporary sync lock")
+        return real_copy2(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(export_routes.shutil, "copy2", flaky_copy)
+
+    response = client.post(f"/api/book/{book.id}/export/gdrive")
+
+    assert response.status_code == 200
+    assert response.json()["verified"] is True
+    assert attempts["count"] == 3

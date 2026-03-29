@@ -6,6 +6,7 @@ import ConfirmDialog from "../components/ConfirmDialog";
 import DownloadCard from "../components/DownloadCard";
 import ExportDialog from "../components/ExportDialog";
 import ExportProgressBar from "../components/ExportProgressBar";
+import ExportQASummary from "../components/ExportQASummary";
 import GenerationProgress from "../components/GenerationProgress";
 import NarrationSettings from "../components/NarrationSettings";
 import TextPreview from "../components/TextPreview";
@@ -218,6 +219,8 @@ export default function BookDetail() {
   const [errorMessage, setErrorMessage] = useState("");
   const [exportDialogOpen, setExportDialogOpen] = useState(false);
   const [exportErrorMessage, setExportErrorMessage] = useState("");
+  const [exportReadiness, setExportReadiness] = useState(null);
+  const [exportReadinessLoading, setExportReadinessLoading] = useState(false);
   const [exportSnapshot, setExportSnapshot] = useState(
     createIdleExportSnapshot(id),
   );
@@ -296,6 +299,8 @@ export default function BookDetail() {
   ).filter(([, format]) => format?.status === "error");
   const exportInProgress =
     exportSubmitting || exportSnapshot?.export_status === "processing";
+  const exportReady = Boolean(exportReadiness?.ready);
+  const exportWarningOnly = Boolean(exportReadiness?.export_anyway_allowed);
   const lastExportChapterCount =
     exportSnapshot?.qa_report?.chapters_included ?? 0;
   const exportHasArtifacts = exportCompletedFormats.length > 0;
@@ -395,6 +400,25 @@ export default function BookDetail() {
     };
   }, [exportSnapshot?.export_status, id]);
 
+  useEffect(() => {
+    if (loading || !hasGeneratedChapters) {
+      if (!loading) {
+        setExportReadiness(null);
+        setExportReadinessLoading(false);
+      }
+      return;
+    }
+
+    void fetchExportReadiness(requestRef.current);
+  }, [
+    id,
+    loading,
+    hasGeneratedChapters,
+    bookQualityReport?.overall_grade,
+    audioQaReport?.chapter_count,
+    exportSnapshot?.export_status,
+  ]);
+
   function showToast(message, type = "info") {
     setToast({
       message,
@@ -454,6 +478,35 @@ export default function BookDetail() {
           : "Failed to fetch export status.",
       );
       return null;
+    }
+  }
+
+  async function fetchExportReadiness(currentRequestId) {
+    setExportReadinessLoading(true);
+    try {
+      const response = await fetch(`/api/book/${id}/export-readiness`);
+      if (!response.ok) {
+        throw new Error("Failed to fetch export readiness.");
+      }
+
+      const payload = await response.json();
+      if (requestRef.current !== currentRequestId) {
+        return null;
+      }
+
+      setExportReadiness(payload);
+      return payload;
+    } catch (error) {
+      if (requestRef.current !== currentRequestId) {
+        return null;
+      }
+
+      setExportReadiness(null);
+      return null;
+    } finally {
+      if (requestRef.current === currentRequestId) {
+        setExportReadinessLoading(false);
+      }
     }
   }
 
@@ -539,6 +592,8 @@ export default function BookDetail() {
     setConfirmDialog(CLOSED_CONFIRM_DIALOG);
     setExportDialogOpen(false);
     setExportErrorMessage("");
+    setExportReadiness(null);
+    setExportReadinessLoading(false);
     setExportSnapshot(createIdleExportSnapshot(id));
     setExportSubmitting(false);
     setGenerationErrorMessage("");
@@ -1136,7 +1191,9 @@ export default function BookDetail() {
         throw new Error(detail);
       }
       const result = await response.json();
-      setGdriveMessage(result.message);
+      const warningMessage =
+        result.warnings?.length > 0 ? ` ${result.warnings.join(" ")}` : "";
+      setGdriveMessage(`${result.message}${warningMessage}`);
       showToast(`Uploaded ${result.files_copied.length} file(s) to Google Drive`);
     } catch (error) {
       setGdriveMessage(
@@ -1872,7 +1929,7 @@ export default function BookDetail() {
                       </div>
                       <div className="mt-4 space-y-3">
                         {Object.entries(
-                          bookQualityReport.cross_chapter_checks,
+                          bookQualityReport.cross_chapter_checks ?? {},
                         ).map(([name, details]) => (
                           <div
                             className="flex flex-col gap-1 rounded-2xl border border-white/10 bg-slate-900/60 px-4 py-3"
@@ -2305,11 +2362,18 @@ export default function BookDetail() {
                     </div>
                   ) : null}
 
+                  {hasGeneratedChapters ? (
+                    <ExportQASummary
+                      loading={exportReadinessLoading}
+                      summary={exportReadiness}
+                    />
+                  ) : null}
+
                   <div className="flex flex-wrap gap-3">
                     <button
                       className="inline-flex items-center justify-center rounded-full border border-amber-300/25 bg-amber-400/10 px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-amber-100 transition hover:bg-amber-400/20 disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/[0.04] disabled:text-slate-500"
                       disabled={
-                        completedChapters.length === 0 || exportInProgress
+                        completedChapters.length === 0 || exportInProgress || exportReadinessLoading || !exportReady
                       }
                       onClick={() => {
                         setExportDialogOpen(true);
@@ -2321,6 +2385,19 @@ export default function BookDetail() {
                         ? "Re-export Audiobook"
                         : "Export Audiobook"}
                     </button>
+                    {exportWarningOnly ? (
+                      <button
+                        className="inline-flex items-center justify-center rounded-full border border-amber-300/25 bg-amber-500/15 px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-amber-100 transition hover:bg-amber-400/20 disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/[0.04] disabled:text-slate-500"
+                        disabled={completedChapters.length === 0 || exportInProgress || exportReadinessLoading}
+                        onClick={() => {
+                          setExportDialogOpen(true);
+                          setExportErrorMessage("");
+                        }}
+                        type="button"
+                      >
+                        {exportCompletedFormats.length > 0 ? "Re-export Anyway" : "Export Anyway"}
+                      </button>
+                    ) : null}
                     {exportCompletedFormats.length > 0 ? (
                       <button
                         className="inline-flex items-center justify-center rounded-full border border-emerald-300/25 bg-emerald-400/10 px-4 py-2 text-xs font-semibold uppercase tracking-[0.18em] text-emerald-100 transition hover:bg-emerald-400/20 disabled:cursor-not-allowed disabled:border-white/10 disabled:bg-white/[0.04] disabled:text-slate-500"

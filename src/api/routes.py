@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 import threading
 import time
 from datetime import datetime
@@ -10,25 +12,33 @@ from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy.orm import Session, selectinload
 
 from src.api.cache import invalidate_library_cache, library_cache
 from src.api.library import LibraryScanner
 from src.config import get_application_settings, settings
 from src.database import (
+    AudioQAResult,
     Book,
+    BookExportStatus,
     BookGenerationStatus,
     BookStatus,
     Chapter,
+    ChapterQARecord,
     ChapterStatus,
     ChapterType,
+    ExportJob,
     QAStatus,
     get_db,
+    utc_now,
 )
+from src.pipeline.book_qa import build_export_readiness_summary
 from src.pipeline.manuscript_validator import ManuscriptValidationReport, ManuscriptValidator
 from src.pipeline.pronunciation_watchlist import PronunciationWatchlist
+from src.parser import Chapter as ParsedManuscriptChapter
 from src.parser import CreditsGenerator, ManuscriptParserFactory
+from src.parser.common import AUTO_SPLIT_ESTIMATED_MINUTES, estimate_duration_minutes, split_text_at_paragraph
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +161,56 @@ class ParseBookResponse(BaseModel):
     message: str
 
 
+class SplitChapterRequest(BaseModel):
+    """Request payload for manually splitting one parsed chapter."""
+
+    split_point: str = "auto"
+    paragraph_index: int | None = None
+
+    @model_validator(mode="after")
+    def _validate_request(self) -> "SplitChapterRequest":
+        """Require either auto mode or one explicit paragraph index."""
+
+        if self.paragraph_index is not None:
+            return self
+        if self.split_point != "auto":
+            raise ValueError("split_point must be 'auto' when paragraph_index is not provided.")
+        return self
+
+
+class ExportReadinessCheckResponse(BaseModel):
+    """One ACX/export checklist item for the frontend summary panel."""
+
+    key: str
+    label: str
+    passed: bool
+    detail: str
+    critical: bool = True
+
+
+class ExportReadinessChapterResponse(BaseModel):
+    """Per-chapter export readiness summary row."""
+
+    id: int
+    number: int
+    title: str | None
+    duration_seconds: float | None
+    grade: str
+    issues: list[str] = Field(default_factory=list)
+
+
+class ExportReadinessResponse(BaseModel):
+    """Consolidated export-readiness payload for one book."""
+
+    ready: bool
+    export_anyway_allowed: bool
+    status_label: str
+    acx_checks: list[ExportReadinessCheckResponse]
+    chapters: list[ExportReadinessChapterResponse]
+    blocking_issues: list[str]
+    warnings: list[str]
+
+
 class LibraryStats(BaseModel):
     """Counts of books per lifecycle state."""
 
@@ -223,6 +283,232 @@ _library_scan_progress: dict[str, object] = {
     "scanning": False,
     "started_monotonic": None,
 }
+
+
+def _title_with_part_suffix(title: str | None, *, part: int) -> str:
+    """Return a stable split-chapter title with a part suffix."""
+
+    base_title = (title or "Chapter").strip() or "Chapter"
+    base_title = re.sub(r"\s+\(Part\s+\d+\)\s*$", "", base_title, flags=re.IGNORECASE)
+    return f"{base_title} (Part {part})"
+
+
+def _auto_split_parsed_chapters(chapters: list[ParsedManuscriptChapter]) -> list[ParsedManuscriptChapter]:
+    """Split oversized parsed chapters on paragraph boundaries before DB persistence."""
+
+    pending = list(chapters)
+    normalized: list[ParsedManuscriptChapter] = []
+    while pending:
+        parsed_chapter = pending.pop(0)
+        estimated_minutes = estimate_duration_minutes(parsed_chapter.word_count)
+        if estimated_minutes <= AUTO_SPLIT_ESTIMATED_MINUTES:
+            normalized.append(parsed_chapter)
+            continue
+
+        split_result = split_text_at_paragraph(parsed_chapter.raw_text)
+        if split_result is None:
+            logger.warning(
+                "Chapter '%s' is estimated at %.1f minutes but could not be auto-split because no paragraph boundary was found.",
+                parsed_chapter.title,
+                estimated_minutes,
+            )
+            normalized.append(parsed_chapter)
+            continue
+
+        left_chapter = ParsedManuscriptChapter(
+            number=parsed_chapter.number,
+            title=_title_with_part_suffix(parsed_chapter.title, part=1),
+            type=parsed_chapter.type,
+            raw_text=split_result.left_text,
+            word_count=split_result.left_word_count,
+        )
+        right_chapter = ParsedManuscriptChapter(
+            number=parsed_chapter.number,
+            title=_title_with_part_suffix(parsed_chapter.title, part=2),
+            type=parsed_chapter.type,
+            raw_text=split_result.right_text,
+            word_count=split_result.right_word_count,
+        )
+        logger.info(
+            "Auto-split parsed chapter '%s' (%.1f min estimate) into '%s' (%.1f min) and '%s' (%.1f min).",
+            parsed_chapter.title,
+            estimated_minutes,
+            left_chapter.title,
+            estimate_duration_minutes(left_chapter.word_count),
+            right_chapter.title,
+            estimate_duration_minutes(right_chapter.word_count),
+        )
+        pending.insert(0, right_chapter)
+        pending.insert(0, left_chapter)
+
+    return normalized
+
+
+def _shift_numbered_rows(records: list[object], attribute_name: str, *, delta: int, db: Session) -> None:
+    """Shift rows that carry unique chapter-number keys without colliding in-place."""
+
+    if not records or delta == 0:
+        return
+
+    temporary_offset = 100_000
+    for record in records:
+        current_value = getattr(record, attribute_name)
+        setattr(record, attribute_name, current_value + temporary_offset)
+    db.flush()
+    for record in records:
+        current_value = getattr(record, attribute_name)
+        setattr(record, attribute_name, current_value - temporary_offset + delta)
+    db.flush()
+
+
+def _retag_shifted_qa_payloads(records: list[ChapterQARecord]) -> None:
+    """Keep embedded chapter-number metadata aligned after renumbering QA rows."""
+
+    for record in records:
+        try:
+            payload = json.loads(record.qa_details)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        payload["chapter_n"] = record.chapter_n
+        chapter_report = payload.get("chapter_report")
+        if isinstance(chapter_report, dict):
+            chapter_report["chapter_number"] = record.chapter_n
+            payload["chapter_report"] = chapter_report
+        record.qa_details = json.dumps(payload)
+
+
+def _retag_shifted_audio_qa_payloads(records: list[AudioQAResult]) -> None:
+    """Keep embedded chapter-number metadata aligned after renumbering deep-QA rows."""
+
+    for record in records:
+        try:
+            payload = json.loads(record.report_json)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        payload["chapter_n"] = record.chapter_n
+        record.report_json = json.dumps(payload)
+
+
+def _invalidate_chapter_artifacts(chapter: Chapter) -> None:
+    """Reset generation and QA artifacts for a chapter whose text changed."""
+
+    chapter.status = ChapterStatus.PENDING
+    chapter.audio_path = None
+    chapter.duration_seconds = None
+    chapter.qa_status = QAStatus.NOT_REVIEWED
+    chapter.qa_notes = None
+    chapter.started_at = None
+    chapter.completed_at = None
+    chapter.error_message = None
+    chapter.audio_file_size_bytes = None
+    chapter.current_chunk = None
+    chapter.total_chunks = None
+    chapter.chunk_boundaries = None
+    chapter.generation_metadata = None
+    chapter.mastered = False
+
+
+def _split_persisted_chapter(
+    *,
+    book: Book,
+    chapter: Chapter,
+    paragraph_index: int | None,
+    db: Session,
+) -> tuple[Chapter, Chapter]:
+    """Split one persisted chapter and renumber following chapters and QA rows."""
+
+    if chapter.type in {ChapterType.OPENING_CREDITS, ChapterType.CLOSING_CREDITS}:
+        raise HTTPException(status_code=400, detail="Opening and closing credits cannot be split.")
+    if book.generation_status == BookGenerationStatus.GENERATING:
+        raise HTTPException(status_code=409, detail="Stop generation before splitting chapters.")
+    if book.export_status == BookExportStatus.PROCESSING:
+        raise HTTPException(status_code=409, detail="Wait for export to finish before splitting chapters.")
+
+    split_result = split_text_at_paragraph(chapter.text_content or "", paragraph_index=paragraph_index)
+    if split_result is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Chapter could not be split. It needs at least two non-empty paragraphs.",
+        )
+
+    chapters_to_shift = (
+        db.query(Chapter)
+        .filter(Chapter.book_id == book.id, Chapter.number > chapter.number)
+        .order_by(Chapter.number.desc(), Chapter.id.desc())
+        .all()
+    )
+    for shifted_chapter in chapters_to_shift:
+        shifted_chapter.number += 1
+
+    qa_records_to_shift = (
+        db.query(ChapterQARecord)
+        .filter(ChapterQARecord.book_id == book.id, ChapterQARecord.chapter_n > chapter.number)
+        .order_by(ChapterQARecord.chapter_n.desc(), ChapterQARecord.id.desc())
+        .all()
+    )
+    _shift_numbered_rows(qa_records_to_shift, "chapter_n", delta=1, db=db)
+    _retag_shifted_qa_payloads(qa_records_to_shift)
+
+    audio_qa_to_shift = (
+        db.query(AudioQAResult)
+        .filter(AudioQAResult.book_id == book.id, AudioQAResult.chapter_n > chapter.number)
+        .order_by(AudioQAResult.chapter_n.desc(), AudioQAResult.id.desc())
+        .all()
+    )
+    _shift_numbered_rows(audio_qa_to_shift, "chapter_n", delta=1, db=db)
+    _retag_shifted_audio_qa_payloads(audio_qa_to_shift)
+
+    db.query(ChapterQARecord).filter(
+        ChapterQARecord.book_id == book.id,
+        ChapterQARecord.chapter_n == chapter.number,
+    ).delete(synchronize_session=False)
+    db.query(AudioQAResult).filter(
+        AudioQAResult.book_id == book.id,
+        AudioQAResult.chapter_n == chapter.number,
+    ).delete(synchronize_session=False)
+
+    chapter.title = _title_with_part_suffix(chapter.title, part=1)
+    chapter.text_content = split_result.left_text
+    chapter.word_count = split_result.left_word_count
+    _invalidate_chapter_artifacts(chapter)
+
+    split_chapter = Chapter(
+        book_id=book.id,
+        number=chapter.number + 1,
+        title=_title_with_part_suffix(chapter.title, part=2),
+        type=chapter.type,
+        text_content=split_result.right_text,
+        word_count=split_result.right_word_count,
+        status=ChapterStatus.PENDING,
+        qa_status=QAStatus.NOT_REVIEWED,
+    )
+    db.add(split_chapter)
+
+    book.status = BookStatus.PARSED
+    book.generation_status = BookGenerationStatus.IDLE
+    book.export_status = BookExportStatus.IDLE
+    export_job = db.query(ExportJob).filter(ExportJob.book_id == book.id).first()
+    if export_job is not None:
+        export_job.export_status = BookExportStatus.ERROR
+        export_job.completed_at = utc_now()
+        export_job.updated_at = export_job.completed_at
+        export_job.current_stage = "Chapter split requires re-export"
+        export_job.error_message = "Chapter structure changed after a manual split. Re-export required."
+
+    db.flush()
+    logger.info(
+        "Manually split book %s chapter %s into chapter ids %s and %s at paragraph index %s.",
+        book.id,
+        chapter.number,
+        chapter.id,
+        split_chapter.id,
+        split_result.paragraph_index,
+    )
+    return chapter, split_chapter
 
 
 def _set_library_scan_progress(**updates: object) -> None:
@@ -703,6 +989,7 @@ async def parse_book(
         metadata, chapters_data, manuscript_path = ManuscriptParserFactory.parse_manuscript(folder_path)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    chapters_data = _auto_split_parsed_chapters(chapters_data)
 
     if request.overwrite and existing_chapter_count > 0:
         for existing_chapter in list(book.chapters):
@@ -807,3 +1094,46 @@ async def update_chapter_text(
 
     logger.info("Updated chapter %s text for book %s", chapter_number, book_id)
     return _serialize_chapter(chapter)
+
+
+@router.post("/book/{book_id}/chapter/{chapter_id}/split", response_model=list[ChapterResponse])
+async def split_book_chapter(
+    book_id: int,
+    chapter_id: int,
+    request: SplitChapterRequest,
+    db: Session = Depends(get_db),
+) -> list[ChapterResponse]:
+    """Split one stored chapter at a paragraph boundary without auto-regenerating it."""
+
+    book = db.query(Book).filter(Book.id == book_id).first()
+    if book is None:
+        raise HTTPException(status_code=404, detail=f"Book {book_id} not found")
+
+    chapter = (
+        db.query(Chapter)
+        .filter(Chapter.book_id == book_id, Chapter.id == chapter_id)
+        .first()
+    )
+    if chapter is None:
+        raise HTTPException(status_code=404, detail=f"Chapter {chapter_id} not found in book {book_id}")
+
+    left_chapter, right_chapter = _split_persisted_chapter(
+        book=book,
+        chapter=chapter,
+        paragraph_index=request.paragraph_index,
+        db=db,
+    )
+    db.commit()
+    invalidate_library_cache()
+    return [_serialize_chapter(left_chapter), _serialize_chapter(right_chapter)]
+
+
+@router.get("/book/{book_id}/export-readiness", response_model=ExportReadinessResponse)
+async def get_export_readiness(book_id: int, db: Session = Depends(get_db)) -> ExportReadinessResponse:
+    """Return a consolidated pre-export QA and ACX readiness summary."""
+
+    book = db.query(Book.id).filter(Book.id == book_id).first()
+    if book is None:
+        raise HTTPException(status_code=404, detail=f"Book {book_id} not found")
+
+    return ExportReadinessResponse.model_validate(build_export_readiness_summary(book_id, db))

@@ -29,6 +29,8 @@ from src.pipeline.book_qa import (
     check_loudness_range,
     check_cross_chapter_pacing,
     check_cross_chapter_voice,
+    build_export_readiness_summary,
+    ACX_REQUIREMENTS,
     run_book_qa,
 )
 
@@ -549,3 +551,70 @@ def test_book_report_aggregates_grades_and_blockers(test_db: Session, monkeypatc
     assert report.chapters_grade_a == 3
     assert report.chapters_grade_c == 1
     assert report.ready_for_export is True
+
+
+def test_acx_compliance_reports_split_endpoint_for_oversized_chapter(
+    test_db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Oversized chapters should point operators at the manual split endpoint."""
+
+    monkeypatch.setattr("src.pipeline.book_qa.measure_integrated_lufs", lambda *_args, **_kwargs: -20.0)
+
+    book = _create_book(test_db, title="Oversized Chapter")
+    _create_credits(test_db, book)
+    oversized = _create_ready_chapter(
+        test_db,
+        book=book,
+        number=1,
+        title="Huge Chapter",
+        audio=_with_edges(_tone(3000)),
+    )
+    oversized.duration_seconds = ACX_REQUIREMENTS["max_chapter_duration_s"] + 60.0
+    test_db.commit()
+
+    result = check_acx_compliance(book.id, test_db)
+
+    duration_violations = [
+        violation
+        for violation in result.details["violations"]
+        if violation["issue"] == "duration_seconds_max"
+    ]
+    assert duration_violations
+    assert duration_violations[0]["split_endpoint"] == f"/api/book/{book.id}/chapter/{oversized.id}/split"
+    assert any("/api/book/" in blocker for blocker in result.blockers)
+
+
+def test_export_readiness_summary_allows_warning_only_export(
+    test_db: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Grade C chapters should surface warnings without becoming blocking export failures."""
+
+    monkeypatch.setattr("src.pipeline.book_qa.measure_integrated_lufs", lambda *_args, **_kwargs: -20.0)
+
+    book = _create_book(test_db, title="Warning Export")
+    _create_credits(test_db, book)
+    _create_ready_chapter(
+        test_db,
+        book=book,
+        number=1,
+        title="Steady Chapter",
+        audio=_with_edges(_tone(3000)),
+        grade="A",
+    )
+    _create_ready_chapter(
+        test_db,
+        book=book,
+        number=2,
+        title="Needs Review",
+        audio=_with_edges(_tone(3000)),
+        grade="C",
+    )
+
+    summary = build_export_readiness_summary(book.id, test_db)
+
+    assert summary["ready"] is False
+    assert summary["export_anyway_allowed"] is True
+    assert summary["blocking_issues"] == []
+    assert any("Needs Review" in warning for warning in summary["warnings"])

@@ -107,3 +107,6 @@ def test_validation_error(test_db: Session, tmp_path: Path) -> None:
 
     with pytest.raises(ValidationError):
         manager.update_settings({"output_preferences": {"mp3_bitrate": 111}})
+
+    with pytest.raises(ValidationError):
+        manager.update_settings({"output_preferences": {"m4b_bitrate": "320k"}})

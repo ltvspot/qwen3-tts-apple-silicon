@@ -54,6 +54,7 @@ EXPORT_VERIFY_TIMEOUT_SECONDS = 60
 EXPORT_UNKNOWN_DURATION_TIMEOUT_SECONDS = 300.0
 EXPORT_STALE_TIMEOUT = timedelta(minutes=15)
 FORMAT_DETAILS_ARTIFACTS_KEY = "_artifacts"
+FORMAT_DETAILS_REQUEST_OPTIONS_KEY = "request_options"
 EXPORT_LUFS_MAX_ATTEMPTS = 3
 EXPORT_STATE_FILE_NAME = "export_state.json"
 SOFT_FAIL_CHECKS = frozenset({"pacing_detailed", "spectral_quality", "volume_consistency", "duration_check"})
@@ -1090,6 +1091,7 @@ def export_m4b(
     book: Book,
     chapter_markers: list[ChapterMarker],
     metadata_path: Path,
+    bitrate: str | None = None,
 ) -> EncodedExportArtifact:
     """Encode a normalized master WAV into M4B with chapter markers."""
 
@@ -1109,7 +1111,7 @@ def export_m4b(
         "-codec:a",
         "aac",
         "-b:a",
-        settings.EXPORT_M4B_BITRATE,
+        bitrate or settings.EXPORT_M4B_BITRATE,
         "-ar",
         str(_sample_rate()),
         "-ac",
@@ -1369,6 +1371,14 @@ def _format_details_artifacts(raw_payload: str | dict[str, Any] | None) -> dict[
 
     artifacts = _load_format_details_payload(raw_payload).get(FORMAT_DETAILS_ARTIFACTS_KEY)
     return dict(artifacts) if isinstance(artifacts, dict) else {}
+
+
+def _format_details_request_options(raw_payload: str | dict[str, Any] | None) -> dict[str, Any]:
+    """Return request-scoped export options stored alongside format details."""
+
+    artifacts = _format_details_artifacts(raw_payload)
+    options = artifacts.get(FORMAT_DETAILS_REQUEST_OPTIONS_KEY)
+    return dict(options) if isinstance(options, dict) else {}
 
 
 def _serialize_format_details_payload(
@@ -1950,6 +1960,7 @@ def export_book_sync(
     *,
     export_formats: list[str] | None = None,
     include_only_approved: bool = True,
+    m4b_bitrate: str | None = None,
     session_factory: sessionmaker[Session] | None = None,
     progress_callback: ExportProgressCallback | None = None,
     should_abort: Callable[[], None] | None = None,
@@ -1993,6 +2004,13 @@ def export_book_sync(
     checkpoint_artifacts: dict[str, Any] = {}
     normalization_result = LoudnessNormalizationResult(measured_lufs=None, lufs_warning=None, attempts=0)
     state_payload = _load_export_state_payload(book)
+    checkpoint_artifacts.update(_format_details_artifacts(state_payload.get("format_details")))
+    request_options = _format_details_request_options(state_payload.get("format_details"))
+    if m4b_bitrate:
+        request_options["m4b_bitrate"] = m4b_bitrate
+    resolved_m4b_bitrate = str(request_options.get("m4b_bitrate") or settings.EXPORT_M4B_BITRATE)
+    if request_options:
+        checkpoint_artifacts[FORMAT_DETAILS_REQUEST_OPTIONS_KEY] = request_options
     state_payload.update(
         {
             "book_id": book.id,
@@ -2004,7 +2022,7 @@ def export_book_sync(
             "current_stage": "Preparing export job",
             "current_format": None,
             "progress_percent": 0.0,
-            "format_details": _serialize_format_details_payload(format_results),
+            "format_details": _serialize_format_details_payload(format_results, artifacts=checkpoint_artifacts),
             "updated_at": utc_now().isoformat(),
         }
     )
@@ -2217,6 +2235,7 @@ def export_book_sync(
                         book=book,
                         chapter_markers=concatenation.chapter_markers,
                         metadata_path=temp_paths["metadata"],
+                        bitrate=resolved_m4b_bitrate,
                     )
                 encoded_artifacts[export_format] = encoded_artifact
                 encoded_outputs[export_format] = output_path
@@ -2322,6 +2341,7 @@ def export_book_sync(
                         book=book,
                         chapter_markers=concatenation.chapter_markers,
                         metadata_path=temp_paths["metadata"],
+                        bitrate=resolved_m4b_bitrate,
                     )
 
             if verification is None or not verification.get("ok"):
@@ -2614,6 +2634,9 @@ def run_export_job_sync(export_job_id: int, session_factory: sessionmaker[Sessio
         book_id = export_job.book_id
         formats_requested = json.loads(export_job.formats_requested)
         include_only_approved = export_job.include_only_approved
+        request_options = _format_details_request_options(export_job.format_details)
+        requested_m4b_bitrate = request_options.get("m4b_bitrate")
+        existing_artifacts = _format_details_artifacts(export_job.format_details)
 
         export_job.export_status = BookExportStatus.PROCESSING
         export_job.started_at = utc_now()
@@ -2626,19 +2649,30 @@ def run_export_job_sync(export_job_id: int, session_factory: sessionmaker[Sessio
         export_job.current_format = None
         export_job.current_chapter_n = None
         export_job.total_chapters = None
-        export_job.format_details = json.dumps(_serialize_format_details_payload(_empty_format_details(formats_requested)))
+        export_job.format_details = json.dumps(
+            _serialize_format_details_payload(
+                _empty_format_details(formats_requested),
+                artifacts=existing_artifacts,
+            )
+        )
         book.export_status = BookExportStatus.PROCESSING
         db_session.commit()
 
     try:
+        export_kwargs: dict[str, object] = {
+            "export_formats": formats_requested,
+            "include_only_approved": include_only_approved,
+            "session_factory": session_factory,
+            "progress_callback": persist_progress,
+            "should_abort": ensure_job_active,
+            "export_job_id": export_job_id,
+        }
+        if isinstance(requested_m4b_bitrate, str):
+            export_kwargs["m4b_bitrate"] = requested_m4b_bitrate
+
         result = export_book_sync(
             book_id,
-            export_formats=formats_requested,
-            include_only_approved=include_only_approved,
-            session_factory=session_factory,
-            progress_callback=persist_progress,
-            should_abort=ensure_job_active,
-            export_job_id=export_job_id,
+            **export_kwargs,
         )
     except ExportCancelledError:
         logger.info("Export job %s cancelled before completion", export_job_id)

@@ -26,6 +26,7 @@ from src.pipeline.qa_checker import (
     _mono_samples,
     _resolve_audio_path,
     _spectral_centroid,
+    build_qa_record_response,
 )
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,19 @@ ACX_REQUIREMENTS = {
     "lra_fail_min_lu": 3.0,
     "lra_fail_max_lu": 18.0,
 }
+EXPORT_READY_GRADES = {"A", "B"}
+EXPORT_WARNING_GRADES = {"C"}
+EXPORT_READINESS_CHECKS = (
+    ("sample_rate", "Sample rate 44.1 kHz", {"sample_rate"}, True),
+    ("mono", "All chapters mono", {"channels"}, True),
+    ("rms", "RMS -23 to -18 dB", {"rms_db"}, True),
+    ("peak", "Peak below -3 dBTP", {"true_peak_db"}, True),
+    ("noise_floor", "Noise floor below -60 dB", {"noise_floor_db"}, True),
+    ("room_tone", "Room tone present", {"room_tone_head_db", "room_tone_tail_db"}, True),
+    ("duration", "No chapter exceeds 120 minutes", {"duration_seconds_max"}, True),
+    ("opening_credits", "Opening credits present", {"opening_credits"}, True),
+    ("closing_credits", "Closing credits present", {"closing_credits"}, True),
+)
 
 
 class BookQACheck(BaseModel):
@@ -186,6 +200,37 @@ def _chapter_grade(chapter: Chapter, qa_record: ChapterQARecord | None) -> str:
             return grade
 
     return "A" if qa_record.overall_status == QAAutomaticStatus.PASS else "B"
+
+
+def _chapter_grade_details(chapter: Chapter, qa_record: ChapterQARecord | None) -> tuple[str, list[str]]:
+    """Return the best-known chapter grade plus any surfaced QA issue messages."""
+
+    if qa_record is None:
+        issues: list[str] = []
+        if chapter.status != ChapterStatus.GENERATED:
+            issues.append("Audio has not been generated yet.")
+        else:
+            issues.append("Chapter QA has not been run yet.")
+        if chapter.qa_status == QAStatus.NEEDS_REVIEW:
+            issues.append("Chapter is marked for review.")
+        return ("F", issues)
+
+    payload = build_qa_record_response(qa_record, chapter)
+    chapter_report = payload.get("chapter_report") or {}
+    raw_grade = chapter_report.get("overall_grade")
+    grade = raw_grade if isinstance(raw_grade, str) and raw_grade else _chapter_grade(chapter, qa_record)
+
+    issues: list[str] = []
+    for check in payload.get("automatic_checks", []):
+        if not isinstance(check, dict):
+            continue
+        status = str(check.get("status") or "")
+        message = str(check.get("message") or "").strip()
+        if status in {QAAutomaticStatus.WARNING.value, QAAutomaticStatus.FAIL.value} and message:
+            issues.append(message)
+    if payload.get("manual_status") == "flagged":
+        issues.append("Manual QA flagged this chapter for fixes.")
+    return (grade, issues)
 
 
 def _require_gate3_ready(book_id: int, db_session: Session) -> tuple[Book, list[Chapter], dict[int, ChapterQARecord]]:
@@ -851,17 +896,52 @@ def check_loudness_range(book_id: int, db_session: Session) -> BookQACheck:
     )
 
 
-def check_acx_compliance(book_id: int, db_session: Session, *, export_mode: bool = False) -> BookQACheck:
-    """Ensure every chapter meets ACX/Audible production requirements."""
+def _evaluate_acx_compliance_for_chapters(
+    book_id: int,
+    chapters: list[Chapter],
+    *,
+    export_mode: bool = False,
+) -> BookQACheck:
+    """Ensure every generated chapter meets ACX/Audible production requirements."""
 
-    _, chapters, _ = _require_gate3_ready(book_id, db_session)
     violations: list[dict[str, Any]] = []
     blockers: list[str] = []
     recommendations: list[str] = []
     export_warning_issues = {"lufs", "rms_db", "true_peak_db", "noise_floor_db", "file_size_mb"}
 
     for chapter in chapters:
-        audio_path = _chapter_audio_path(chapter)
+        def add_violation(
+            issue: str,
+            remediation: str,
+            value: Any,
+            *,
+            chapter_n: int | None = None,
+            extra_details: dict[str, Any] | None = None,
+        ) -> None:
+            severity = "warning" if export_mode and issue in export_warning_issues else "blocker"
+            label = f"Chapter {chapter_n if chapter_n is not None else chapter.number} {issue}: {remediation}"
+            violation_payload = {
+                "chapter_id": chapter.id,
+                "chapter_n": chapter_n if chapter_n is not None else chapter.number,
+                "issue": issue,
+                "value": value,
+                "remediation": remediation,
+                "severity": severity,
+            }
+            if extra_details:
+                violation_payload.update(extra_details)
+            violations.append(violation_payload)
+            if severity == "warning":
+                recommendations.append(label)
+            else:
+                blockers.append(label)
+
+        try:
+            audio_path = _chapter_audio_path(chapter)
+        except ValueError:
+            add_violation("audio_missing", "Generate chapter audio before export.", chapter.audio_path)
+            continue
+
         audio = AudioSegment.from_file(audio_path).set_channels(1).set_sample_width(2)
         lufs = measure_integrated_lufs(audio_path)
         rms_db = _trimmed_rms_db(audio)
@@ -874,23 +954,6 @@ def check_acx_compliance(book_id: int, db_session: Session, *, export_mode: bool
         duration_seconds = chapter.duration_seconds or (len(audio) / 1000.0)
         file_size_mb = audio_path.stat().st_size / (1024 * 1024)
         bit_depth = audio.sample_width * 8
-
-        def add_violation(issue: str, remediation: str, value: Any, *, chapter_n: int | None = None) -> None:
-            severity = "warning" if export_mode and issue in export_warning_issues else "blocker"
-            label = f"Chapter {chapter_n if chapter_n is not None else chapter.number} {issue}: {remediation}"
-            violations.append(
-                {
-                    "chapter_n": chapter_n if chapter_n is not None else chapter.number,
-                    "issue": issue,
-                    "value": value,
-                    "remediation": remediation,
-                    "severity": severity,
-                }
-            )
-            if severity == "warning":
-                recommendations.append(label)
-            else:
-                blockers.append(label)
 
         if audio.frame_rate != ACX_REQUIREMENTS["sample_rate"]:
             add_violation("sample_rate", "Resample chapter masters to 44.1kHz.", audio.frame_rate)
@@ -917,7 +980,13 @@ def check_acx_compliance(book_id: int, db_session: Session, *, export_mode: bool
         if duration_seconds < ACX_REQUIREMENTS["min_chapter_duration_s"]:
             add_violation("duration_seconds", "Ensure the chapter contains at least one second of audio.", chapter.duration_seconds)
         if duration_seconds > ACX_REQUIREMENTS["max_chapter_duration_s"]:
-            add_violation("duration_seconds_max", "Split files so no chapter exceeds 120 minutes.", chapter.duration_seconds)
+            split_endpoint = f"/api/book/{book_id}/chapter/{chapter.id}/split"
+            add_violation(
+                "duration_seconds_max",
+                f"Split this chapter before export via {split_endpoint}.",
+                chapter.duration_seconds,
+                extra_details={"split_endpoint": split_endpoint},
+            )
         skip_file_size_check = audio_path.suffix.lower() == ".wav" and duration_seconds > (20 * 60)
         if not skip_file_size_check and file_size_mb > ACX_REQUIREMENTS["max_file_size_mb"]:
             add_violation("file_size_mb", "Reduce chapter size below the ACX upload limit.", round(file_size_mb, 3))
@@ -981,6 +1050,190 @@ def check_acx_compliance(book_id: int, db_session: Session, *, export_mode: bool
         recommendations=recommendations or (["All chapters satisfy ACX/Audible requirements."] if not violations else []),
         blockers=blockers,
     )
+
+
+def check_acx_compliance(book_id: int, db_session: Session, *, export_mode: bool = False) -> BookQACheck:
+    """Ensure every chapter meets ACX/Audible production requirements."""
+
+    _, chapters, _ = _require_gate3_ready(book_id, db_session)
+    return _evaluate_acx_compliance_for_chapters(book_id, chapters, export_mode=export_mode)
+
+
+def _readiness_check_payload(
+    *,
+    key: str,
+    label: str,
+    violations: list[dict[str, Any]],
+    relevant_issues: set[str],
+    passing_detail: str,
+    failing_detail: str,
+    critical: bool = True,
+) -> dict[str, Any]:
+    """Build one frontend checklist item from a slice of ACX violations."""
+
+    matched = [violation for violation in violations if violation.get("issue") in relevant_issues]
+    if not matched:
+        return {
+            "key": key,
+            "label": label,
+            "passed": True,
+            "detail": passing_detail,
+            "critical": critical,
+        }
+
+    chapter_numbers = sorted(
+        {
+            int(violation["chapter_n"])
+            for violation in matched
+            if violation.get("chapter_n") is not None
+        }
+    )
+    chapter_detail = (
+        f" Affected chapters: {', '.join(f'#{chapter_n}' for chapter_n in chapter_numbers)}."
+        if chapter_numbers
+        else ""
+    )
+    return {
+        "key": key,
+        "label": label,
+        "passed": False,
+        "detail": f"{failing_detail}{chapter_detail}",
+        "critical": critical,
+    }
+
+
+def build_export_readiness_summary(book_id: int, db_session: Session) -> dict[str, Any]:
+    """Return the consolidated export-readiness payload consumed by the frontend dashboard."""
+
+    _book_or_404(book_id, db_session)
+    chapters = _all_book_chapters(book_id, db_session)
+    qa_records = _load_qa_records(book_id, db_session)
+    acx_result = _evaluate_acx_compliance_for_chapters(book_id, chapters, export_mode=False) if chapters else BookQACheck(
+        status=QAAutomaticStatus.FAIL.value,
+        message="Book has no chapters.",
+        details={"violations": []},
+        recommendations=[],
+        blockers=["Book has no chapters. Parse the manuscript first."],
+    )
+
+    chapters_payload: list[dict[str, Any]] = []
+    blocking_issues = list(acx_result.blockers)
+    warnings: list[str] = []
+
+    for chapter in chapters:
+        grade, issues = _chapter_grade_details(chapter, qa_records.get(chapter.number))
+        chapter_label = chapter.title or f"Chapter {chapter.number}"
+        if grade not in EXPORT_READY_GRADES:
+            if grade in EXPORT_WARNING_GRADES:
+                warnings.append(f"{chapter_label} is grade {grade} and should be reviewed before export.")
+            else:
+                blocking_issues.append(f"{chapter_label} is grade {grade} and blocks export.")
+
+        if chapter.status != ChapterStatus.GENERATED:
+            blocking_issues.append(f"{chapter_label} has not finished audio generation.")
+
+        chapters_payload.append(
+            {
+                "id": chapter.id,
+                "number": chapter.number,
+                "title": chapter.title,
+                "duration_seconds": chapter.duration_seconds,
+                "grade": grade,
+                "issues": issues[:4],
+            }
+        )
+
+    violations = acx_result.details.get("violations", []) if isinstance(acx_result.details, dict) else []
+    acx_checks = [
+        _readiness_check_payload(
+            key="sample_rate",
+            label="Sample rate 44.1 kHz",
+            violations=violations,
+            relevant_issues={"sample_rate", "audio_missing"},
+            passing_detail="All generated chapters are at 44.1 kHz.",
+            failing_detail="One or more chapters still need correct sample-rate export or generated audio.",
+        ),
+        _readiness_check_payload(
+            key="mono",
+            label="All chapters mono",
+            violations=violations,
+            relevant_issues={"channels", "audio_missing"},
+            passing_detail="All generated chapters are mono.",
+            failing_detail="One or more chapters are stereo or missing audio.",
+        ),
+        _readiness_check_payload(
+            key="rms",
+            label="RMS -23 to -18 dB",
+            violations=violations,
+            relevant_issues={"rms_db", "audio_missing"},
+            passing_detail="All generated chapters are within the spoken-word RMS window.",
+            failing_detail="One or more chapters fall outside the RMS window or still need audio.",
+        ),
+        _readiness_check_payload(
+            key="peak",
+            label="Peak below -3 dBTP",
+            violations=violations,
+            relevant_issues={"true_peak_db", "audio_missing"},
+            passing_detail="All generated chapters peak safely below -3 dBTP.",
+            failing_detail="One or more chapters exceed the peak ceiling or still need audio.",
+        ),
+        _readiness_check_payload(
+            key="noise_floor",
+            label="Noise floor below -60 dB",
+            violations=violations,
+            relevant_issues={"noise_floor_db", "audio_missing"},
+            passing_detail="All generated chapters stay below the ACX noise-floor ceiling.",
+            failing_detail="One or more chapters are too noisy or still need audio.",
+        ),
+        _readiness_check_payload(
+            key="room_tone",
+            label="Room tone present",
+            violations=violations,
+            relevant_issues={"room_tone_head_db", "room_tone_tail_db", "leading_silence_ms", "trailing_silence_ms", "audio_missing"},
+            passing_detail="Each chapter has compliant head and tail room tone.",
+            failing_detail="One or more chapters need compliant room tone or still need audio.",
+        ),
+        _readiness_check_payload(
+            key="duration",
+            label="No chapter exceeds 120 minutes",
+            violations=violations,
+            relevant_issues={"duration_seconds_max"},
+            passing_detail="No chapter exceeds the 120-minute ACX maximum.",
+            failing_detail="One or more chapters exceed the ACX maximum and should be split.",
+        ),
+        _readiness_check_payload(
+            key="opening_credits",
+            label="Opening credits present",
+            violations=violations,
+            relevant_issues={"opening_credits"},
+            passing_detail="Opening credits are present.",
+            failing_detail="Opening credits are missing from the chapter sequence.",
+        ),
+        _readiness_check_payload(
+            key="closing_credits",
+            label="Closing credits present",
+            violations=violations,
+            relevant_issues={"closing_credits"},
+            passing_detail="Closing credits are present.",
+            failing_detail="Closing credits are missing from the chapter sequence.",
+        ),
+    ]
+
+    deduped_blockers = list(dict.fromkeys(blocking_issues))
+    deduped_warnings = list(dict.fromkeys(warnings))
+    ready = not deduped_blockers and not deduped_warnings
+    export_anyway_allowed = not deduped_blockers and bool(deduped_warnings)
+    status_label = "READY FOR EXPORT" if ready else "NEEDS ATTENTION"
+
+    return {
+        "ready": ready,
+        "export_anyway_allowed": export_anyway_allowed,
+        "status_label": status_label,
+        "acx_checks": acx_checks,
+        "chapters": chapters_payload,
+        "blocking_issues": deduped_blockers,
+        "warnings": deduped_warnings,
+    }
 
 
 def get_voice_consistency_chart(book_id: int, db_session: Session) -> VoiceConsistencyChart:

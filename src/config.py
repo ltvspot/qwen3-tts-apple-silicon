@@ -16,6 +16,7 @@ DEFAULT_NARRATOR_NAME = "Kent Zimering"
 DEFAULT_MANUSCRIPT_SOURCE_FOLDER = "./Formatted Manuscripts/"
 DEFAULT_ENGINE_MODEL_PATH = "models/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit"
 SETTINGS_DB_KEY = "application_settings"
+VALID_EXPORT_M4B_BITRATES = ("64k", "96k", "128k", "192k", "256k")
 
 
 class RuntimeSettings(BaseSettings):
@@ -32,7 +33,7 @@ class RuntimeSettings(BaseSettings):
     LOG_LEVEL: str = "INFO"
     SETTINGS_CONFIG_FILE: str = "./config.json"
     EXPORT_TARGET_LUFS: float = -19.0
-    EXPORT_M4B_BITRATE: str = "128k"
+    EXPORT_M4B_BITRATE: Literal["64k", "96k", "128k", "192k", "256k"] = "128k"
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -201,6 +202,10 @@ class OutputSettings(BaseModel):
     mp3_bitrate: Literal[128, 192, 256, 320] = Field(
         default=192,
         description="MP3 export bitrate in kbps.",
+    )
+    m4b_bitrate: Literal["64k", "96k", "128k", "192k", "256k"] = Field(
+        default="128k",
+        description="M4B export bitrate.",
     )
     sample_rate: Literal[44100, 48000] = Field(
         default=44100,
@@ -499,6 +504,7 @@ class SettingsFacade:
         "DEFAULT_VOICE_EMOTION": lambda payload: payload.default_voice.emotion,
         "DEFAULT_VOICE_SPEED": lambda payload: payload.default_voice.speed,
         "EXPORT_MP3_BITRATE": lambda payload: f"{payload.output_preferences.mp3_bitrate}k",
+        "EXPORT_M4B_BITRATE": lambda payload: payload.output_preferences.m4b_bitrate,
         "EXPORT_SAMPLE_RATE": lambda payload: payload.output_preferences.sample_rate,
         "EXPORT_CHAPTER_SILENCE_SECONDS": lambda payload: payload.output_preferences.silence_duration_chapters,
         "EXPORT_OPENING_SILENCE_SECONDS": lambda payload: payload.output_preferences.silence_duration_opening,

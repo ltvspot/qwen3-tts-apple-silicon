@@ -57,6 +57,8 @@ WORD_NUMBER_MAP: dict[str, int] = {
     "nineteen": 19,
     "twenty": 20,
 }
+ESTIMATED_NARRATION_WORDS_PER_MINUTE = 150
+AUTO_SPLIT_ESTIMATED_MINUTES = 110.0
 
 
 @dataclass(slots=True, frozen=True)
@@ -66,6 +68,17 @@ class ParsedHeading:
     number: int
     title: str
     type: str
+
+
+@dataclass(slots=True, frozen=True)
+class ParagraphSplitResult:
+    """One paragraph-aware split decision for a chapter body."""
+
+    left_text: str
+    right_text: str
+    paragraph_index: int
+    left_word_count: int
+    right_word_count: int
 
 
 def normalize_text(text: str) -> str:
@@ -100,6 +113,68 @@ def count_words(text: str) -> int:
     """Count words using the same loose tokenization as the DOCX parser."""
 
     return len(re.findall(r"\b[\w']+\b", text))
+
+
+def estimate_duration_minutes(word_count: int | None, *, words_per_minute: int = ESTIMATED_NARRATION_WORDS_PER_MINUTE) -> float:
+    """Estimate narration duration for a chapter body using a stable spoken-word WPM."""
+
+    safe_word_count = max(int(word_count or 0), 0)
+    return safe_word_count / max(words_per_minute, 1)
+
+
+def split_into_paragraphs(text: str) -> list[str]:
+    """Return the non-empty paragraphs contained in a narration body."""
+
+    paragraphs = re.split(r"\n\s*\n", text)
+    return [normalize_text(paragraph) for paragraph in paragraphs if normalize_text(paragraph)]
+
+
+def split_text_at_paragraph(
+    text: str,
+    *,
+    paragraph_index: int | None = None,
+) -> ParagraphSplitResult | None:
+    """Split chapter text on a paragraph boundary, defaulting to the midpoint by word count."""
+
+    paragraphs = split_into_paragraphs(text)
+    if len(paragraphs) < 2:
+        return None
+
+    word_counts = [count_words(paragraph) for paragraph in paragraphs]
+    if paragraph_index is None:
+        total_words = sum(word_counts)
+        if total_words <= 0:
+            return None
+        target_words = total_words / 2.0
+        running_words = 0
+        best_index = 1
+        best_delta = float("inf")
+        for candidate_index in range(1, len(paragraphs)):
+            running_words += word_counts[candidate_index - 1]
+            delta = abs(running_words - target_words)
+            if delta < best_delta:
+                best_delta = delta
+                best_index = candidate_index
+        split_index = best_index
+    else:
+        split_index = paragraph_index + 1
+        if split_index <= 0 or split_index >= len(paragraphs):
+            raise ValueError(
+                f"paragraph_index must reference an internal paragraph boundary between 0 and {len(paragraphs) - 2}."
+            )
+
+    left_text = normalize_multiline_text(paragraphs[:split_index])
+    right_text = normalize_multiline_text(paragraphs[split_index:])
+    if not left_text or not right_text:
+        return None
+
+    return ParagraphSplitResult(
+        left_text=left_text,
+        right_text=right_text,
+        paragraph_index=split_index - 1,
+        left_word_count=count_words(left_text),
+        right_word_count=count_words(right_text),
+    )
 
 
 def is_front_matter_heading(text: str) -> bool:

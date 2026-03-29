@@ -1,6 +1,8 @@
 import PropTypes from "prop-types";
 import React, { useEffect, useState } from "react";
 
+const M4B_BITRATE_OPTIONS = ["64k", "96k", "128k", "192k", "256k"];
+
 function chapterDurationSeconds(chapter) {
   return chapter.audio_duration_seconds ?? chapter.duration_seconds ?? 0;
 }
@@ -29,6 +31,21 @@ function isFlaggedChapter(chapter) {
   return chapter?.qa_status === "needs_review" || chapter?.qa_status === "flagged";
 }
 
+function estimateM4bFileSize(durationSeconds, bitrate) {
+  if (!durationSeconds || !bitrate) {
+    return null;
+  }
+
+  const bitrateKbps = Number.parseInt(String(bitrate).replace("k", ""), 10);
+  if (Number.isNaN(bitrateKbps) || bitrateKbps <= 0) {
+    return null;
+  }
+
+  const estimatedBytes = (durationSeconds * bitrateKbps * 1000) / 8;
+  const estimatedMegabytes = estimatedBytes / (1024 * 1024);
+  return `${estimatedMegabytes.toFixed(1)} MB`;
+}
+
 export default function ExportDialog({
   chapters = [],
   open = false,
@@ -39,17 +56,18 @@ export default function ExportDialog({
   const [includeM4b, setIncludeM4b] = useState(true);
   const [includeMp3, setIncludeMp3] = useState(true);
   const [includeOnlyApproved, setIncludeOnlyApproved] = useState(true);
+  const [m4bBitrate, setM4bBitrate] = useState("128k");
   const [validationMessage, setValidationMessage] = useState("");
   const exportableChapters = chapters;
   const includedChapters = includeOnlyApproved
     ? exportableChapters.filter((chapter) => !isFlaggedChapter(chapter))
     : exportableChapters;
-  const estimatedDuration = formatEstimatedDuration(
-    includedChapters.reduce(
-      (totalDuration, chapter) => totalDuration + chapterDurationSeconds(chapter),
-      0,
-    ),
+  const totalDurationSeconds = includedChapters.reduce(
+    (totalDuration, chapter) => totalDuration + chapterDurationSeconds(chapter),
+    0,
   );
+  const estimatedDuration = formatEstimatedDuration(totalDurationSeconds);
+  const estimatedM4bSize = estimateM4bFileSize(totalDurationSeconds, m4bBitrate);
 
   useEffect(() => {
     if (!open) {
@@ -59,6 +77,7 @@ export default function ExportDialog({
     setIncludeMp3(true);
     setIncludeM4b(true);
     setIncludeOnlyApproved(true);
+    setM4bBitrate("128k");
     setValidationMessage("");
   }, [open]);
 
@@ -80,6 +99,7 @@ export default function ExportDialog({
     onSubmit({
       formats,
       include_only_approved: includeOnlyApproved,
+      m4b_bitrate: includeM4b ? m4bBitrate : null,
     });
   }
 
@@ -144,6 +164,34 @@ export default function ExportDialog({
               </span>
             </span>
           </label>
+
+          {includeM4b ? (
+            <div className="rounded-3xl border border-white/10 bg-slate-950/45 px-4 py-4">
+              <label className="block text-sm font-semibold text-white" htmlFor="m4b-bitrate">
+                M4B Bitrate
+              </label>
+              <p className="mt-2 text-sm text-slate-300">
+                128k is recommended for spoken word. Higher bitrates increase file size with limited narration benefit.
+              </p>
+              <div className="mt-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                <select
+                  className="rounded-2xl border border-white/10 bg-slate-950 px-4 py-3 text-sm text-white outline-none transition focus:border-amber-300/40"
+                  id="m4b-bitrate"
+                  onChange={(event) => setM4bBitrate(event.target.value)}
+                  value={m4bBitrate}
+                >
+                  {M4B_BITRATE_OPTIONS.map((option) => (
+                    <option key={option} value={option}>
+                      {option}
+                    </option>
+                  ))}
+                </select>
+                <div className="text-sm text-slate-400">
+                  Estimated M4B size: {estimatedM4bSize ?? "Pending"}
+                </div>
+              </div>
+            </div>
+          ) : null}
 
           <label className="flex items-start gap-3 rounded-3xl border border-amber-300/20 bg-amber-400/10 px-4 py-4">
             <input

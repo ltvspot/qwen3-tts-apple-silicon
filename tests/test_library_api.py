@@ -34,6 +34,32 @@ def _create_sample_docx(docx_path: Path) -> None:
     document.save(docx_path)
 
 
+def _create_long_chapter_docx(docx_path: Path) -> None:
+    """Create a manuscript whose first chapter should auto-split during parsing."""
+
+    document = Document()
+    document.add_paragraph("The Long Chronicle", style="Title")
+    document.add_paragraph("by Jane Doe")
+    document.add_paragraph("Chapter I. The Endless Chapter", style="Heading 1")
+    paragraph_text = " ".join(["strategy"] * 2300)
+    for _ in range(8):
+        document.add_paragraph(paragraph_text)
+    document.save(docx_path)
+
+
+def _create_split_ready_docx(docx_path: Path) -> None:
+    """Create a manuscript with a chapter that has multiple paragraph boundaries."""
+
+    document = Document()
+    document.add_paragraph("The Split Chronicle", style="Title")
+    document.add_paragraph("by Jane Doe")
+    document.add_paragraph("Chapter I. The Middle", style="Heading 1")
+    document.add_paragraph("First paragraph for the split test.")
+    document.add_paragraph("Second paragraph for the split test.")
+    document.add_paragraph("Third paragraph for the split test.")
+    document.save(docx_path)
+
+
 def _create_library_folder(root: Path, folder_name: str, *, with_docx: bool = True) -> Path:
     """Create a temporary manuscript folder for tests."""
 
@@ -330,6 +356,129 @@ def test_parse_book_flow_and_chapter_updates(
     assert overwrite_response.status_code == 200
     assert overwrite_response.json()["chapters_detected"] == 4
     assert test_db.query(Chapter).filter(Chapter.book_id == book.id).count() == 4
+
+
+def test_parse_book_auto_splits_oversized_chapter(
+    client: TestClient,
+    test_db: Session,
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    """Parsing should split chapters that exceed the estimated ACX safety margin."""
+
+    folder_name = "1007-Long-Chronicle-6x9-999"
+    folder = tmp_path / folder_name
+    folder.mkdir(parents=True, exist_ok=True)
+    _create_long_chapter_docx(folder / f"{folder_name}-Word-6x9-Clean.docx")
+    monkeypatch.setattr(settings, "FORMATTED_MANUSCRIPTS_PATH", str(tmp_path))
+
+    assert client.post("/api/library/scan").status_code == 200
+    book = test_db.query(Book).filter(Book.folder_path == folder_name).one()
+
+    parse_response = client.post(f"/api/book/{book.id}/parse", json={})
+    assert parse_response.status_code == 200
+    assert parse_response.json()["chapters_detected"] == 4
+
+    chapters = test_db.query(Chapter).filter(Chapter.book_id == book.id).order_by(Chapter.number.asc()).all()
+    assert [chapter.number for chapter in chapters] == [0, 1, 2, 3]
+    assert chapters[1].title.endswith("(Part 1)")
+    assert chapters[2].title.endswith("(Part 2)")
+
+
+def test_manual_split_endpoint_splits_chapter_and_renumbers_following_segments(
+    client: TestClient,
+    test_db: Session,
+    tmp_path: Path,
+    monkeypatch: object,
+) -> None:
+    """Manual split should create two pending chapters and push later numbers forward."""
+
+    folder_name = "1008-Split-Chronicle-6x9-155"
+    folder = tmp_path / folder_name
+    folder.mkdir(parents=True, exist_ok=True)
+    _create_split_ready_docx(folder / f"{folder_name}-Word-6x9-Clean.docx")
+    monkeypatch.setattr(settings, "FORMATTED_MANUSCRIPTS_PATH", str(tmp_path))
+
+    assert client.post("/api/library/scan").status_code == 200
+    book = test_db.query(Book).filter(Book.folder_path == folder_name).one()
+    assert client.post(f"/api/book/{book.id}/parse", json={}).status_code == 200
+
+    chapter_to_split = (
+        test_db.query(Chapter)
+        .filter(Chapter.book_id == book.id, Chapter.number == 1)
+        .one()
+    )
+    response = client.post(
+        f"/api/book/{book.id}/chapter/{chapter_to_split.id}/split",
+        json={"paragraph_index": 0},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert [chapter["number"] for chapter in payload] == [1, 2]
+    assert payload[0]["title"].endswith("(Part 1)")
+    assert payload[1]["title"].endswith("(Part 2)")
+    assert payload[0]["status"] == "pending"
+    assert payload[1]["status"] == "pending"
+
+    chapters = test_db.query(Chapter).filter(Chapter.book_id == book.id).order_by(Chapter.number.asc()).all()
+    assert [chapter.number for chapter in chapters] == [0, 1, 2, 3]
+    assert chapters[3].title == "Closing Credits"
+
+
+def test_export_readiness_endpoint_returns_consolidated_summary(
+    client: TestClient,
+    test_db: Session,
+    monkeypatch,
+) -> None:
+    """The export-readiness endpoint should expose the consolidated frontend summary payload."""
+
+    monkeypatch.setattr(
+        "src.api.routes.build_export_readiness_summary",
+        lambda book_id, db: {
+            "ready": False,
+            "export_anyway_allowed": True,
+            "status_label": "NEEDS ATTENTION",
+            "acx_checks": [
+                {
+                    "key": "sample_rate",
+                    "label": "Sample rate 44.1 kHz",
+                    "passed": True,
+                    "detail": "All generated chapters are at 44.1 kHz.",
+                    "critical": True,
+                }
+            ],
+            "chapters": [
+                {
+                    "id": 12,
+                    "number": 1,
+                    "title": "Chapter One",
+                    "duration_seconds": 600.0,
+                    "grade": "C",
+                    "issues": ["Chapter needs a final review."],
+                }
+            ],
+            "blocking_issues": [],
+            "warnings": ["Chapter One is grade C and should be reviewed before export."],
+        },
+    )
+
+    book = Book(
+        title="Readiness Test",
+        author="Jane Doe",
+        folder_path="1009-readiness-test",
+    )
+    test_db.add(book)
+    test_db.commit()
+
+    response = client.get(f"/api/book/{book.id}/export-readiness")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ready"] is False
+    assert payload["export_anyway_allowed"] is True
+    assert payload["acx_checks"][0]["key"] == "sample_rate"
+    assert payload["chapters"][0]["grade"] == "C"
 
 
 def test_parse_book_uses_epub_fallback(
