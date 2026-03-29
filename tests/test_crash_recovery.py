@@ -156,7 +156,7 @@ class RecordingGenerator:
 
 
 def test_orphaned_job_detected(test_db: Session) -> None:
-    """Stale running jobs should be marked failed on startup recovery."""
+    """Stale running jobs should be reset to queued for automatic retry."""
 
     book = _create_book(test_db, title="Orphaned Job Book")
     test_db.add(
@@ -182,9 +182,8 @@ def test_orphaned_job_detected(test_db: Session) -> None:
     job = test_db.query(GenerationJob).one()
 
     assert recovered == 1
-    assert job.status == GenerationJobStatus.FAILED
-    assert "Server restarted during generation." in (job.error_message or "")
-    assert "Completed 2/5 chapters." in (job.error_message or "")
+    assert job.status == GenerationJobStatus.QUEUED
+    assert job.error_message is None
 
 
 def test_orphaned_chapter_reset(test_db: Session) -> None:
@@ -221,11 +220,11 @@ def test_orphaned_chapter_reset(test_db: Session) -> None:
     assert chapter.status == ChapterStatus.PENDING
     assert chapter.started_at is None
     assert chapter.current_chunk is None
-    assert book.generation_status == BookGenerationStatus.ERROR
+    assert book.generation_status == BookGenerationStatus.GENERATING
 
 
 def test_startup_cleanup_resets_running_jobs_and_generating_chapters(test_db: Session) -> None:
-    """Startup cleanup should clear stale queued/running state before recovery begins."""
+    """Startup cleanup should convert interrupted work into resumable queued jobs."""
 
     book = _create_book(test_db, title="Startup Cleanup Book")
     book.status = BookStatus.GENERATING
@@ -251,20 +250,20 @@ def test_startup_cleanup_resets_running_jobs_and_generating_chapters(test_db: Se
     test_db.add(job)
     test_db.commit()
 
-    cleaned_jobs, cleaned_chapters = cleanup_startup_generation_state(test_db)
+    recovered_jobs, queued_jobs = cleanup_startup_generation_state(test_db)
     test_db.refresh(job)
     test_db.refresh(chapter)
     test_db.refresh(book)
 
-    assert (cleaned_jobs, cleaned_chapters) == (1, 1)
-    assert job.status == GenerationJobStatus.FAILED
-    assert "Server restarted during generation" in (job.error_message or "")
+    assert (recovered_jobs, queued_jobs) == (1, 0)
+    assert job.status == GenerationJobStatus.QUEUED
+    assert job.error_message is None
     assert chapter.status == ChapterStatus.PENDING
     assert chapter.audio_path is None
     assert chapter.duration_seconds is None
     assert chapter.current_chunk is None
     assert book.status == BookStatus.PARSED
-    assert book.generation_status == BookGenerationStatus.ERROR
+    assert book.generation_status == BookGenerationStatus.GENERATING
 
 
 def test_startup_cleanup_repairs_invalid_generation_job_statuses(test_db: Session) -> None:
@@ -287,10 +286,10 @@ def test_startup_cleanup_repairs_invalid_generation_job_statuses(test_db: Sessio
     test_db.execute(text("UPDATE generation_jobs SET status = 'error' WHERE id = :job_id"), {"job_id": job.id})
     test_db.commit()
 
-    cleaned_jobs, cleaned_chapters = cleanup_startup_generation_state(test_db)
+    recovered_jobs, queued_jobs = cleanup_startup_generation_state(test_db)
 
     repaired_job = test_db.query(GenerationJob).filter(GenerationJob.id == job.id).one()
-    assert (cleaned_jobs, cleaned_chapters) == (0, 0)
+    assert (recovered_jobs, queued_jobs) == (0, 0)
     assert repaired_job.status == GenerationJobStatus.FAILED
     assert repaired_job.error_message == "Legacy invalid generation job status repaired to failed."
 
@@ -321,6 +320,49 @@ def test_fresh_job_not_recovered(test_db: Session) -> None:
 
     assert recovered == 0
     assert job.status == GenerationJobStatus.RUNNING
+
+
+def test_queue_stale_detection_requeues_running_job(test_db: Session) -> None:
+    """The queue maintenance path should reset stale running jobs to queued."""
+
+    queue = GenerationQueue(max_workers=1)
+    queue._db_session_maker = sessionmaker(
+        bind=test_db.get_bind(),
+        autoflush=False,
+        autocommit=False,
+        expire_on_commit=False,
+    )
+
+    book = _create_book(test_db, title="Stale Queue Book")
+    book.status = BookStatus.GENERATING
+    book.generation_status = BookGenerationStatus.GENERATING
+    chapter = _create_chapter(test_db, book_id=book.id, number=1, status=ChapterStatus.GENERATING)
+    job = GenerationJob(
+        book_id=book.id,
+        chapter_id=chapter.id,
+        job_type=GenerationJobType.SINGLE_CHAPTER,
+        status=GenerationJobStatus.RUNNING,
+        progress=15.0,
+        current_chapter_progress=20.0,
+        chapters_total=1,
+        chapters_completed=0,
+        chapters_failed=0,
+        current_chapter_n=1,
+        updated_at=utc_now() - timedelta(minutes=6),
+        force=False,
+    )
+    test_db.add(job)
+    test_db.commit()
+
+    requeued_job_ids = queue._requeue_stale_jobs()
+
+    test_db.refresh(job)
+    test_db.refresh(chapter)
+    test_db.refresh(book)
+    assert requeued_job_ids == [job.id]
+    assert job.status == GenerationJobStatus.QUEUED
+    assert chapter.status == ChapterStatus.PENDING
+    assert book.generation_status == BookGenerationStatus.GENERATING
 
 
 def test_startup_export_cleanup_recovers_existing_files(test_db: Session) -> None:
@@ -681,6 +723,48 @@ async def test_checkpoint_saved(test_db: Session) -> None:
 
 
 @pytest.mark.asyncio
+async def test_resume_pending_jobs_processes_recovered_queue(test_db: Session) -> None:
+    """Startup resume should wake queued work without manual re-enqueueing."""
+
+    queue = GenerationQueue(max_workers=1)
+    session_factory = sessionmaker(
+        bind=test_db.get_bind(),
+        autoflush=False,
+        autocommit=False,
+        expire_on_commit=False,
+    )
+    generator = RecordingGenerator()
+
+    book = _create_book(test_db, title="Auto Resume Queue Book")
+    _create_chapter(test_db, book_id=book.id, number=1)
+    queued_job = GenerationJob(
+        book_id=book.id,
+        job_type=GenerationJobType.FULL_BOOK,
+        status=GenerationJobStatus.QUEUED,
+        progress=0.0,
+        current_chapter_progress=0.0,
+        chapters_total=1,
+        chapters_completed=0,
+        chapters_failed=0,
+        current_chapter_n=1,
+        force=False,
+    )
+    test_db.add(queued_job)
+    test_db.commit()
+
+    await queue.start(session_factory, generator)
+    resumed_count = await queue.resume_pending_jobs()
+    await queue.wait_until_idle()
+
+    test_db.refresh(queued_job)
+    assert resumed_count == 1
+    assert queued_job.status == GenerationJobStatus.COMPLETED
+    assert generator.generated == [1]
+
+    await queue.stop()
+
+
+@pytest.mark.asyncio
 async def test_resume_skips_completed(test_db: Session) -> None:
     """Resumed jobs should skip chapters that were already generated before the crash."""
 
@@ -737,7 +821,7 @@ async def test_resume_skips_completed(test_db: Session) -> None:
 
 @pytest.mark.asyncio
 async def test_graceful_shutdown_pauses_job(test_db: Session) -> None:
-    """Saving and pausing active jobs should checkpoint and reset in-progress chapters."""
+    """Graceful shutdown should queue active jobs for auto-resume without surfacing an error."""
 
     queue = GenerationQueue(max_workers=1)
     session_factory = sessionmaker(
@@ -770,16 +854,16 @@ async def test_graceful_shutdown_pauses_job(test_db: Session) -> None:
     queue._store_job_snapshot(job)
     queue.active_jobs.add(job.id)
 
-    await queue.save_and_pause_active_jobs()
+    await queue.save_and_requeue_active_jobs()
 
     test_db.refresh(job)
     test_db.refresh(chapter)
     test_db.refresh(book)
-    assert job.status == GenerationJobStatus.PAUSED
-    assert job.pause_requested is True
-    assert job.error_message == "Server shutdown — job paused. Will resume on restart."
+    assert job.status == GenerationJobStatus.QUEUED
+    assert job.pause_requested is False
+    assert job.error_message is None
     assert chapter.status == ChapterStatus.PENDING
-    assert book.generation_status == BookGenerationStatus.IDLE
+    assert book.generation_status == BookGenerationStatus.GENERATING
 
 
 def test_sqlite_wal_mode(tmp_path: Path) -> None:

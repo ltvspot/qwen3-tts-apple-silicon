@@ -78,62 +78,82 @@ def repair_invalid_generation_job_statuses(db_session: Session, *, book_id: int 
 
 @retry_on_locked()
 def cleanup_startup_generation_state(db_session: Session) -> tuple[int, int]:
-    """Reset queued/running jobs left behind by a prior process exit."""
+    """Recover queued/running jobs left behind by a prior process exit."""
 
     repair_invalid_generation_job_statuses(db_session)
-    stale_jobs = (
+    active_jobs = (
         db_session.query(GenerationJob)
         .filter(GenerationJob.status.in_((GenerationJobStatus.RUNNING, GenerationJobStatus.QUEUED)))
+        .order_by(GenerationJob.priority.desc(), GenerationJob.created_at.asc(), GenerationJob.id.asc())
         .all()
     )
-    stale_chapters = (
-        db_session.query(Chapter)
-        .filter(Chapter.status == ChapterStatus.GENERATING)
-        .all()
-    )
+    recovered_jobs = 0
+    queued_jobs = 0
 
-    for job in stale_jobs:
-        job.status = GenerationJobStatus.FAILED
-        job.completed_at = utc_now()
+    for job in active_jobs:
+        if job.status == GenerationJobStatus.RUNNING:
+            recovered_jobs += 1
+            logger.info(
+                "Recovering interrupted job %s for book %s - resetting to queued",
+                job.id,
+                job.book_id,
+            )
+        else:
+            queued_jobs += 1
+            logger.info(
+                "Found pending queued job %s for book %s - will resume",
+                job.id,
+                job.book_id,
+            )
+
+        job.status = GenerationJobStatus.QUEUED
+        job.completed_at = None
+        job.paused_at = None
         job.pause_requested = False
         job.cancel_requested = False
         job.current_chapter_progress = 0.0
-        job.eta_seconds = None
-        job.error_message = "Server restarted during generation. Job reset for retry."
+        job.error_message = None
 
         book = db_session.query(Book).filter(Book.id == job.book_id).first()
         if book is not None:
             if book.status == BookStatus.GENERATING:
                 book.status = BookStatus.PARSED
-            book.generation_status = BookGenerationStatus.ERROR
-            book.generation_eta_seconds = None
-            if book.current_job_id == job.id:
-                book.current_job_id = None
+            book.generation_status = BookGenerationStatus.GENERATING
+            book.generation_eta_seconds = job.eta_seconds
+            book.current_job_id = job.id
 
-    for chapter in stale_chapters:
-        chapter.status = ChapterStatus.PENDING
-        chapter.audio_path = None
-        chapter.duration_seconds = None
-        chapter.started_at = None
-        chapter.completed_at = None
-        chapter.error_message = None
-        chapter.current_chunk = None
-        chapter.total_chunks = None
-        chapter.chunk_boundaries = None
-        chapter.generation_metadata = None
+        interrupted_chapters = (
+            db_session.query(Chapter)
+            .filter(
+                Chapter.book_id == job.book_id,
+                Chapter.status == ChapterStatus.GENERATING,
+            )
+            .all()
+        )
+        for chapter in interrupted_chapters:
+            chapter.status = ChapterStatus.PENDING
+            chapter.audio_path = None
+            chapter.duration_seconds = None
+            chapter.started_at = None
+            chapter.completed_at = None
+            chapter.error_message = None
+            chapter.current_chunk = None
+            chapter.total_chunks = None
+            chapter.chunk_boundaries = None
+            chapter.generation_metadata = None
 
     db_session.commit()
     logger.info(
-        "Cleaned up %s stale jobs and %s stale chapters on startup",
-        len(stale_jobs),
-        len(stale_chapters),
+        "Server startup: recovered %s interrupted jobs, %s queued jobs - resuming generation",
+        recovered_jobs,
+        queued_jobs,
     )
-    return (len(stale_jobs), len(stale_chapters))
+    return (recovered_jobs, queued_jobs)
 
 
 @retry_on_locked()
 def recover_orphaned_jobs(db_session: Session) -> int:
-    """Detect and recover generation jobs interrupted by a prior crash."""
+    """Detect stale running generation jobs and reset them to queued for retry."""
 
     repair_invalid_generation_job_statuses(db_session)
     stale_cutoff = utc_now() - timedelta(minutes=STALE_THRESHOLD_MINUTES)
@@ -149,27 +169,18 @@ def recover_orphaned_jobs(db_session: Session) -> int:
     if not orphaned_jobs:
         return 0
 
-    recovered_at = utc_now()
     for job in orphaned_jobs:
         logger.warning(
-            "Recovering orphaned job %s (book=%s, status=%s, last_update=%s)",
+            "Stale job detection: reset job %s (no progress for 5+ minutes)",
             job.id,
-            job.book_id,
-            job.status.value if isinstance(job.status, GenerationJobStatus) else job.status,
-            job.updated_at,
         )
-        job.status = GenerationJobStatus.FAILED
-        job.completed_at = recovered_at
+        job.status = GenerationJobStatus.QUEUED
+        job.completed_at = None
+        job.paused_at = None
         job.pause_requested = False
         job.cancel_requested = False
         job.current_chapter_progress = 0.0
-        job.eta_seconds = None
-        job.error_message = (
-            "Server restarted during generation. "
-            f"Last active: {job.updated_at.isoformat()}. "
-            f"Completed {job.chapters_completed}/{job.chapters_total} chapters. "
-            "Use 'Retry' to resume from the last checkpoint."
-        )
+        job.error_message = None
 
         in_progress_chapters = (
             db_session.query(Chapter)
@@ -192,13 +203,12 @@ def recover_orphaned_jobs(db_session: Session) -> int:
         if book is not None:
             if book.status == BookStatus.GENERATING:
                 book.status = BookStatus.PARSED
-            book.generation_status = BookGenerationStatus.ERROR
-            book.generation_eta_seconds = None
-            if book.current_job_id == job.id:
-                book.current_job_id = None
+            book.generation_status = BookGenerationStatus.GENERATING
+            book.generation_eta_seconds = job.eta_seconds
+            book.current_job_id = job.id
 
     db_session.commit()
-    logger.info("Recovered %s orphaned job(s)", len(orphaned_jobs))
+    logger.info("Recovered %s stale job(s) for retry", len(orphaned_jobs))
     return len(orphaned_jobs)
 
 
@@ -213,7 +223,7 @@ def run_startup_recovery() -> int:
 
 
 def run_startup_cleanup() -> tuple[int, int]:
-    """Reset queued/running generation state left behind by a prior process."""
+    """Recover queued/running generation state left behind by a prior process."""
 
     session = SessionLocal()
     try:
@@ -279,13 +289,14 @@ async def _graceful_shutdown_impl(trigger: str | None) -> None:
         queue = peek_queue()
         if queue is not None:
             queue.request_drain()
+            await queue.request_shutdown_checkpoint()
             for remaining in range(30, 0, -1):
                 if not queue.has_active_work():
                     break
                 await asyncio.sleep(1)
                 logger.info("Draining... %ss remaining", remaining - 1)
 
-            await queue.save_and_pause_active_jobs()
+            await queue.save_and_requeue_active_jobs()
 
         await shutdown_generation_runtime()
         logger.info("Graceful shutdown complete")

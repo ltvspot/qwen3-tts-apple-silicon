@@ -869,6 +869,48 @@ async def test_generate_chapter_resumes_from_chunk_checkpoints(test_db: Session)
 
 
 @pytest.mark.asyncio
+async def test_generate_chapter_recovers_existing_wav_without_regeneration(test_db: Session) -> None:
+    """A final chapter WAV on disk should be reused as the resume checkpoint."""
+
+    initial_generator = AudiobookGenerator(Qwen3TTS(backend="synthetic"))
+    book = create_book(test_db, title="Existing WAV Resume Book")
+    chapter = create_chapter(
+        test_db,
+        book_id=book.id,
+        number=1,
+        title="Existing WAV Resume Chapter",
+        chapter_type=ChapterType.CHAPTER,
+        text="This chapter should reuse the existing WAV file on resume.",
+    )
+
+    original_duration = await initial_generator.generate_chapter(book.id, chapter, test_db)
+    test_db.refresh(chapter)
+
+    chapter.status = ChapterStatus.FAILED
+    chapter.audio_path = None
+    chapter.duration_seconds = None
+    chapter.started_at = None
+    chapter.completed_at = None
+    chapter.error_message = "Interrupted after writing WAV."
+    chapter.current_chunk = None
+    chapter.total_chunks = None
+    chapter.chunk_boundaries = None
+    chapter.generation_metadata = None
+    test_db.commit()
+
+    resume_engine = RecordingCheckpointEngine()
+    resume_generator = AudiobookGenerator(resume_engine)
+    recovered_duration = await resume_generator.generate_chapter(book.id, chapter, test_db)
+
+    test_db.refresh(chapter)
+    metadata = json.loads(chapter.generation_metadata or "{}")
+    assert recovered_duration == pytest.approx(original_duration, rel=0.05)
+    assert chapter.status == ChapterStatus.GENERATED
+    assert metadata["recovered_from_existing_wav"] is True
+    assert resume_engine.calls == []
+
+
+@pytest.mark.asyncio
 async def test_generation_queue_processes_fifo_and_cancels_queued_jobs(test_db: Session) -> None:
     """The queue should process jobs in order and allow queued cancellation."""
 

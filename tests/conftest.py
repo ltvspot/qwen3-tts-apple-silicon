@@ -123,10 +123,13 @@ def client(test_db: Session, monkeypatch: pytest.MonkeyPatch) -> Generator[TestC
         ]
         return StartupHealthSummary(checked_at=utc_now(), checks=checks, warnings=[], errors=[])
 
+    async def fake_start_generation_runtime(*, resume_pending: bool = False) -> None:
+        del resume_pending
+
     monkeypatch.setattr("src.main.init_db", lambda: None)
     monkeypatch.setattr("src.main.run_startup_cleanup", lambda: (0, 0))
     monkeypatch.setattr("src.main.run_export_startup_cleanup", lambda: (0, 0))
-    monkeypatch.setattr("src.main.run_startup_recovery", lambda: 0)
+    monkeypatch.setattr("src.main.start_generation_runtime", fake_start_generation_runtime)
     monkeypatch.setattr("src.main.install_signal_handlers", lambda: None)
     monkeypatch.setattr("src.main.run_all_health_checks", fake_health_checks)
 

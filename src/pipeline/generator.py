@@ -136,7 +136,7 @@ class AudiobookGenerator:
         for chapter_index, chapter in enumerate(chapters):
             self._raise_if_cancelled(should_cancel)
 
-            if chapter.status == ChapterStatus.GENERATED and not force:
+            if chapter.status == ChapterStatus.GENERATED and not force and self.chapter_audio_exists(book_id, chapter):
                 if progress_callback is not None:
                     await progress_callback(chapter.number, ((chapter_index + 1) / len(chapters)) * 100)
                 continue
@@ -242,13 +242,26 @@ class AudiobookGenerator:
     ) -> float:
         """Generate and persist audio for a single chapter."""
 
-        engine = await self._get_engine()
-
         text_content = (chapter.text_content or "").strip()
         if not text_content:
             raise ValueError(f"Chapter {chapter.number} has no text content")
-        if chapter.status == ChapterStatus.GENERATED and not force:
-            raise ValueError(f"Chapter {chapter.number} already has generated audio")
+        if not force:
+            recovered_duration = await self._recover_existing_chapter_audio(book_id, chapter, db_session)
+            if recovered_duration is not None:
+                logger.info(
+                    "Recovered existing WAV for book %s chapter %s - skipping regeneration",
+                    book_id,
+                    chapter.number,
+                )
+                return recovered_duration
+            if chapter.status == ChapterStatus.GENERATED:
+                logger.warning(
+                    "Book %s chapter %s was marked generated but no reusable WAV was found; regenerating",
+                    book_id,
+                    chapter.number,
+                )
+
+        engine = await self._get_engine()
 
         logger.info(
             "Generating audio for book %s chapter %s (%s words)",
@@ -1096,6 +1109,107 @@ class AudiobookGenerator:
 
         return self._get_chunk_checkpoint_dir(book_id, chapter) / f"{chunk_index:04d}.wav"
 
+    def chapter_audio_exists(self, book_id: int, chapter: Chapter) -> bool:
+        """Return whether a reusable chapter WAV already exists on disk."""
+
+        candidate = self._existing_chapter_audio_path(book_id, chapter)
+        if candidate is None:
+            return False
+        try:
+            return candidate.exists() and candidate.stat().st_size > 0
+        except OSError:
+            return False
+
+    def _existing_chapter_audio_path(self, book_id: int, chapter: Chapter) -> Path | None:
+        """Return the best on-disk chapter audio candidate, if one exists."""
+
+        stored_path = self._resolve_stored_audio_path(chapter.audio_path)
+        if stored_path is not None and stored_path.exists():
+            return stored_path
+
+        try:
+            expected_path = self._get_chapter_audio_path(book_id, chapter)
+        except ValueError:
+            return stored_path
+        return expected_path if expected_path.exists() else stored_path
+
+    async def _recover_existing_chapter_audio(
+        self,
+        book_id: int,
+        chapter: Chapter,
+        db_session: Session,
+    ) -> float | None:
+        """Restore chapter state from an existing WAV on disk without regenerating audio."""
+
+        audio_path = self._existing_chapter_audio_path(book_id, chapter)
+        if audio_path is None:
+            return None
+
+        try:
+            audio = await asyncio.to_thread(AudioSegment.from_file, audio_path)
+        except Exception:
+            logger.warning("Discarding unreadable chapter WAV at %s", audio_path, exc_info=True)
+            audio_path.unlink(missing_ok=True)
+            return None
+
+        duration = len(audio) / 1000.0
+        if duration <= 0:
+            logger.warning("Discarding empty chapter WAV at %s", audio_path)
+            audio_path.unlink(missing_ok=True)
+            return None
+
+        chunk_checkpoint_count = len(list(self._get_chunk_checkpoint_dir(book_id, chapter).glob("*.wav")))
+        chapter.status = ChapterStatus.GENERATED
+        chapter.audio_path = str(audio_path.resolve().relative_to(self.output_path.resolve()))
+        chapter.duration_seconds = duration
+        chapter.started_at = chapter.started_at or chapter.completed_at or utc_now()
+        chapter.completed_at = utc_now()
+        chapter.error_message = None
+        chapter.current_chunk = chunk_checkpoint_count or chapter.total_chunks
+        if chapter.total_chunks is None and chunk_checkpoint_count:
+            chapter.total_chunks = chunk_checkpoint_count
+        chapter.audio_file_size_bytes = audio_path.stat().st_size
+
+        qa_notification_reason: str | None = None
+        manual_review_notes: list[str] = []
+        try:
+            qa_result = await run_qa_checks_for_chapter(chapter)
+            chapter.status = ChapterStatus.GENERATED
+            if qa_result.has_failures:
+                qa_notification_reason = next(
+                    (
+                        check.message
+                        for check in qa_result.checks
+                        if check.status == "fail" and check.message
+                    ),
+                    "Automatic QA flagged the chapter for review.",
+                )
+        except Exception as exc:
+            qa_notification_reason = self._format_qa_exception(exc)
+            manual_review_notes.append(qa_notification_reason)
+            chapter.status = ChapterStatus.GENERATED_NO_QA
+            chapter.error_message = qa_notification_reason
+            logger.exception(
+                "Automatic QA failed while recovering book %s chapter %s from disk",
+                book_id,
+                chapter.number,
+            )
+            qa_result = self._build_qa_error_result(chapter, qa_notification_reason)
+
+        persist_qa_result(db_session, chapter, qa_result)
+        self._flag_manual_review(chapter, manual_review_notes)
+        self._merge_generation_metadata(chapter, {"recovered_from_existing_wav": True})
+        db_session.commit()
+
+        if qa_notification_reason is not None:
+            send_qa_failure_notification(
+                book_id=book_id,
+                chapter_number=chapter.number,
+                reason=qa_notification_reason,
+            )
+
+        return duration
+
     def _load_chunk_checkpoint(self, checkpoint_path: Path) -> AudioSegment | None:
         """Load a previously saved chunk checkpoint when one exists."""
 
@@ -1210,6 +1324,16 @@ class AudiobookGenerator:
         except json.JSONDecodeError:
             payload = {}
         payload["raw_wav_lufs"] = round(lufs, 3)
+        chapter.generation_metadata = json.dumps(payload)
+
+    def _merge_generation_metadata(self, chapter: Chapter, updates: dict[str, Any]) -> None:
+        """Merge generation metadata updates without discarding existing keys."""
+
+        try:
+            payload = json.loads(chapter.generation_metadata) if chapter.generation_metadata else {}
+        except json.JSONDecodeError:
+            payload = {}
+        payload.update(updates)
         chapter.generation_metadata = json.dumps(payload)
 
     def _custom_watchlist_entries(self, chapter: Chapter) -> list[dict[str, str]]:

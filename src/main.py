@@ -23,6 +23,7 @@ from src.api.batch_routes import router as batch_router
 from src.api.error_handlers import register_error_handlers
 from src.api.export_routes import router as export_router
 from src.api.generation import router as generation_router
+from src.api.generation_runtime import start_generation_runtime
 from src.api.middleware import request_context_middleware
 from src.api.monitoring_routes import router as monitoring_router
 from src.api.overseer_routes import router as overseer_router
@@ -42,7 +43,6 @@ from src.startup import (
     install_signal_handlers,
     run_export_startup_cleanup,
     run_startup_cleanup,
-    run_startup_recovery,
 )
 
 configure_logging(level=settings.LOG_LEVEL)
@@ -74,15 +74,20 @@ async def lifespan(app: FastAPI):
     logger.info("Starting Alexandria Audiobook Narrator %s", __version__)
     ensure_runtime_directories()
     init_db()
-    run_startup_cleanup()
+    recovered_jobs, queued_jobs = run_startup_cleanup()
     run_export_startup_cleanup()
-    run_startup_recovery()
     reset_settings_manager()
     application_settings = get_application_settings()
     logger.info("Loaded application settings for narrator: %s", application_settings.narrator_name)
     install_signal_handlers()
     startup_summary = await run_all_health_checks()
     app.state.startup_health = startup_summary
+    await start_generation_runtime(resume_pending=True)
+    logger.info(
+        "Generation startup recovery ready: %s interrupted job(s), %s queued job(s)",
+        recovered_jobs,
+        queued_jobs,
+    )
     yield
     await graceful_shutdown("application shutdown")
     release_engine()

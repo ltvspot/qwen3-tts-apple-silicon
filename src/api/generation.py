@@ -215,18 +215,6 @@ def _first_incomplete_chapter_number(chapters: list[Chapter]) -> int | None:
     return first_incomplete
 
 
-def _has_active_job(book_id: int, db: Session, *, chapter_id: int | None = None) -> bool:
-    """Return True when a queued or running job already exists."""
-
-    query = db.query(GenerationJob.id).filter(
-        GenerationJob.book_id == book_id,
-        GenerationJob.status.in_(ACTIVE_JOB_STATUSES),
-    )
-    if chapter_id is None:
-        return query.first() is not None
-    return query.filter(GenerationJob.chapter_id == chapter_id).first() is not None
-
-
 def _get_book_chapters(book_id: int, db: Session) -> list[Chapter]:
     """Return ordered chapters for a book."""
 
@@ -559,9 +547,6 @@ async def _enqueue_book_generation(book_id: int, db: Session, *, force: bool) ->
     chapters = _get_book_chapters(book_id, db)
     _validate_book_ready_for_generation(book, chapters, book_id, force=force)
 
-    if _has_active_job(book_id, db):
-        raise HTTPException(status_code=409, detail="Generation is already queued or running for this book.")
-
     try:
         queue = await ensure_queue_started(db)
         job_id = await queue.enqueue_book(book_id, db, force=force)
@@ -617,8 +602,6 @@ async def resume_book_generation(book_id: int, db: Session = Depends(get_db)) ->
     resume_from = _first_incomplete_chapter_number(chapters)
     if resume_from is None:
         raise HTTPException(status_code=400, detail="All chapters are already generated.")
-    if _has_active_job(book_id, db):
-        raise HTTPException(status_code=409, detail="Generation is already queued or running for this book.")
     resume_checkpoint = max(_latest_resume_checkpoint(book_id, db), max(resume_from - 1, 0))
 
     try:
@@ -673,9 +656,6 @@ async def generate_chapter(
             status_code=400,
             detail="Chapter audio already exists. Use force=true to re-generate it.",
         )
-    if _has_active_job(book_id, db):
-        raise HTTPException(status_code=409, detail="Generation is already queued or running for this book.")
-
     try:
         queue = await ensure_queue_started(db)
         job_id = await queue.enqueue_chapter(book_id, chapter_number, db, force=force)
@@ -719,9 +699,6 @@ async def resume_chapter_generation(
         raise HTTPException(status_code=400, detail="Chapter has no text content")
     if chapter.status == ChapterStatus.GENERATED:
         raise HTTPException(status_code=400, detail="Chapter audio already exists.")
-    if _has_active_job(book_id, db):
-        raise HTTPException(status_code=409, detail="Generation is already queued or running for this book.")
-
     try:
         queue = await ensure_queue_started(db)
         job_id = await queue.enqueue_chapter(book_id, chapter_number, db, force=False)

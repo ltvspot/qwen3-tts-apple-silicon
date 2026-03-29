@@ -9,7 +9,7 @@ import json
 import logging
 import threading
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any
 
@@ -141,16 +141,20 @@ class GenerationQueue:
         self.active_jobs: set[int] = set()
         self._jobs_lock = threading.RLock()
         self._workers: list[asyncio.Task[None]] = []
+        self._maintenance_task: asyncio.Task[None] | None = None
         self._db_session_maker: Any | None = None
         self._generator: AudiobookGenerator | None = None
         self._resource_monitor: Any | None = None
         self._resource_pause_reason: str | None = None
+        self._shutdown_checkpoint_jobs: set[int] = set()
         self._start_lock = asyncio.Lock()
         self._jobs_available = asyncio.Event()
         self._stop_event = asyncio.Event()
         self._started = False
         self._draining = False
         self.resource_poll_interval_seconds = 30.0
+        self.heartbeat_interval_seconds = 60.0
+        self.stale_job_threshold_seconds = 5 * 60.0
         self.failure_thresholds = (
             get_application_settings().engine_config.failure_thresholds.model_copy(deep=True)
             if failure_thresholds is None
@@ -186,6 +190,10 @@ class GenerationQueue:
                 asyncio.create_task(self._worker(index), name=f"generation-worker-{index}")
                 for index in range(self.max_workers)
             ]
+            self._maintenance_task = asyncio.create_task(
+                self._maintenance_loop(),
+                name="generation-maintenance",
+            )
             self._started = True
             logger.info("Started generation queue with %s worker(s)", self.max_workers)
 
@@ -198,11 +206,16 @@ class GenerationQueue:
 
             self._stop_event.set()
             self._jobs_available.set()
-            await asyncio.gather(*self._workers, return_exceptions=True)
+            pending_tasks = [*self._workers]
+            if self._maintenance_task is not None:
+                pending_tasks.append(self._maintenance_task)
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
             self._workers.clear()
+            self._maintenance_task = None
             with self._jobs_lock:
                 self.active_jobs.clear()
                 self.jobs.clear()
+                self._shutdown_checkpoint_jobs.clear()
             self._db_session_maker = None
             self._generator = None
             self._resource_monitor = None
@@ -211,6 +224,28 @@ class GenerationQueue:
             self._started = False
             allow_sleep()
             logger.info("Stopped generation queue")
+
+    async def resume_pending_jobs(self) -> int:
+        """Load queued jobs into the in-memory view and wake workers."""
+
+        self._ensure_started()
+        db_session: Session = self._db_session_maker()
+        try:
+            queued_jobs = (
+                db_session.query(GenerationJob)
+                .filter(GenerationJob.status == GenerationJobStatus.QUEUED)
+                .order_by(GenerationJob.priority.desc(), GenerationJob.created_at.asc(), GenerationJob.id.asc())
+                .all()
+            )
+            for queued_job in queued_jobs:
+                self._store_job_snapshot(queued_job)
+        finally:
+            db_session.close()
+
+        if queued_jobs:
+            self._notify_workers()
+            logger.info("Resuming %s queued generation job(s)", len(queued_jobs))
+        return len(queued_jobs)
 
     async def enqueue_book(
         self,
@@ -512,6 +547,7 @@ class GenerationQueue:
         with self._jobs_lock:
             self.active_jobs.discard(job_id)
             self.jobs.pop(job_id, None)
+            self._shutdown_checkpoint_jobs.discard(job_id)
         invalidate_library_cache()
         self._notify_workers()
         return db_job
@@ -615,6 +651,44 @@ class GenerationQueue:
         self._draining = True
         self._jobs_available.set()
 
+    async def request_shutdown_checkpoint(self) -> list[int]:
+        """Ask active jobs to stop at the next chunk boundary so shutdown can persist progress."""
+
+        if self._db_session_maker is None:
+            return []
+
+        @retry_on_locked()
+        def _request_checkpoint() -> list[int]:
+            requested_job_ids: list[int] = []
+            db_session: Session = self._db_session_maker()
+            try:
+                running_jobs = (
+                    db_session.query(GenerationJob)
+                    .filter(GenerationJob.status == GenerationJobStatus.RUNNING)
+                    .all()
+                )
+                for db_job in running_jobs:
+                    if db_job.pause_requested:
+                        continue
+                    db_job.pause_requested = True
+                    requested_job_ids.append(db_job.id)
+                    self._record_history(
+                        db_session,
+                        db_job,
+                        "shutdown_requested",
+                        "Graceful shutdown requested a checkpoint and automatic resume.",
+                    )
+                db_session.commit()
+                return requested_job_ids
+            finally:
+                db_session.close()
+
+        requested_job_ids = await asyncio.to_thread(_request_checkpoint)
+        if requested_job_ids:
+            with self._jobs_lock:
+                self._shutdown_checkpoint_jobs.update(requested_job_ids)
+        return requested_job_ids
+
     def has_active_work(self) -> bool:
         """Return True when a job is actively being processed by a worker."""
 
@@ -623,15 +697,15 @@ class GenerationQueue:
                 return True
             return any(job.status == JobStatus.RUNNING for job in self.jobs.values())
 
-    async def save_and_pause_active_jobs(self) -> None:
-        """Checkpoint in-flight jobs so they can resume cleanly after restart."""
+    async def save_and_requeue_active_jobs(self) -> None:
+        """Persist any still-running jobs back to queued so startup can resume them."""
 
         if self._db_session_maker is None:
             return
 
         @retry_on_locked()
-        def _pause_jobs() -> list[int]:
-            paused_job_ids: list[int] = []
+        def _requeue_jobs() -> list[int]:
+            requeued_job_ids: list[int] = []
             db_session: Session = self._db_session_maker()
             try:
                 running_jobs = (
@@ -640,46 +714,53 @@ class GenerationQueue:
                     .all()
                 )
                 if not running_jobs:
-                    return paused_job_ids
+                    return requeued_job_ids
 
-                paused_at = utc_now()
                 for db_job in running_jobs:
+                    if db_job.id in self._shutdown_checkpoint_jobs or not db_job.pause_requested:
+                        self._prepare_job_for_resume(
+                            db_session,
+                            db_job,
+                            reason="Graceful shutdown saved progress for automatic resume.",
+                        )
+                        requeued_job_ids.append(db_job.id)
+                        continue
+
                     db_job.status = GenerationJobStatus.PAUSED
-                    db_job.pause_requested = True
-                    db_job.cancel_requested = False
                     db_job.current_chapter_progress = 0.0
-                    db_job.paused_at = paused_at
-                    db_job.eta_seconds = None
-                    db_job.error_message = "Server shutdown — job paused. Will resume on restart."
-                    self._record_history(
-                        db_session,
-                        db_job,
-                        "paused",
-                        "Server shutdown — job paused. Will resume on restart.",
-                    )
+                    if db_job.paused_at is None:
+                        db_job.paused_at = utc_now()
                     self._reset_generating_chapters_for_job(db_session, db_job)
                     book = db_session.query(Book).filter(Book.id == db_job.book_id).first()
                     if book is not None:
+                        if book.status == BookStatus.GENERATING:
+                            book.status = BookStatus.PARSED
                         book.generation_status = BookGenerationStatus.IDLE
                         book.generation_eta_seconds = None
                         book.current_job_id = db_job.id
-                    paused_job_ids.append(db_job.id)
 
                 db_session.commit()
-                for job_id in paused_job_ids:
+                for job_id in requeued_job_ids:
                     refreshed = db_session.query(GenerationJob).filter(GenerationJob.id == job_id).first()
                     if refreshed is not None:
                         self._store_job_snapshot(refreshed)
-                return paused_job_ids
+                return requeued_job_ids
             finally:
                 db_session.close()
 
-        paused_job_ids = await asyncio.to_thread(_pause_jobs)
-        if paused_job_ids:
+        requeued_job_ids = await asyncio.to_thread(_requeue_jobs)
+        if requeued_job_ids:
             with self._jobs_lock:
-                for job_id in paused_job_ids:
+                for job_id in requeued_job_ids:
                     self.active_jobs.discard(job_id)
+                    self._shutdown_checkpoint_jobs.discard(job_id)
             invalidate_library_cache()
+            logger.info("Graceful shutdown: saved progress for %s active jobs", len(requeued_job_ids))
+
+    async def save_and_pause_active_jobs(self) -> None:
+        """Backward-compatible wrapper for the shutdown checkpoint path."""
+
+        await self.save_and_requeue_active_jobs()
 
     def list_active_jobs(self, db_session: Session) -> list[GenerationJob]:
         """Return non-terminal jobs ordered by runtime precedence."""
@@ -764,6 +845,31 @@ class GenerationQueue:
             await asyncio.sleep(1.0)
             gc.collect()
 
+    async def _maintenance_loop(self) -> None:
+        """Persist heartbeats and requeue stale running jobs."""
+
+        logger.info("Generation maintenance loop is online")
+        while not self._stop_event.is_set():
+            try:
+                await asyncio.wait_for(self._stop_event.wait(), timeout=self.heartbeat_interval_seconds)
+                break
+            except asyncio.TimeoutError:
+                pass
+
+            try:
+                active_job_ids = self._active_job_ids_snapshot()
+                if active_job_ids:
+                    await asyncio.to_thread(self._heartbeat_active_jobs, active_job_ids)
+                stale_job_ids = await asyncio.to_thread(self._requeue_stale_jobs)
+            except Exception:
+                logger.exception("Generation maintenance loop failed")
+                continue
+
+            if stale_job_ids:
+                self._notify_workers()
+
+        logger.info("Generation maintenance loop stopped")
+
     def _current_rss_mb(self) -> float:
         """Return the current process RSS in megabytes when available."""
 
@@ -773,6 +879,79 @@ class GenerationQueue:
             return psutil.Process().memory_info().rss / (1024 * 1024)
         except Exception:
             return 0.0
+
+    def _active_job_ids_snapshot(self) -> list[int]:
+        """Return the current active job ids without holding the lock during DB work."""
+
+        with self._jobs_lock:
+            return list(self.active_jobs)
+
+    def _heartbeat_active_jobs(self, job_ids: list[int]) -> int:
+        """Touch updated_at for active jobs so restart recovery can distinguish live work."""
+
+        if self._db_session_maker is None or not job_ids:
+            return 0
+
+        db_session: Session = self._db_session_maker()
+        try:
+            heartbeat_at = utc_now()
+            jobs = (
+                db_session.query(GenerationJob)
+                .filter(
+                    GenerationJob.id.in_(job_ids),
+                    GenerationJob.status == GenerationJobStatus.RUNNING,
+                )
+                .all()
+            )
+            for job in jobs:
+                job.updated_at = heartbeat_at
+            db_session.commit()
+            return len(jobs)
+        finally:
+            db_session.close()
+
+    def _requeue_stale_jobs(self) -> list[int]:
+        """Reset stale running jobs to queued so workers can retry them."""
+
+        if self._db_session_maker is None:
+            return []
+
+        db_session: Session = self._db_session_maker()
+        try:
+            stale_cutoff = utc_now() - timedelta(seconds=self.stale_job_threshold_seconds)
+            stale_jobs = (
+                db_session.query(GenerationJob)
+                .filter(
+                    GenerationJob.status == GenerationJobStatus.RUNNING,
+                    GenerationJob.updated_at < stale_cutoff,
+                )
+                .all()
+            )
+            if not stale_jobs:
+                return []
+
+            stale_job_ids: list[int] = []
+            for stale_job in stale_jobs:
+                logger.warning(
+                    "Stale job detection: reset job %s (no progress for 5+ minutes)",
+                    stale_job.id,
+                )
+                self._prepare_job_for_resume(db_session, stale_job, reason="Automatic stale-job retry.")
+                stale_job_ids.append(stale_job.id)
+
+            db_session.commit()
+            for stale_job in stale_jobs:
+                self._store_job_snapshot(stale_job)
+
+            with self._jobs_lock:
+                for job_id in stale_job_ids:
+                    self.active_jobs.discard(job_id)
+                    self._shutdown_checkpoint_jobs.discard(job_id)
+
+            invalidate_library_cache()
+            return stale_job_ids
+        finally:
+            db_session.close()
 
     async def _worker(self, worker_index: int) -> None:
         """Process queued jobs according to priority ordering."""
@@ -925,7 +1104,13 @@ class GenerationQueue:
 
         for chapter in chapters:
             if not db_job.force and chapter.status == ChapterStatus.GENERATED:
-                continue
+                if self._chapter_has_reusable_audio(chapter):
+                    continue
+                logger.warning(
+                    "Book %s chapter %s was marked generated but the WAV is missing; regenerating",
+                    db_job.book_id,
+                    chapter.number,
+                )
 
             await self._wait_for_model_restart()
             db_session.refresh(db_job)
@@ -987,7 +1172,9 @@ class GenerationQueue:
                 db_session.refresh(db_job)
                 if db_job.status == GenerationJobStatus.FAILED:
                     return
-                if db_job.pause_requested:
+                if db_job.id in self._shutdown_checkpoint_jobs:
+                    self._mark_requeued_for_shutdown(db_job, db_session)
+                elif db_job.pause_requested:
                     self._mark_paused(db_job, db_session)
                 else:
                     self._mark_cancelled(db_job, db_session)
@@ -1064,6 +1251,9 @@ class GenerationQueue:
             db_session.refresh(db_job)
             if db_job.cancel_requested:
                 self._mark_cancelled(db_job, db_session)
+                return
+            if db_job.id in self._shutdown_checkpoint_jobs:
+                self._mark_requeued_for_shutdown(db_job, db_session)
                 return
             if db_job.pause_requested:
                 self._mark_paused(db_job, db_session)
@@ -1144,7 +1334,9 @@ class GenerationQueue:
             db_session.refresh(db_job)
             if db_job.status == GenerationJobStatus.FAILED:
                 return
-            if db_job.pause_requested:
+            if db_job.id in self._shutdown_checkpoint_jobs:
+                self._mark_requeued_for_shutdown(db_job, db_session)
+            elif db_job.pause_requested:
                 self._mark_paused(db_job, db_session)
             else:
                 self._mark_cancelled(db_job, db_session)
@@ -1293,6 +1485,8 @@ class GenerationQueue:
         db_session.commit()
         invalidate_library_cache()
         self._store_job_snapshot(db_job)
+        with self._jobs_lock:
+            self._shutdown_checkpoint_jobs.discard(db_job.id)
 
     def _mark_failed(self, db_job: GenerationJob, job_info: JobInfo, db_session: Session, error_message: str) -> None:
         """Persist an unrecoverable failure."""
@@ -1300,6 +1494,48 @@ class GenerationQueue:
         logger.error("Generation job %s failed: %s", db_job.id, error_message)
         db_job.error_message = error_message
         self._finalize_job(db_job, db_session, job_info, failed=True, failure_message=error_message)
+
+    def _prepare_job_for_resume(
+        self,
+        db_session: Session,
+        db_job: GenerationJob,
+        *,
+        reason: str,
+    ) -> None:
+        """Normalize a non-terminal job back into queued state for automatic resume."""
+
+        db_job.status = GenerationJobStatus.QUEUED
+        db_job.pause_requested = False
+        db_job.cancel_requested = False
+        db_job.current_chapter_progress = 0.0
+        db_job.completed_at = None
+        db_job.paused_at = None
+        db_job.error_message = None
+        self._reset_generating_chapters_for_job(db_session, db_job)
+        self._record_history(db_session, db_job, "requeued", reason)
+
+        book = db_session.query(Book).filter(Book.id == db_job.book_id).first()
+        if book is not None:
+            if book.status == BookStatus.GENERATING:
+                book.status = BookStatus.PARSED
+            book.generation_status = BookGenerationStatus.GENERATING
+            book.generation_eta_seconds = db_job.eta_seconds
+            book.current_job_id = db_job.id
+
+    def _mark_requeued_for_shutdown(self, db_job: GenerationJob, db_session: Session) -> None:
+        """Persist queued state when graceful shutdown interrupts an active job."""
+
+        self._prepare_job_for_resume(
+            db_session,
+            db_job,
+            reason="Graceful shutdown saved progress for automatic resume.",
+        )
+        db_session.commit()
+        invalidate_library_cache()
+        self._store_job_snapshot(db_job)
+        with self._jobs_lock:
+            self._shutdown_checkpoint_jobs.discard(db_job.id)
+        logger.info("Generation job %s queued for auto-resume during shutdown", db_job.id)
 
     def _mark_paused(self, db_job: GenerationJob, db_session: Session) -> None:
         """Persist paused state for a job after the current chapter boundary."""
@@ -1320,6 +1556,8 @@ class GenerationQueue:
         db_session.commit()
         invalidate_library_cache()
         self._store_job_snapshot(db_job)
+        with self._jobs_lock:
+            self._shutdown_checkpoint_jobs.discard(db_job.id)
         logger.info("Generation job %s paused", db_job.id)
 
     def _mark_cancelled(self, db_job: GenerationJob, db_session: Session) -> None:
@@ -1355,6 +1593,8 @@ class GenerationQueue:
         db_session.commit()
         invalidate_library_cache()
         self._store_job_snapshot(db_job)
+        with self._jobs_lock:
+            self._shutdown_checkpoint_jobs.discard(db_job.id)
         logger.info("Generation job %s marked as cancelled", db_job.id)
 
     def _store_job_snapshot(self, db_job: GenerationJob) -> JobInfo:
@@ -1494,7 +1734,7 @@ class GenerationQueue:
 
         stats = FailureTrackingStats()
         for chapter in chapters:
-            if chapter.status == ChapterStatus.GENERATED:
+            if chapter.status == ChapterStatus.GENERATED and self._chapter_has_reusable_audio(chapter):
                 stats.record_success(self._estimated_chunk_count(chapter))
             elif chapter.status in {ChapterStatus.FAILED, ChapterStatus.GENERATED_NO_QA}:
                 stats.record_failure(self._estimated_chunk_count(chapter))
@@ -1522,7 +1762,15 @@ class GenerationQueue:
     def _chapter_metrics(self, chapters: list[Chapter], *, force: bool) -> tuple[int, int, float | None]:
         """Return completed count, failed count, and observed average generation time."""
 
-        completed_chapters = [] if force else [chapter for chapter in chapters if chapter.status == ChapterStatus.GENERATED]
+        completed_chapters = (
+            []
+            if force
+            else [
+                chapter
+                for chapter in chapters
+                if chapter.status == ChapterStatus.GENERATED and self._chapter_has_reusable_audio(chapter)
+            ]
+        )
         failed_count = (
             0
             if force
@@ -1543,7 +1791,7 @@ class GenerationQueue:
         """Return the next chapter number that still needs work."""
 
         for chapter in chapters:
-            if force or chapter.status != ChapterStatus.GENERATED:
+            if force or chapter.status != ChapterStatus.GENERATED or not self._chapter_has_reusable_audio(chapter):
                 return chapter.number
         return None
 
@@ -1553,8 +1801,22 @@ class GenerationQueue:
         if force:
             return 0
 
-        completed_numbers = [chapter.number for chapter in chapters if chapter.status == ChapterStatus.GENERATED]
+        completed_numbers = [
+            chapter.number
+            for chapter in chapters
+            if chapter.status == ChapterStatus.GENERATED and self._chapter_has_reusable_audio(chapter)
+        ]
         return max(completed_numbers, default=0)
+
+    def _chapter_has_reusable_audio(self, chapter: Chapter) -> bool:
+        """Return whether a generated chapter still has a reusable WAV on disk."""
+
+        if self._generator is None:
+            return True
+        chapter_audio_exists = getattr(self._generator, "chapter_audio_exists", None)
+        if not callable(chapter_audio_exists):
+            return True
+        return bool(chapter_audio_exists(chapter.book_id, chapter))
 
     def _overall_progress(self, completed_count: int, total_count: int, current_progress_fraction: float) -> float:
         """Return the overall job progress as a percentage."""
@@ -1615,7 +1877,7 @@ class GenerationQueue:
         failed_seen = 0
 
         for chapter in chapters:
-            if not force and chapter.status == ChapterStatus.GENERATED:
+            if not force and chapter.status == ChapterStatus.GENERATED and self._chapter_has_reusable_audio(chapter):
                 completed_seen += 1
                 continue
             if not force and chapter.status == ChapterStatus.FAILED:

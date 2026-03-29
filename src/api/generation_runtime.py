@@ -12,6 +12,7 @@ from src.pipeline.batch_orchestrator import BatchOrchestrator
 from src.pipeline.generator import AudiobookGenerator
 from src.pipeline.queue_manager import GenerationQueue
 from src.config import settings
+from src.database import SessionLocal
 
 _generator: AudiobookGenerator | None = None
 _queue: GenerationQueue | None = None
@@ -80,6 +81,20 @@ def get_resource_monitor() -> ResourceMonitor:
     if _resource_monitor is None:
         _resource_monitor = ResourceMonitor(Path(settings.OUTPUTS_PATH))
     return _resource_monitor
+
+
+async def start_generation_runtime(*, resume_pending: bool = False) -> GenerationQueue:
+    """Start the shared generation runtime using the application session factory."""
+
+    queue = get_queue()
+    await queue.start(
+        SessionLocal,
+        get_generator(),
+        resource_monitor=get_resource_monitor(),
+    )
+    if resume_pending:
+        await queue.resume_pending_jobs()
+    return queue
 
 
 async def ensure_queue_started(db: Session) -> GenerationQueue:
