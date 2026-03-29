@@ -42,6 +42,7 @@ def test_get_settings_returns_current_shape(client, test_db: Session, tmp_path: 
     assert payload["narrator_name"] == "Kent Zimering"
     assert payload["default_voice"]["name"] == "Ethan"
     assert payload["output_preferences"]["mp3_bitrate"] == 192
+    assert payload["output_preferences"]["tts_output_sample_rate"] == 24000
     assert payload["engine_config"]["chunk_timeout_seconds"] == 120
 
 
@@ -70,6 +71,7 @@ def test_put_settings_partial_update_deep_merges(client, test_db: Session, tmp_p
     assert "output_preferences.mp3_bitrate" in payload["updated_fields"]
     assert payload["settings"]["output_preferences"]["mp3_bitrate"] == 256
     assert payload["settings"]["output_preferences"]["sample_rate"] == 44100
+    assert payload["settings"]["output_preferences"]["tts_output_sample_rate"] == 24000
     assert payload["settings"]["default_voice"]["name"] == "Ethan"
     assert payload["settings"]["default_voice"]["speed"] == 1.2
 
@@ -111,6 +113,7 @@ def test_put_settings_full_update_replaces_payload(client, test_db: Session, tmp
     assert payload["settings"]["default_voice"]["name"] == "Nova"
     assert payload["settings"]["engine_config"]["chunk_timeout_seconds"] == 180
     assert payload["settings"]["output_preferences"]["sample_rate"] == 48000
+    assert payload["settings"]["output_preferences"]["tts_output_sample_rate"] == 24000
     assert payload["settings"]["output_preferences"]["include_album_art"] is False
 
 

@@ -323,8 +323,10 @@ class ChunkValidator:
             "reference": normalize_text(input_text),
             "transcript": normalize_text(transcript),
         }
+        warning_threshold = self.validation_settings.wer_warning_threshold
+        fail_threshold = self.validation_settings.wer_fail_threshold
 
-        if score > self.validation_settings.wer_fail_threshold:
+        if score > fail_threshold:
             return ValidationResult(
                 check="text_alignment",
                 severity=ValidationSeverity.FAIL,
@@ -332,7 +334,7 @@ class ChunkValidator:
                 details=details,
             )
 
-        if score >= self.validation_settings.wer_warning_threshold:
+        if score >= warning_threshold:
             return ValidationResult(
                 check="text_alignment",
                 severity=ValidationSeverity.WARNING,

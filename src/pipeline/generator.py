@@ -14,7 +14,7 @@ from typing import Any
 from pydub.audio_segment import AudioSegment
 from sqlalchemy.orm import Session, selectinload
 
-from src.config import settings
+from src.config import get_application_settings, settings
 from src.database import (
     Book,
     BookGenerationStatus,
@@ -262,6 +262,9 @@ class AudiobookGenerator:
                 )
 
         engine = await self._get_engine()
+        app_settings = get_application_settings()
+        self.chunk_validator.validation_settings = app_settings.chunk_validation
+        tts_output_sample_rate = int(app_settings.output_preferences.tts_output_sample_rate)
 
         logger.info(
             "Generating audio for book %s chapter %s (%s words)",
@@ -271,7 +274,17 @@ class AudiobookGenerator:
         )
 
         chunk_plans = TextChunker.chunk_text_with_metadata(text_content, engine.max_chunk_chars)
+        chunk_plans = self._merge_minimum_word_chunks(chunk_plans)
         pause_settings = self._pause_settings()
+        max_attempts = self._max_chunk_attempts()
+        total_retry_budget = len(chunk_plans) * max_attempts
+        logger.info(
+            "Chapter %s: %s chunks x %s attempts = %s max generations",
+            chapter.number,
+            len(chunk_plans),
+            max_attempts,
+            total_retry_budget,
+        )
         chapter.status = ChapterStatus.GENERATING
         chapter.started_at = utc_now()
         chapter.completed_at = None
@@ -288,6 +301,7 @@ class AudiobookGenerator:
             manual_review_notes: list[str] = []
             checkpoint_hits = 0
             chunk_files_written = 0
+            actual_generations = 0
             gate1_summary = {
                 "chunks_total": len(chunk_plans),
                 "chunks_pass_first_attempt": 0,
@@ -342,10 +356,11 @@ class AudiobookGenerator:
                         voice_name,
                         chapter_speed,
                         chunk_index=chunk_index,
-                        expected_sample_rate=getattr(engine, "sample_rate", None),
+                        expected_sample_rate=tts_output_sample_rate,
                     )
                     failed_validation = self._is_noncritical_validation_failure(validation_report)
                     attempts_used = 1
+                    generation_attempts = 0
                     logger.info(
                         "Reusing checkpointed chunk %s for book %s chapter %s",
                         chunk_index,
@@ -368,9 +383,10 @@ class AudiobookGenerator:
                             chapter_number=chapter.number,
                             book_id=book_id,
                             should_cancel=should_cancel,
-                            expected_sample_rate=getattr(engine, "sample_rate", None),
+                            expected_sample_rate=tts_output_sample_rate,
                             custom_watchlist=custom_watchlist,
                         )
+                        generation_attempts = attempts_used
                     except ChunkGenerationExhaustedError as exc:
                         error_message = (
                             f"Chunk {chunk_index + 1} failed after {self._max_chunk_attempts()} attempts: "
@@ -388,6 +404,7 @@ class AudiobookGenerator:
                             chunk_index + 1,
                         )
                         raise ChunkGenerationExhaustedError(error_message) from exc
+                actual_generations += generation_attempts
 
                 if attempts_used == 1 and not validation_report.issues:
                     gate1_summary["chunks_pass_first_attempt"] += 1
@@ -526,6 +543,15 @@ class AudiobookGenerator:
                     reason=qa_notification_reason,
                 )
 
+            efficiency = 100.0
+            if total_retry_budget > 0:
+                efficiency = max(0.0, (1.0 - (actual_generations / total_retry_budget)) * 100.0)
+            logger.info(
+                "Chapter %s complete: %s generations used (%.0f%% efficient)",
+                chapter.number,
+                actual_generations,
+                efficiency,
+            )
             logger.info(
                 "Generated book %s chapter %s -> %s (%.2fs)",
                 book_id,
@@ -579,8 +605,11 @@ class AudiobookGenerator:
 
         max_attempts = self._max_chunk_attempts()
         terminal_error: Exception | None = None
+        attempts_made = 0
+        split_retry: tuple[str, str] | None = None
         for attempt in range(1, max_attempts + 1):
             self._raise_if_cancelled(should_cancel)
+            attempts_made = attempt
             try:
                 audio = await self._generate_chunk(
                     self._vary_retry_text(text, attempt),
@@ -644,6 +673,19 @@ class AudiobookGenerator:
                 chapter_number=chapter_number,
                 attempt=attempt,
             )
+            if attempt == 1 and allow_split_retry:
+                extreme_wer = self._extreme_wer_score(validation_report)
+                if (
+                    extreme_wer is not None
+                    and extreme_wer > self.chunk_validator.validation_settings.wer_extreme_threshold
+                ):
+                    split_retry = TextChunker.split_for_retry(validation_text)
+                    if split_retry is not None:
+                        logger.warning(
+                            "Extreme WER %.2f on first attempt - skipping retries, splitting chunk",
+                            extreme_wer,
+                        )
+                        break
             if validation_report.needs_regeneration and attempt < max_attempts:
                 logger.warning(
                     "Chunk %s for book %s chapter %s failed validation, regenerating (%s/%s): %s",
@@ -684,7 +726,7 @@ class AudiobookGenerator:
             return (audio, validation_report, False, attempt)
 
         if allow_split_retry:
-            split = TextChunker.split_for_retry(validation_text)
+            split = split_retry or TextChunker.split_for_retry(validation_text)
             if split is not None:
                 logger.warning(
                     "Retrying book %s chapter %s chunk %s by splitting at a sentence boundary",
@@ -770,13 +812,13 @@ class AudiobookGenerator:
                                 minimum_severity=ValidationSeverity.FAIL,
                             )
                         ),
-                        attempts_used=max(max_attempts + 1, left_attempts + right_attempts),
+                        attempts_used=attempts_made + left_attempts + right_attempts,
                     )
                 return (
                     stitched_audio,
                     stitched_report,
                     self._is_noncritical_validation_failure(stitched_report),
-                    max(max_attempts + 1, left_attempts + right_attempts),
+                    attempts_made + left_attempts + right_attempts,
                 )
 
         if terminal_error is not None:
@@ -786,7 +828,7 @@ class AudiobookGenerator:
                 speed=speed,
                 expected_sample_rate=expected_sample_rate,
                 reason=str(terminal_error),
-                attempts_used=max_attempts,
+                attempts_used=attempts_made,
             )
         raise RuntimeError("Chunk generation retry loop exited unexpectedly.")
 
@@ -928,7 +970,12 @@ class AudiobookGenerator:
         resolved_speed = max(speed, 0.1)
         word_count = max(len(expected_text.split()), 1)
         duration_ms = int(max(400, min(3000, (word_count * 150) / resolved_speed)))
-        resolved_frame_rate = frame_rate or getattr(self.engine, "sample_rate", 22050) or 22050
+        resolved_frame_rate = (
+            frame_rate
+            or int(get_application_settings().output_preferences.tts_output_sample_rate)
+            or getattr(self.engine, "sample_rate", 22050)
+            or 22050
+        )
         return AudioSegment.silent(duration=duration_ms, frame_rate=resolved_frame_rate).set_channels(1)
 
     def _log_chunk_validation(
@@ -990,20 +1037,37 @@ class AudiobookGenerator:
         ]
 
     def _vary_retry_speed(self, speed: float, attempt: int) -> float:
-        """Apply a tiny speed variation on retries to avoid identical outputs."""
+        """Apply a meaningful speed variation on retries to avoid identical outputs."""
 
         if attempt <= 1:
             return speed
 
-        variation = 0.02 * (1 if attempt % 2 == 0 else -1)
+        variation = 0.05 if attempt == 2 else -0.05
         return max(0.5, min(2.0, speed + variation))
 
     def _vary_retry_text(self, text: str, attempt: int) -> str:
-        """Apply a tiny textual perturbation on retries to diversify generation."""
+        """Apply a textual perturbation on retries to diversify generation."""
 
         if attempt <= 1:
             return text
-        return f"{text}{' ' * (attempt - 1)}"
+
+        normalized = re.sub(r"\s+", " ", text).strip()
+        if attempt == 2:
+            return f" {normalized}"
+        return f"\u202F{normalized}"
+
+    @staticmethod
+    def _extreme_wer_score(report: ChunkValidationReport) -> float | None:
+        """Return the highest WER reported by text-alignment validation, if any."""
+
+        scores = [
+            float(result.details["wer"])
+            for result in report.results
+            if result.check == "text_alignment"
+            and result.details is not None
+            and isinstance(result.details.get("wer"), (int, float))
+        ]
+        return max(scores) if scores else None
 
     def _is_noncritical_validation_failure(self, report: ChunkValidationReport) -> bool:
         """Return whether a failed chunk can be preserved for manual review."""
@@ -1344,10 +1408,39 @@ class AudiobookGenerator:
             return []
         return self.pronunciation_watchlist.custom_entries_from_payload(book.pronunciation_watchlist)
 
+    def _merge_minimum_word_chunks(
+        self,
+        chunk_plans: list[TextChunker.ChunkPlan],
+        *,
+        minimum_words: int = 15,
+    ) -> list[TextChunker.ChunkPlan]:
+        """Merge undersized interior chunks into neighbors to stabilize generation."""
+
+        if len(chunk_plans) < 3:
+            return chunk_plans
+
+        merged = list(chunk_plans)
+        index = 1
+        while index < len(merged) - 1:
+            word_count = len([word for word in merged[index].text.split() if word.strip()])
+            if word_count >= minimum_words:
+                index += 1
+                continue
+
+            logger.info("Merged short chunk (%s words) with neighbor", word_count)
+            merged[index - 1:index + 1] = [
+                TextChunker.ChunkPlan(
+                    text=merged[index - 1].text + merged[index].text,
+                    ends_sentence=merged[index].ends_sentence,
+                    ends_paragraph=merged[index].ends_paragraph,
+                )
+            ]
+            index = max(1, index - 1)
+
+        return merged
+
     def _pause_settings(self) -> dict[str, int]:
         """Return the current configurable sentence and paragraph pause durations."""
-
-        from src.config import get_application_settings
 
         output_preferences = get_application_settings().output_preferences
         return {

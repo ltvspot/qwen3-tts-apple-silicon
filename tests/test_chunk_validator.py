@@ -8,10 +8,10 @@ from pydub import AudioSegment
 from pydub.generators import Sine
 
 from src.config import ChunkValidationSettings
-from src.pipeline.chunk_validator import ChunkValidator, ValidationSeverity
+from src.pipeline.chunk_validator import ChunkValidator, ValidationSeverity, _TranscriptionOutcome
 
 
-def _tone(duration_ms: int, *, gain_db: float = -6.0, frame_rate: int = 22050) -> AudioSegment:
+def _tone(duration_ms: int, *, gain_db: float = -6.0, frame_rate: int = 24000) -> AudioSegment:
     """Create a mono tone fixture with a deterministic frame rate."""
 
     return (
@@ -31,7 +31,7 @@ def _validator(*, stt_alignment_enabled: bool = False) -> ChunkValidator:
 def test_detects_silent_audio() -> None:
     """Near-silent chunks should fail validation."""
 
-    report = _validator().validate(AudioSegment.silent(duration=500, frame_rate=22050), "Hello world")
+    report = _validator().validate(AudioSegment.silent(duration=500, frame_rate=24000), "Hello world")
 
     assert report.worst_severity == ValidationSeverity.FAIL
     assert any("effectively silent" in issue.lower() for issue in report.issues)
@@ -58,7 +58,7 @@ def test_detects_too_short_audio() -> None:
 def test_detects_too_long_audio() -> None:
     """Overlong chunks should fail duration validation."""
 
-    report = _validator().validate(AudioSegment.silent(duration=120_001, frame_rate=22050), "Too long")
+    report = _validator().validate(AudioSegment.silent(duration=120_001, frame_rate=24000), "Too long")
 
     assert report.worst_severity == ValidationSeverity.FAIL
     assert any("too long" in issue.lower() for issue in report.issues)
@@ -86,13 +86,28 @@ def test_detects_sample_rate_mismatch() -> None:
     assert any("sample rate mismatch" in issue.lower() for issue in report.issues)
 
 
+def test_accepts_matching_tts_output_sample_rate() -> None:
+    """Chunks at the configured TTS output rate should pass sample-rate validation."""
+
+    report = _validator().validate(
+        _tone(1000, frame_rate=24000),
+        "Sample rate pass test.",
+        expected_sample_rate=24000,
+    )
+    sample_rate_result = next(result for result in report.results if result.check == "sample_rate")
+
+    assert report.worst_severity == ValidationSeverity.INFO
+    assert sample_rate_result.severity == ValidationSeverity.PASS
+    assert "sample rate is valid" in sample_rate_result.message.lower()
+
+
 def test_valid_audio_passes_non_alignment_checks_cleanly() -> None:
     """Balanced narration audio should pass when STT is disabled for the unit test."""
 
     report = _validator().validate(
-        _tone(3500, gain_db=-6.0, frame_rate=22050),
+        _tone(3500, gain_db=-6.0, frame_rate=24000),
         "This chunk has a reasonable duration and healthy audio levels for narration.",
-        expected_sample_rate=22050,
+        expected_sample_rate=24000,
     )
 
     assert report.worst_severity == ValidationSeverity.INFO
@@ -106,8 +121,23 @@ def test_chunk_validation_settings_default_to_large_turbo_model() -> None:
     settings = ChunkValidationSettings()
 
     assert settings.stt_model == "mlx-community/whisper-large-v3-turbo"
-    assert settings.wer_warning_threshold == 0.10
-    assert settings.wer_fail_threshold == 0.20
+    assert settings.wer_warning_threshold == 0.40
+    assert settings.wer_fail_threshold == 0.80
+    assert settings.wer_extreme_threshold == 2.0
+
+
+def test_text_alignment_warning_band_is_non_blocking() -> None:
+    """WER values inside the warning band should stay review-only."""
+
+    result = ChunkValidator(ChunkValidationSettings(stt_alignment_enabled=True)).check_text_alignment(
+        _tone(1000),
+        "one two three four five",
+        transcription=_TranscriptionOutcome(transcript="one wrong wrong wrong five"),
+    )
+
+    assert result.severity == ValidationSeverity.WARNING
+    assert result.details is not None
+    assert 0.40 <= result.details["wer"] <= 0.80
 
 
 def test_load_whisper_model_uses_mlx_whisper_backend_and_caches(monkeypatch) -> None:

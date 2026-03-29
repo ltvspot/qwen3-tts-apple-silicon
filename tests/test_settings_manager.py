@@ -59,6 +59,19 @@ def test_load_settings_default(test_db: Session, tmp_path: Path) -> None:
     assert manager.get_settings() == default_application_settings()
 
 
+def test_application_settings_migrates_legacy_tts_sample_rate() -> None:
+    """Legacy raw-TTS sample rates should move into the dedicated validation field."""
+
+    settings = ApplicationSettings(
+        narrator_name="Kent Zimering",
+        manuscript_source_folder="Formatted Manuscripts",
+        output_preferences={"sample_rate": 24000},
+    )
+
+    assert settings.output_preferences.sample_rate == 44100
+    assert settings.output_preferences.tts_output_sample_rate == 24000
+
+
 def test_save_settings_to_db(test_db: Session, tmp_path: Path) -> None:
     """Saving settings should upsert the database record."""
 

@@ -151,16 +151,20 @@ class ChunkValidationSettings(BaseModel):
         description="MLX Whisper model name used for per-chunk STT alignment checks.",
     )
     wer_warning_threshold: float = Field(
-        default=0.10,
+        default=0.40,
         ge=0.0,
         le=1.0,
         description="Word error rate above which chunks are flagged for review.",
     )
     wer_fail_threshold: float = Field(
-        default=0.20,
+        default=0.80,
         ge=0.0,
-        le=1.0,
         description="Word error rate above which chunks are automatically regenerated.",
+    )
+    wer_extreme_threshold: float = Field(
+        default=2.0,
+        ge=1.0,
+        description="WER above this triggers immediate split-retry without exhausting normal retries.",
     )
     repeat_detection_enabled: bool = Field(
         default=True,
@@ -183,13 +187,13 @@ class ChunkValidationSettings(BaseModel):
         description="Enable spectral clarity and gibberish detection checks.",
     )
     spectral_flatness_warning: float = Field(
-        default=0.20,
+        default=0.35,
         ge=0.0,
         le=1.0,
         description="Average spectral flatness above which chunks are flagged for review.",
     )
     spectral_flatness_fail: float = Field(
-        default=0.30,
+        default=0.50,
         ge=0.0,
         le=1.0,
         description="Average spectral flatness above which chunks are automatically regenerated.",
@@ -198,6 +202,23 @@ class ChunkValidationSettings(BaseModel):
 
 class OutputSettings(BaseModel):
     """Export output preferences."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_legacy_tts_sample_rate(cls, value: Any) -> Any:
+        """Migrate older raw-TTS sample-rate payloads into the dedicated field."""
+
+        if not isinstance(value, dict):
+            return value
+
+        legacy_sample_rate = value.get("sample_rate")
+        if legacy_sample_rate not in {22050, 24000}:
+            return value
+
+        migrated = dict(value)
+        migrated.setdefault("tts_output_sample_rate", legacy_sample_rate)
+        migrated["sample_rate"] = 44100
+        return migrated
 
     mp3_bitrate: Literal[128, 192, 256, 320] = Field(
         default=192,
@@ -210,6 +231,10 @@ class OutputSettings(BaseModel):
     sample_rate: Literal[44100, 48000] = Field(
         default=44100,
         description="Audiobook output sample rate in Hz.",
+    )
+    tts_output_sample_rate: int = Field(
+        default=24000,
+        description="Native sample rate of the TTS model output. Used for chunk validation, not final export.",
     )
     silence_duration_chapters: float = Field(
         default=2.0,

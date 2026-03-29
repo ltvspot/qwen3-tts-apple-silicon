@@ -15,7 +15,7 @@ from sqlalchemy import text
 from sqlalchemy.orm import Session, sessionmaker
 
 from src.api import generation as generation_api
-from src.config import FailureThresholdSettings, settings
+from src.config import FailureThresholdSettings, default_application_settings, settings
 from src.database import (
     Book,
     BookStatus,
@@ -153,7 +153,7 @@ class FlakyEngine:
         self.calls += 1
         if self.calls < 3:
             raise TimeoutError("temporary timeout")
-        return Sine(220).to_audio_segment(duration=3000, volume=-6.0)
+        return Sine(220).to_audio_segment(duration=3000, volume=-6.0).set_frame_rate(22050)
 
 
 class ValidationFailureEngine:
@@ -174,8 +174,8 @@ class ValidationFailureEngine:
         del voice, emotion, speed
         self.calls += 1
         if "Invalid chunk." in text:
-            return AudioSegment.silent(duration=250)
-        return Sine(220).to_audio_segment(duration=400, volume=-6.0)
+            return AudioSegment.silent(duration=250, frame_rate=22050)
+        return Sine(220).to_audio_segment(duration=400, volume=-6.0).set_frame_rate(22050)
 
 
 class SplitRetryEngine:
@@ -196,7 +196,7 @@ class SplitRetryEngine:
         del voice, emotion, speed
         self.calls.append(text)
         if "Alpha sentence." in text and "Beta sentence." in text:
-            return AudioSegment.silent(duration=250)
+            return AudioSegment.silent(duration=250, frame_rate=22050)
         return Sine(220).to_audio_segment(duration=700, volume=-6.0).set_frame_rate(22050)
 
 
@@ -437,6 +437,11 @@ def generation_settings(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None
 
     monkeypatch.setattr(settings, "OUTPUTS_PATH", str(tmp_path / "outputs"))
     monkeypatch.setattr(settings, "TTS_BACKEND", "synthetic")
+    app_settings = default_application_settings()
+    app_settings.chunk_validation.stt_alignment_enabled = False
+    app_settings.output_preferences.tts_output_sample_rate = 22050
+    monkeypatch.setattr("src.pipeline.generator.get_application_settings", lambda: app_settings)
+    monkeypatch.setattr("src.pipeline.chunk_validator.get_application_settings", lambda: app_settings)
 
 
 @pytest.mark.asyncio
