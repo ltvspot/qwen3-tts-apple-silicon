@@ -7,6 +7,17 @@ from pathlib import Path
 from src.pipeline.audio_qa.transcription_checker import AudioQADependencyError, TranscriptionAccuracyChecker
 
 
+def test_transcription_checker_defaults_to_large_turbo_model() -> None:
+    """Deep QA transcription should default to the production Whisper model and thresholds."""
+
+    checker = TranscriptionAccuracyChecker()
+
+    assert checker.model_name == "mlx-community/whisper-large-v3-turbo"
+    assert checker.WARNING_WER_THRESHOLD == 0.10
+    assert checker.SEGMENT_WARNING_THRESHOLD == 0.25
+    assert checker.SEGMENT_ERROR_THRESHOLD == 0.45
+
+
 def test_transcription_checker_reports_missing_dependency(tmp_path: Path, monkeypatch) -> None:
     """The checker should degrade cleanly when mlx-whisper is unavailable."""
 

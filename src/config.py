@@ -145,18 +145,18 @@ class ChunkValidationSettings(BaseModel):
         description="Enable speech-to-text alignment validation when Whisper is available.",
     )
     stt_model: str = Field(
-        default="tiny.en",
+        default="mlx-community/whisper-large-v3-turbo",
         min_length=1,
-        description="Whisper model name used for per-chunk STT alignment checks.",
+        description="MLX Whisper model name used for per-chunk STT alignment checks.",
     )
     wer_warning_threshold: float = Field(
-        default=0.15,
+        default=0.10,
         ge=0.0,
         le=1.0,
         description="Word error rate above which chunks are flagged for review.",
     )
     wer_fail_threshold: float = Field(
-        default=0.30,
+        default=0.20,
         ge=0.0,
         le=1.0,
         description="Word error rate above which chunks are automatically regenerated.",

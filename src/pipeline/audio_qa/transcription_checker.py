@@ -62,11 +62,11 @@ class TranscriptionAccuracyChecker:
     """Transcribe chapter audio and compare it to the source text."""
 
     PASS_WER_THRESHOLD = 0.05
-    WARNING_WER_THRESHOLD = 0.15
-    SEGMENT_WARNING_THRESHOLD = 0.35
-    SEGMENT_ERROR_THRESHOLD = 0.60
+    WARNING_WER_THRESHOLD = 0.10
+    SEGMENT_WARNING_THRESHOLD = 0.25
+    SEGMENT_ERROR_THRESHOLD = 0.45
 
-    def __init__(self, model_name: str = "mlx-community/whisper-tiny") -> None:
+    def __init__(self, model_name: str = "mlx-community/whisper-large-v3-turbo") -> None:
         self.model_name = model_name
         self._backend: Any | None = None
 

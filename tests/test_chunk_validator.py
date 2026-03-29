@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+
 from pydub import AudioSegment
 from pydub.generators import Sine
 
@@ -20,10 +22,10 @@ def _tone(duration_ms: int, *, gain_db: float = -6.0, frame_rate: int = 22050) -
     )
 
 
-def _validator() -> ChunkValidator:
+def _validator(*, stt_alignment_enabled: bool = False) -> ChunkValidator:
     """Return a validator configured for deterministic unit tests."""
 
-    return ChunkValidator(ChunkValidationSettings())
+    return ChunkValidator(ChunkValidationSettings(stt_alignment_enabled=stt_alignment_enabled))
 
 
 def test_detects_silent_audio() -> None:
@@ -85,7 +87,7 @@ def test_detects_sample_rate_mismatch() -> None:
 
 
 def test_valid_audio_passes_non_alignment_checks_cleanly() -> None:
-    """Balanced narration audio should only emit the Whisper-skipped info result by default."""
+    """Balanced narration audio should pass when STT is disabled for the unit test."""
 
     report = _validator().validate(
         _tone(3500, gain_db=-6.0, frame_rate=22050),
@@ -95,4 +97,35 @@ def test_valid_audio_passes_non_alignment_checks_cleanly() -> None:
 
     assert report.worst_severity == ValidationSeverity.INFO
     assert report.needs_regeneration is False
-    assert any("whisper not installed" in issue.lower() for issue in report.issues)
+    assert any("disabled in settings" in issue.lower() for issue in report.issues)
+
+
+def test_chunk_validation_settings_default_to_large_turbo_model() -> None:
+    """Chunk STT should default to the production mlx-whisper model and thresholds."""
+
+    settings = ChunkValidationSettings()
+
+    assert settings.stt_model == "mlx-community/whisper-large-v3-turbo"
+    assert settings.wer_warning_threshold == 0.10
+    assert settings.wer_fail_threshold == 0.20
+
+
+def test_load_whisper_model_uses_mlx_whisper_backend_and_caches(monkeypatch) -> None:
+    """The validator should import mlx-whisper once and reuse the cached backend handle."""
+
+    fake_backend = object()
+    monkeypatch.setitem(sys.modules, "mlx_whisper", fake_backend)
+    ChunkValidator._whisper_model_cache.clear()
+    ChunkValidator._whisper_import_failed = False
+    ChunkValidator._whisper_model_loaded = False
+
+    first = ChunkValidator._load_whisper_model("mlx-community/whisper-large-v3-turbo")
+    second = ChunkValidator._load_whisper_model("mlx-community/whisper-large-v3-turbo")
+
+    assert first is fake_backend
+    assert second is fake_backend
+    assert ChunkValidator._whisper_model_loaded is True
+
+    ChunkValidator._whisper_model_cache.clear()
+    ChunkValidator._whisper_import_failed = False
+    ChunkValidator._whisper_model_loaded = False

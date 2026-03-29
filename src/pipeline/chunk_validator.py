@@ -104,13 +104,20 @@ def normalize_text(text: str) -> str:
 
 
 def word_error_rate(reference: str, hypothesis: str) -> float:
-    """Compute word error rate using dynamic-programming edit distance."""
+    """Compute WER using editdistance when present, otherwise a DP fallback."""
 
     ref_words = normalize_text(reference).split()
     hyp_words = normalize_text(hypothesis).split()
 
     if not ref_words:
         return 0.0 if not hyp_words else 1.0
+
+    try:
+        import editdistance  # type: ignore
+
+        return float(editdistance.eval(ref_words, hyp_words)) / float(len(ref_words))
+    except ImportError:
+        pass
 
     rows = len(ref_words) + 1
     cols = len(hyp_words) + 1
@@ -234,10 +241,11 @@ class ChunkValidator:
     REPEAT_HOP_MS = 250
     ENVELOPE_FRAME_MS = 50
     ENERGY_WINDOW_MS = 100
-    WHISPER_SKIP_MESSAGE = "STT alignment check skipped (whisper not installed)"
+    WHISPER_SKIP_MESSAGE = "STT alignment check skipped (mlx-whisper not installed)"
 
     _whisper_model_cache: dict[str, Any] = {}
     _whisper_import_failed = False
+    _whisper_model_loaded = False
 
     def __init__(self, validation_settings: ChunkValidationSettings | None = None) -> None:
         """Initialize a validator with persisted or test-specific settings."""
@@ -702,12 +710,12 @@ class ChunkValidator:
         return (expected * 0.6, expected * 1.8)
 
     def _transcribe_audio(self, audio: AudioSegment) -> _TranscriptionOutcome:
-        """Run Whisper transcription or return a non-fatal skipped result."""
+        """Run mlx-whisper transcription or return a non-fatal skipped result."""
 
         try:
-            model = self._load_whisper_model(self.validation_settings.stt_model)
+            backend = self._load_whisper_model(self.validation_settings.stt_model)
         except ImportError:
-            logger.warning("Whisper is not installed; chunk STT alignment is disabled.")
+            logger.warning("mlx-whisper is not installed; chunk STT alignment is disabled.")
             return _TranscriptionOutcome(
                 transcript=None,
                 status=ValidationResult(
@@ -717,7 +725,7 @@ class ChunkValidator:
                 ),
             )
         except Exception as exc:
-            logger.warning("Unable to load Whisper model for chunk validation: %s", exc)
+            logger.warning("Unable to initialize mlx-whisper for chunk validation: %s", exc)
             return _TranscriptionOutcome(
                 transcript=None,
                 status=ValidationResult(
@@ -733,7 +741,11 @@ class ChunkValidator:
                 temp_path = Path(handle.name)
 
             audio.export(temp_path, format="wav")
-            payload = model.transcribe(str(temp_path), fp16=False, language="en")
+            payload = backend.transcribe(
+                str(temp_path),
+                path_or_hf_repo=self.validation_settings.stt_model,
+                language="en",
+            )
             transcript = str(payload.get("text", "")).strip()
             return _TranscriptionOutcome(transcript=transcript)
         except Exception as exc:
@@ -752,7 +764,7 @@ class ChunkValidator:
 
     @classmethod
     def _load_whisper_model(cls, model_name: str) -> Any:
-        """Lazily load and cache a Whisper model when the dependency exists."""
+        """Lazily import mlx-whisper and reuse its internal per-model singleton."""
 
         if cls._whisper_import_failed:
             raise ImportError(cls.WHISPER_SKIP_MESSAGE)
@@ -761,14 +773,17 @@ class ChunkValidator:
             return cls._whisper_model_cache[model_name]
 
         try:
-            import whisper
+            import mlx_whisper  # type: ignore[import-not-found]
         except ImportError as exc:
             cls._whisper_import_failed = True
             raise ImportError(cls.WHISPER_SKIP_MESSAGE) from exc
 
-        model = whisper.load_model(model_name)
-        cls._whisper_model_cache[model_name] = model
-        return model
+        # mlx_whisper.transcribe() already memoizes loaded weights per model name
+        # via its internal ModelHolder, so caching the backend handle here is
+        # enough to avoid repeated import/load setup in the chunk validator.
+        cls._whisper_model_cache[model_name] = mlx_whisper
+        cls._whisper_model_loaded = True
+        return mlx_whisper
 
     def _detect_audio_repeat_pattern(self, audio: AudioSegment) -> dict[str, float] | None:
         """Return repeat-loop metrics from the chunk energy envelope when detectable."""

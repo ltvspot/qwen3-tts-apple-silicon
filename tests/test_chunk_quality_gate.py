@@ -186,12 +186,12 @@ def test_text_alignment_pass() -> None:
     result = validator.check_text_alignment(
         _tone(1000),
         "The quick brown fox jumps over the lazy dog.",
-        transcription=_TranscriptionOutcome(transcript="the quick brown fox jumps over lazy dog"),
+        transcription=_TranscriptionOutcome(transcript="the quick brown fox jumps over the lazy dog"),
     )
 
     assert result.severity == ValidationSeverity.PASS
     assert result.details is not None
-    assert result.details["wer"] < 0.15
+    assert result.details["wer"] < 0.10
 
 
 def test_text_alignment_fail() -> None:
@@ -298,17 +298,17 @@ async def test_regeneration_on_fail(test_db: Session, monkeypatch: pytest.Monkey
 
 
 def test_graceful_whisper_missing(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Missing Whisper should return a non-fatal INFO result."""
+    """Missing mlx-whisper should return a non-fatal INFO result."""
 
     def _raise_missing(cls, model_name: str):
         del cls, model_name
-        raise ImportError("whisper missing")
+        raise ImportError("mlx-whisper missing")
 
     monkeypatch.setattr(ChunkValidator, "_load_whisper_model", classmethod(_raise_missing))
     result = _validator().check_text_alignment(_tone(1000), "Hello world")
 
     assert result.severity == ValidationSeverity.INFO
-    assert result.message == "STT alignment check skipped (whisper not installed)"
+    assert result.message == "STT alignment check skipped (mlx-whisper not installed)"
 
 
 def test_validation_report_worst_severity() -> None:
