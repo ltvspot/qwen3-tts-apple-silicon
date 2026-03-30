@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import gc
+import inspect
 import json
 import logging
 import os
@@ -12,6 +13,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -28,27 +30,53 @@ logger = logging.getLogger(__name__)
 
 MODEL_DIR_NAME = "Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit"
 BASE_MODEL_DIR_NAME = "Qwen3-TTS-12Hz-1.7B-Base-8bit"
+VOICEDESIGN_MODEL_DIR_NAME = "Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit"
 DEFAULT_SAMPLE_RATE = 22050
 RAW_WAV_TARGET_LUFS = -18.5
 RAW_WAV_PEAK_LIMIT_DBFS = -0.5
 DEFAULT_MODEL_RESTART_INTERVAL = 50
 ENGLISH_LANG_CODE = "en"
+APPROX_QWEN_MODEL_MEMORY_MB = 1700
+VOICEDESIGN_TEMPERATURE_DEFAULT = 0.0
 VOICE_PRESETS: dict[str, dict[str, str]] = {
+    # === English Male Voices (American) ===
     "Ethan": {
         "speaker": "aiden",
-        "description": "Default audiobook narration mapped to Qwen speaker Aiden.",
+        "description": "Bright, clear American male. Energetic midrange with sunny tone. Great for contemporary fiction and young adult narration.",
     },
     "Nova": {
         "speaker": "ryan",
-        "description": "Clean contemporary narration mapped to Qwen speaker Ryan.",
-    },
-    "Aria": {
-        "speaker": "vivian",
-        "description": "Warm expressive narration mapped to Qwen speaker Vivian.",
+        "description": "Dynamic American male with strong rhythmic drive. Modern, confident delivery. Ideal for thrillers, business, and non-fiction.",
     },
     "Leo": {
         "speaker": "uncle_fu",
-        "description": "Lower-register narration mapped to Qwen speaker Uncle_Fu.",
+        "description": "Deep, seasoned male with low mellow timbre. Authoritative and warm. Perfect for literary fiction, history, and classic novels.",
+    },
+    "Dylan": {
+        "speaker": "dylan",
+        "description": "Youthful male with crisp natural clarity. Clean enunciation and steady pacing. Well-suited for educational content and memoirs.",
+    },
+    "Marcus": {
+        "speaker": "eric",
+        "description": "Warm male with slightly husky brightness. Lively personality with natural warmth. Excellent for character-driven stories and dialogue-heavy books.",
+    },
+    # === English Female Voices ===
+    "Aria": {
+        "speaker": "vivian",
+        "description": "Warm, expressive female narrator. Smooth and engaging delivery. Great for romance, drama, and literary fiction.",
+    },
+    "Serena": {
+        "speaker": "serena",
+        "description": "Gentle, composed female voice with clear diction. Calm and reassuring tone. Ideal for self-help, wellness, and meditation content.",
+    },
+    # === International Voices ===
+    "Anna": {
+        "speaker": "ono_anna",
+        "description": "Soft-spoken female with precise articulation. Japanese-influenced English with elegant pacing. Unique character for international content.",
+    },
+    "Sohee": {
+        "speaker": "sohee",
+        "description": "Bright, articulate female voice. Korean-influenced English with clear delivery. Fresh tone for diverse narration styles.",
     },
 }
 EMOTION_INSTRUCTIONS: dict[str, str] = {
@@ -64,6 +92,11 @@ SYNTHETIC_VOICE_FREQUENCIES: dict[str, int] = {
     "Nova": 220,
     "Aria": 250,
     "Leo": 175,
+    "Dylan": 205,
+    "Marcus": 185,
+    "Serena": 235,
+    "Anna": 265,
+    "Sohee": 280,
 }
 # Keep this inline-instruction wrapper local so importing the engine does not
 # import the pipeline package at module load time.
@@ -73,6 +106,15 @@ INLINE_INSTRUCTION_PATTERN = re.compile(
     rf"^\s*{re.escape(INLINE_INSTRUCTION_PREFIX)}(?P<instruction>.*?){re.escape(INLINE_INSTRUCTION_SUFFIX)}\s*",
     re.IGNORECASE | re.DOTALL,
 )
+
+
+@dataclass(slots=True)
+class DesignedVoiceProfile:
+    """Persisted VoiceDesign voice metadata detached from the ORM session."""
+
+    voice_name: str
+    display_name: str
+    voice_description: str
 
 
 @lru_cache(maxsize=1)
@@ -132,6 +174,7 @@ class Qwen3TTS(TTSEngine):
         self.backend = (backend or settings.TTS_BACKEND).strip().lower()
         self.model: Any | None = None
         self.base_model: Any | None = None
+        self._voicedesign_model: Any | None = None
         self.loaded = False
         self.sample_rate = DEFAULT_SAMPLE_RATE
         self._resolved_backend: str | None = None
@@ -141,6 +184,10 @@ class Qwen3TTS(TTSEngine):
         self._min_timeout_samples_before_restart = 10
         self._chapters_since_restart = 0
         self._restart_interval = int(os.environ.get("TTS_MODEL_RESTART_INTERVAL", DEFAULT_MODEL_RESTART_INTERVAL))
+        self._voicedesign_temperature = float(
+            os.environ.get("VOICEDESIGN_TEMPERATURE", VOICEDESIGN_TEMPERATURE_DEFAULT)
+        )
+        self._warned_voicedesign_speed_fallback = False
         self.voice_cloner = VoiceCloner(settings.VOICES_PATH)
 
     @property
@@ -202,10 +249,17 @@ class Qwen3TTS(TTSEngine):
 
         self.model = None
         self.base_model = None
+        self._voicedesign_model = None
         self.loaded = False
         self._resolved_backend = None
         self.sample_rate = DEFAULT_SAMPLE_RATE
         logger.info("Qwen3-TTS engine unloaded")
+
+    @property
+    def voicedesign_available(self) -> bool:
+        """Return whether the VoiceDesign model directory exists on disk."""
+
+        return self._voicedesign_model_path().exists()
 
     @property
     def restart_interval(self) -> int:
@@ -223,9 +277,24 @@ class Qwen3TTS(TTSEngine):
         """Return app-facing voice presets and any runtime cloned voices."""
 
         voices = [
-            Voice(name=name, display_name=name, description=profile["description"])
+            Voice(
+                name=name,
+                display_name=name,
+                description=profile["description"],
+                speaker=profile["speaker"],
+                voice_type="built_in",
+            )
             for name, profile in VOICE_PRESETS.items()
         ]
+        for designed_voice in self._list_designed_voice_profiles():
+            voices.append(
+                Voice(
+                    name=designed_voice.voice_name,
+                    display_name=designed_voice.display_name,
+                    description=designed_voice.voice_description,
+                    voice_type="designed",
+                )
+            )
         for clone_name in self.voice_cloner.list_cloned_voices():
             voices.append(
                 Voice(
@@ -233,6 +302,7 @@ class Qwen3TTS(TTSEngine):
                     display_name=clone_name,
                     description="Cloned runtime voice from a reference sample.",
                     is_cloned=True,
+                    voice_type="cloned",
                 )
             )
         return voices
@@ -268,9 +338,25 @@ class Qwen3TTS(TTSEngine):
             sample_rate=self.sample_rate,
         )
         voice_kind, resolved_voice = self._resolve_voice(voice)
+        if voice_kind == "designed":
+            resolved_instruction = self._compose_voice_design_instruction(resolved_voice, config.instruction)
+            voicedesign_config = AudioGenerationConfig(
+                text=config.text,
+                voice=config.voice,
+                emotion=config.emotion,
+                instruction=resolved_instruction,
+                speed=config.speed,
+                sample_rate=config.sample_rate,
+            )
 
         if self._resolved_backend == "synthetic":
             audio = self._generate_synthetic_audio(config, resolved_voice)
+        elif voice_kind == "designed":
+            audio = self._generate_voicedesign_audio(
+                voicedesign_config,
+                resolved_instruction,
+                raw_voice_description=resolved_voice,
+            )
         elif voice_kind == "clone":
             audio = self._generate_cloned_audio(config, resolved_voice)
         else:
@@ -297,6 +383,43 @@ class Qwen3TTS(TTSEngine):
         cleaned_name = self.voice_cloner.validate_voice_name(output_voice_name)
         logger.info("Registered cloned voice '%s' using %s", cleaned_name, ref_audio_path)
         return cleaned_name
+
+    def generate_with_voice_description(
+        self,
+        text: str,
+        voice_description: str,
+        speed: float = 1.0,
+    ) -> AudioSegment:
+        """Generate audio from a natural-language voice description via VoiceDesign."""
+
+        cleaned_text = text.strip()
+        if not cleaned_text:
+            raise ValueError("Text cannot be empty.")
+        cleaned_description = voice_description.strip()
+        if not cleaned_description:
+            raise ValueError("Voice description cannot be empty.")
+        if not 0.5 <= speed <= 2.0:
+            raise ValueError("Speed must be between 0.5 and 2.0.")
+
+        spoken_text, inline_instruction = self._extract_inline_instruction(cleaned_text)
+        if not spoken_text:
+            raise ValueError("Text cannot be empty.")
+
+        composed_description = self._compose_voice_design_instruction(cleaned_description, inline_instruction)
+        config = AudioGenerationConfig(
+            text=spoken_text,
+            voice="voice_design",
+            instruction=composed_description,
+            speed=speed,
+            sample_rate=self.sample_rate,
+        )
+        audio = self._generate_voicedesign_audio(
+            config,
+            composed_description,
+            raw_voice_description=cleaned_description,
+        )
+        audio = audio.set_channels(1)
+        return self._normalize_audio(audio)
 
     def _resolve_backend(self) -> str:
         """Resolve the backend mode for the current runtime."""
@@ -485,12 +608,90 @@ class Qwen3TTS(TTSEngine):
         self.base_model = self._load_mlx_model(self.base_model_path)
         return self.base_model
 
+    def _ensure_voicedesign_model_loaded(self) -> Any:
+        """Load the VoiceDesign model on first use and cache it."""
+
+        if self._voicedesign_model is not None:
+            return self._voicedesign_model
+
+        voicedesign_path = self._voicedesign_model_path()
+        if not voicedesign_path.exists():
+            raise RuntimeError(
+                f"VoiceDesign model not found at {voicedesign_path}. "
+                "Download it with: "
+                f"huggingface-cli download mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit --local-dir {voicedesign_path}"
+            )
+
+        logger.info("Loading VoiceDesign model from %s", voicedesign_path)
+        self._voicedesign_model = self._load_mlx_model(voicedesign_path)
+        logger.info("VoiceDesign model loaded successfully")
+        self._log_combined_model_memory()
+        return self._voicedesign_model
+
+    def _voicedesign_model_path(self) -> Path:
+        """Return the VoiceDesign model directory next to the primary CustomVoice model."""
+
+        return self.model_path.parent / VOICEDESIGN_MODEL_DIR_NAME
+
+    def _voicedesign_seed(self, voice_description: str) -> int:
+        """Compute a deterministic random seed from a voice description."""
+
+        import hashlib
+
+        normalized = voice_description.strip().lower()
+        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+        return int(digest[:8], 16)
+
+    def _list_designed_voice_profiles(self) -> list[DesignedVoiceProfile]:
+        """Read enabled designed voices from the database."""
+
+        try:
+            from src.database import DesignedVoice, SessionLocal
+
+            session = SessionLocal()
+            try:
+                records = (
+                    session.query(DesignedVoice)
+                    .filter(DesignedVoice.is_enabled.is_(True))
+                    .order_by(DesignedVoice.created_at.desc(), DesignedVoice.id.desc())
+                    .all()
+                )
+            finally:
+                session.close()
+        except Exception as exc:
+            logger.debug("Designed voice metadata unavailable: %s", exc)
+            return []
+
+        return [
+            DesignedVoiceProfile(
+                voice_name=record.voice_name,
+                display_name=record.display_name,
+                voice_description=record.voice_description,
+            )
+            for record in records
+        ]
+
+    def _find_designed_voice_profile(self, voice: str) -> DesignedVoiceProfile | None:
+        """Resolve a designed voice by name, case-insensitively."""
+
+        requested = voice.strip().lower()
+        if not requested:
+            return None
+        for profile in self._list_designed_voice_profiles():
+            if profile.voice_name.lower() == requested:
+                return profile
+        return None
+
     def _resolve_voice(self, voice: str) -> tuple[str, str]:
-        """Resolve a request voice into either a preset speaker or a registered clone."""
+        """Resolve a request voice into a designed voice, clone, or preset speaker."""
 
         normalized = voice.strip()
         if not normalized:
             raise ValueError("Voice cannot be empty.")
+
+        designed_voice = self._find_designed_voice_profile(normalized)
+        if designed_voice is not None:
+            return ("designed", designed_voice.voice_description)
 
         clone_assets = self.voice_cloner.get_voice_assets(normalized)
         if clone_assets is not None:
@@ -532,6 +733,88 @@ class Qwen3TTS(TTSEngine):
             raise RuntimeError("Qwen3-TTS generation returned no audio.")
 
         return self._results_to_audio_segment(results)
+
+    def _generate_voicedesign_audio(
+        self,
+        config: AudioGenerationConfig,
+        voice_description: str,
+        raw_voice_description: str | None = None,
+    ) -> AudioSegment:
+        """Generate audio using the VoiceDesign model and a text-only voice description.
+
+        Uses greedy VoiceDesign decoding by default so the same description stays
+        consistent across chunked generation. The deterministic MLX seed is kept
+        as a fallback for any remaining stochastic behavior.
+        """
+
+        model = self._ensure_voicedesign_model_loaded()
+        generate_voice_design = getattr(model, "generate_voice_design", None)
+        if not callable(generate_voice_design):
+            raise RuntimeError("Loaded VoiceDesign model does not expose generate_voice_design().")
+
+        kwargs: dict[str, Any] = {
+            "text": config.text,
+            "language": "English",
+            "instruct": voice_description,
+            "temperature": self._voicedesign_temperature,
+        }
+        logger.info(
+            "VoiceDesign generation: temperature=%.2f, text_len=%d, instruct_len=%d",
+            self._voicedesign_temperature,
+            len(config.text),
+            len(voice_description),
+        )
+        native_speed_supported = self._callable_accepts_kwarg(generate_voice_design, "speed")
+        if native_speed_supported:
+            kwargs["speed"] = config.speed
+        seed_random = getattr(getattr(_mlx_core_module(), "random", None), "seed", None)
+        seed_source = raw_voice_description if raw_voice_description is not None else voice_description
+        seed = self._voicedesign_seed(seed_source) if callable(seed_random) else None
+
+        if seed is not None:
+            seed_random(seed)
+            logger.debug("Set VoiceDesign MLX seed=%d for description='%s'", seed, seed_source[:50])
+
+        while True:
+            try:
+                results = list(generate_voice_design(**kwargs))
+                break
+            except TypeError as exc:
+                error_text = str(exc).lower()
+                if native_speed_supported and "speed" in kwargs and "speed" in error_text:
+                    logger.warning(
+                        "VoiceDesign model rejected native speed control; retrying without speed and applying post-processing fallback."
+                    )
+                    kwargs.pop("speed", None)
+                    native_speed_supported = False
+                elif "temperature" in kwargs and "temperature" in error_text:
+                    logger.warning(
+                        "VoiceDesign model rejected temperature parameter; retrying with model defaults."
+                    )
+                    kwargs.pop("temperature", None)
+                else:
+                    logger.exception("VoiceDesign generation failed")
+                    raise RuntimeError(f"VoiceDesign generation failed: {exc}") from exc
+
+                if seed is not None:
+                    seed_random(seed)
+                    logger.debug("Re-set VoiceDesign MLX seed=%d for retry", seed)
+            except Exception as exc:
+                logger.exception("VoiceDesign generation failed")
+                raise RuntimeError(f"VoiceDesign generation failed: {exc}") from exc
+
+        if not results:
+            raise RuntimeError("VoiceDesign generation returned no audio.")
+
+        audio = self._results_to_audio_segment(results)
+        if not native_speed_supported and abs(config.speed - 1.0) >= 0.01:
+            if not self._warned_voicedesign_speed_fallback:
+                logger.warning(
+                    "VoiceDesign does not support native speed control; applying ffmpeg tempo adjustment after generation."
+                )
+                self._warned_voicedesign_speed_fallback = True
+            audio = self._apply_speed_preserving_pitch(audio, config.speed)
+        return audio
 
     def _generate_cloned_audio(self, config: AudioGenerationConfig, clone_name: str) -> AudioSegment:
         """Generate audio using the Base model and a stored voice reference."""
@@ -697,6 +980,18 @@ class Qwen3TTS(TTSEngine):
             return None
         return " ".join(instructions)
 
+    def _compose_voice_design_instruction(
+        self,
+        voice_description: str,
+        inline_instruction: str | None,
+    ) -> str:
+        """Fold extra style instructions into the saved VoiceDesign description."""
+
+        cleaned_description = voice_description.strip()
+        if not inline_instruction:
+            return cleaned_description
+        return f"{cleaned_description} Additional speaking direction: {inline_instruction.strip()}"
+
     def _extract_inline_instruction(self, text: str) -> tuple[str, str | None]:
         """Remove the internal instruction wrapper before speaking the text."""
 
@@ -816,6 +1111,26 @@ class Qwen3TTS(TTSEngine):
         del cls
         _mlx_core_module.cache_clear()
         _ffmpeg_binary.cache_clear()
+
+    @staticmethod
+    def _callable_accepts_kwarg(func: Any, keyword: str) -> bool:
+        """Return whether a callable appears to accept a named keyword argument."""
+
+        try:
+            return keyword in inspect.signature(func).parameters
+        except (TypeError, ValueError):
+            return False
+
+    def _log_combined_model_memory(self) -> None:
+        """Emit a memory note when both CustomVoice and VoiceDesign are resident."""
+
+        if self.model is None or self._voicedesign_model is None:
+            return
+        logger.info(
+            "CustomVoice and VoiceDesign models are both loaded (~%d MB combined, current RSS %.1f MB).",
+            APPROX_QWEN_MODEL_MEMORY_MB * 2,
+            self.current_process_memory_mb(),
+        )
 
     @classmethod
     def clear_mlx_metal_cache(cls) -> bool:

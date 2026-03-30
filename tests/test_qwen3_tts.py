@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,6 +19,7 @@ from src.database import get_db
 from src.engines.model_manager import ModelManager
 from src.config import settings
 from src.engines import AudioStitcher, Qwen3TTS, TextChunker
+from src.engines.qwen3_tts import AudioGenerationConfig, DesignedVoiceProfile, VOICE_PRESETS
 from src.main import app
 
 
@@ -145,10 +147,66 @@ def test_list_voices() -> None:
     """Voice listing includes the app-facing preset aliases."""
 
     engine = Qwen3TTS(backend="synthetic")
+    engine.voice_cloner.list_cloned_voices = lambda: []  # type: ignore[method-assign]
+    engine._list_designed_voice_profiles = lambda: []  # type: ignore[method-assign]
 
     voices = engine.list_voices()
+    built_in_voices = {voice.name: voice for voice in voices}
 
-    assert {voice.name for voice in voices} >= {"Ethan", "Nova", "Aria", "Leo"}
+    assert set(built_in_voices) == set(VOICE_PRESETS)
+    assert {voice.speaker for voice in voices} == {profile["speaker"] for profile in VOICE_PRESETS.values()}
+    assert all(
+        built_in_voices[name].description == profile["description"]
+        for name, profile in VOICE_PRESETS.items()
+    )
+
+
+def test_voice_presets_cover_all_qwen_builtin_speakers() -> None:
+    """The preset registry should expose all 9 shipped Qwen speaker aliases."""
+
+    assert len(VOICE_PRESETS) == 9
+    assert set(VOICE_PRESETS) == {
+        "Anna",
+        "Aria",
+        "Dylan",
+        "Ethan",
+        "Leo",
+        "Marcus",
+        "Nova",
+        "Serena",
+        "Sohee",
+    }
+    assert {profile["speaker"] for profile in VOICE_PRESETS.values()} == {
+        "aiden",
+        "dylan",
+        "eric",
+        "ono_anna",
+        "ryan",
+        "serena",
+        "sohee",
+        "uncle_fu",
+        "vivian",
+    }
+
+
+@pytest.mark.parametrize("voice_name", ["Dylan", "Marcus", "Serena", "Anna", "Sohee"])
+def test_new_qwen_voice_presets_generate_successfully(client: TestClient, voice_name: str) -> None:
+    """Each new built-in preset should work through the voice preview API."""
+
+    response = client.post(
+        "/api/voice-lab/test",
+        json={
+            "text": "Every preset should produce a valid preview clip.",
+            "voice": voice_name,
+            "emotion": "neutral",
+            "speed": 1.0,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["audio_url"].startswith("/audio/voices/test-")
+    assert payload["settings"]["voice"] == voice_name
 
 
 def test_generate_requires_load() -> None:
@@ -188,6 +246,434 @@ def test_generate_rejects_unknown_voice() -> None:
 
     with pytest.raises(ValueError, match="Unknown voice"):
         engine.generate("Hello world.", voice="Unknown Voice")
+
+
+def test_voicedesign_temperature_default() -> None:
+    """VoiceDesign generation should default to deterministic greedy decoding."""
+
+    engine = Qwen3TTS(backend="synthetic")
+
+    assert engine._voicedesign_temperature == 0.0
+
+
+def test_voicedesign_temperature_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An explicit VoiceDesign temperature env override should be honored."""
+
+    monkeypatch.setenv("VOICEDESIGN_TEMPERATURE", "0.3")
+
+    engine = Qwen3TTS(backend="synthetic")
+
+    assert engine._voicedesign_temperature == 0.3
+
+
+def test_voicedesign_seed_deterministic() -> None:
+    """The same voice description should always map to the same seed."""
+
+    engine = Qwen3TTS(backend="synthetic")
+
+    assert (
+        engine._voicedesign_seed("A deep, authoritative male narrator")
+        == engine._voicedesign_seed("A deep, authoritative male narrator")
+    )
+
+
+def test_voicedesign_seed_case_insensitive() -> None:
+    """Seed generation should ignore case differences."""
+
+    engine = Qwen3TTS(backend="synthetic")
+
+    assert engine._voicedesign_seed("Commander Voice") == engine._voicedesign_seed("commander voice")
+
+
+def test_voicedesign_seed_different_descriptions() -> None:
+    """Different descriptions should not collapse to the same seed in normal cases."""
+
+    engine = Qwen3TTS(backend="synthetic")
+
+    assert engine._voicedesign_seed("A deep male voice") != engine._voicedesign_seed("A high female voice")
+
+
+def test_voicedesign_seed_strips_whitespace() -> None:
+    """Leading and trailing whitespace should not change the seed."""
+
+    engine = Qwen3TTS(backend="synthetic")
+
+    assert engine._voicedesign_seed("  A deep male voice  ") == engine._voicedesign_seed("A deep male voice")
+
+
+def test_voicedesign_seed_returns_positive_int() -> None:
+    """VoiceDesign seeds should be stable non-negative integers."""
+
+    engine = Qwen3TTS(backend="synthetic")
+
+    seed = engine._voicedesign_seed("Test voice")
+
+    assert isinstance(seed, int)
+    assert seed >= 0
+
+
+def test_voicedesign_audio_sets_seed_before_generation(monkeypatch: pytest.MonkeyPatch) -> None:
+    """VoiceDesign generation should set the MLX RNG seed and pass temperature before sampling."""
+
+    seeds_set: list[int] = []
+
+    class FakeMx:
+        class random:
+            @staticmethod
+            def seed(seed: int) -> None:
+                seeds_set.append(seed)
+
+    class FakeVoiceDesignModel:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def generate_voice_design(self, text: str, language: str, instruct: str, temperature: float):
+            self.calls.append(
+                {
+                    "text": text,
+                    "language": language,
+                    "instruct": instruct,
+                    "temperature": temperature,
+                }
+            )
+            yield SimpleNamespace(audio=[0.0] * 22050, sample_rate=22050)
+
+    engine = Qwen3TTS(backend="synthetic")
+    monkeypatch.setattr("src.engines.qwen3_tts._mlx_core_module", lambda: FakeMx)
+
+    model = FakeVoiceDesignModel()
+    monkeypatch.setattr(engine, "_ensure_voicedesign_model_loaded", lambda: model)
+
+    config = AudioGenerationConfig(
+        text="Hello world",
+        voice="voice_design",
+        instruction="test voice description",
+        speed=1.0,
+        sample_rate=22050,
+    )
+
+    audio = engine._generate_voicedesign_audio(config, "test voice description")
+
+    assert isinstance(audio, AudioSegment)
+    assert seeds_set == [engine._voicedesign_seed("test voice description")]
+    assert model.calls == [
+        {
+            "text": "Hello world",
+            "language": "English",
+            "instruct": "test voice description",
+            "temperature": 0.0,
+        }
+    ]
+
+
+def test_voicedesign_audio_reseeds_before_speed_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The speed-fallback retry should re-seed so the sampled voice stays deterministic."""
+
+    seeds_set: list[int] = []
+
+    class FakeMx:
+        class random:
+            @staticmethod
+            def seed(seed: int) -> None:
+                seeds_set.append(seed)
+
+    class FakeVoiceDesignModel:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def generate_voice_design(
+            self,
+            text: str,
+            language: str,
+            instruct: str,
+            temperature: float,
+            speed: float | None = None,
+        ):
+            self.calls.append(
+                {
+                    "text": text,
+                    "language": language,
+                    "instruct": instruct,
+                    "temperature": temperature,
+                    "speed": speed,
+                }
+            )
+            if speed is not None:
+                raise TypeError("speed is not supported")
+            yield SimpleNamespace(audio=[0.0] * 22050, sample_rate=22050)
+
+    engine = Qwen3TTS(backend="synthetic")
+    monkeypatch.setattr("src.engines.qwen3_tts._mlx_core_module", lambda: FakeMx)
+
+    model = FakeVoiceDesignModel()
+    monkeypatch.setattr(engine, "_ensure_voicedesign_model_loaded", lambda: model)
+
+    config = AudioGenerationConfig(
+        text="Retry world",
+        voice="voice_design",
+        instruction="retry voice description",
+        speed=1.2,
+        sample_rate=22050,
+    )
+
+    audio = engine._generate_voicedesign_audio(config, "retry voice description")
+    expected_seed = engine._voicedesign_seed("retry voice description")
+
+    assert isinstance(audio, AudioSegment)
+    assert seeds_set == [expected_seed, expected_seed]
+    assert model.calls == [
+        {
+            "text": "Retry world",
+            "language": "English",
+            "instruct": "retry voice description",
+            "temperature": 0.0,
+            "speed": 1.2,
+        },
+        {
+            "text": "Retry world",
+            "language": "English",
+            "instruct": "retry voice description",
+            "temperature": 0.0,
+            "speed": None,
+        },
+    ]
+
+
+def test_voicedesign_audio_retries_without_temperature_when_rejected(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """VoiceDesign should retry without temperature when the model rejects that kwarg."""
+
+    seeds_set: list[int] = []
+
+    class FakeMx:
+        class random:
+            @staticmethod
+            def seed(seed: int) -> None:
+                seeds_set.append(seed)
+
+    class FakeVoiceDesignModel:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def generate_voice_design(self, **kwargs):
+            self.calls.append(dict(kwargs))
+            if "temperature" in kwargs:
+                raise TypeError("temperature is not supported")
+            yield SimpleNamespace(audio=[0.0] * 22050, sample_rate=22050)
+
+    engine = Qwen3TTS(backend="synthetic")
+    monkeypatch.setattr("src.engines.qwen3_tts._mlx_core_module", lambda: FakeMx)
+
+    model = FakeVoiceDesignModel()
+    monkeypatch.setattr(engine, "_ensure_voicedesign_model_loaded", lambda: model)
+
+    config = AudioGenerationConfig(
+        text="Retry temperature",
+        voice="voice_design",
+        instruction="steady commander voice",
+        speed=1.0,
+        sample_rate=22050,
+    )
+
+    audio = engine._generate_voicedesign_audio(config, "steady commander voice")
+    expected_seed = engine._voicedesign_seed("steady commander voice")
+
+    assert isinstance(audio, AudioSegment)
+    assert seeds_set == [expected_seed, expected_seed]
+    assert model.calls == [
+        {
+            "text": "Retry temperature",
+            "language": "English",
+            "instruct": "steady commander voice",
+            "temperature": 0.0,
+        },
+        {
+            "text": "Retry temperature",
+            "language": "English",
+            "instruct": "steady commander voice",
+        },
+    ]
+
+
+def test_voicedesign_audio_uses_raw_description_for_seed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """VoiceDesign seeding should use the raw description, not the composed instruction."""
+
+    seeds_set: list[int] = []
+
+    class FakeMx:
+        class random:
+            @staticmethod
+            def seed(seed: int) -> None:
+                seeds_set.append(seed)
+
+    class FakeVoiceDesignModel:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def generate_voice_design(self, text: str, language: str, instruct: str, temperature: float):
+            self.calls.append(
+                {
+                    "text": text,
+                    "language": language,
+                    "instruct": instruct,
+                    "temperature": temperature,
+                }
+            )
+            yield SimpleNamespace(audio=[0.0] * 22050, sample_rate=22050)
+
+    engine = Qwen3TTS(backend="synthetic")
+    monkeypatch.setattr("src.engines.qwen3_tts._mlx_core_module", lambda: FakeMx)
+
+    model = FakeVoiceDesignModel()
+    monkeypatch.setattr(engine, "_ensure_voicedesign_model_loaded", lambda: model)
+
+    config = AudioGenerationConfig(
+        text="Hello world",
+        voice="voice_design",
+        instruction="original voice description Additional speaking direction: more urgency",
+        speed=1.0,
+        sample_rate=22050,
+    )
+
+    raw_description = "original voice description"
+    composed_description = f"{raw_description} Additional speaking direction: more urgency"
+    audio = engine._generate_voicedesign_audio(
+        config,
+        composed_description,
+        raw_voice_description=raw_description,
+    )
+
+    assert isinstance(audio, AudioSegment)
+    assert seeds_set == [engine._voicedesign_seed(raw_description)]
+    assert model.calls == [
+        {
+            "text": "Hello world",
+            "language": "English",
+            "instruct": composed_description,
+            "temperature": 0.0,
+        }
+    ]
+
+
+def test_generate_passes_raw_voice_description_to_voicedesign(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Designed-voice generation should keep seeding anchored to the saved raw description."""
+
+    captured: dict[str, object] = {}
+    engine = Qwen3TTS(backend="mlx")
+    engine.loaded = True
+    engine.sample_rate = 22050
+    engine._resolved_backend = "mlx"
+
+    monkeypatch.setattr(engine, "_resolve_voice", lambda voice: ("designed", "Commander raw description"))
+    monkeypatch.setattr(engine, "_normalize_audio", lambda audio: audio)
+
+    def fake_generate_voicedesign_audio(
+        config: AudioGenerationConfig,
+        voice_description: str,
+        raw_voice_description: str | None = None,
+    ) -> AudioSegment:
+        captured["instruction"] = config.instruction
+        captured["voice_description"] = voice_description
+        captured["raw_voice_description"] = raw_voice_description
+        return AudioSegment.silent(duration=100, frame_rate=22050)
+
+    monkeypatch.setattr(engine, "_generate_voicedesign_audio", fake_generate_voicedesign_audio)
+
+    audio = engine.generate("Hello world", voice="Commander", emotion="warm")
+
+    assert isinstance(audio, AudioSegment)
+    assert captured == {
+        "instruction": "Commander raw description Additional speaking direction: Warm, reassuring audiobook narration with gentle energy.",
+        "voice_description": "Commander raw description Additional speaking direction: Warm, reassuring audiobook narration with gentle energy.",
+        "raw_voice_description": "Commander raw description",
+    }
+
+
+def test_generate_with_voice_description_uses_voicedesign_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """VoiceDesign generation should call the dedicated model method with an instruct prompt."""
+
+    class FakeVoiceDesignModel:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def generate_voice_design(self, **kwargs):
+            self.calls.append(kwargs)
+            yield SimpleNamespace(audio=[0.0] * 22050, sample_rate=22050)
+
+    fake_model = FakeVoiceDesignModel()
+    engine = Qwen3TTS(backend="synthetic")
+    monkeypatch.setattr(engine, "_ensure_voicedesign_model_loaded", lambda: fake_model)
+
+    audio = engine.generate_with_voice_description(
+        "Hello from the designer.",
+        "A deep, authoritative American male narrator.",
+        speed=1.0,
+    )
+
+    assert isinstance(audio, AudioSegment)
+    assert len(audio) > 0
+    assert fake_model.calls == [
+        {
+            "instruct": "A deep, authoritative American male narrator.",
+            "language": "English",
+            "text": "Hello from the designer.",
+            "temperature": 0.0,
+        }
+    ]
+
+
+def test_generate_with_voice_description_uses_speed_fallback_when_needed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """VoiceDesign should fall back to post-processing when native speed control is unavailable."""
+
+    class FakeVoiceDesignModel:
+        def generate_voice_design(self, **kwargs):
+            del kwargs
+            yield SimpleNamespace(audio=[0.0] * 22050, sample_rate=22050)
+
+    calls: list[float] = []
+    engine = Qwen3TTS(backend="synthetic")
+    monkeypatch.setattr(engine, "_ensure_voicedesign_model_loaded", lambda: FakeVoiceDesignModel())
+    monkeypatch.setattr(
+        engine,
+        "_apply_speed_preserving_pitch",
+        lambda audio, speed: calls.append(speed) or audio,
+    )
+
+    engine.generate_with_voice_description(
+        "Speed fallback check.",
+        "A smooth American male narrator.",
+        speed=1.2,
+    )
+
+    assert calls == [1.2]
+
+
+def test_resolve_voice_prioritizes_designed_voices(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Designed voice IDs should resolve before clones, aliases, or raw speakers."""
+
+    engine = Qwen3TTS(backend="synthetic")
+    monkeypatch.setattr(
+        engine,
+        "_list_designed_voice_profiles",
+        lambda: [
+            DesignedVoiceProfile(
+                voice_name="ethan",
+                display_name="Designed Ethan",
+                voice_description="A custom designed narration voice.",
+            )
+        ],
+    )
+    monkeypatch.setattr(engine.voice_cloner, "get_voice_assets", lambda _voice: {"voice_name": "ethan-clone"})
+
+    voice_kind, resolved_voice = engine._resolve_voice("Ethan")
+
+    assert voice_kind == "designed"
+    assert resolved_voice == "A custom designed narration voice."
 
 
 def test_text_chunker_preserves_text_and_limits_chunk_size() -> None:
@@ -357,6 +843,38 @@ def test_voice_test_api_rejects_blank_text(client: TestClient) -> None:
     assert response.json() == {"detail": "Text cannot be empty."}
 
 
+def test_voice_test_api_returns_503_when_gpu_is_busy(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Voice previews should fail cleanly when the generation lock cannot be acquired."""
+
+    class BusyManager:
+        @asynccontextmanager
+        async def generation_session(self, *, timeout_seconds: float | None = None):
+            del timeout_seconds
+            raise asyncio.TimeoutError
+            yield
+
+    monkeypatch.setattr(generation_runtime, "get_engine_manager", lambda engine_name: BusyManager())
+
+    response = client.post(
+        "/api/voice-lab/test",
+        json={
+            "text": "Please wait for the GPU to become available.",
+            "voice": "Ethan",
+            "emotion": "neutral",
+            "speed": 1.0,
+        },
+    )
+
+    assert response.status_code == 503
+    assert (
+        response.json()["detail"]
+        == "Voice preview is temporarily unavailable — audiobook generation is using the GPU. Please try again in a moment or pause generation first."
+    )
+
+
 def test_voice_list_api(client: TestClient) -> None:
     """Voice lab should expose the configured engine voices."""
 
@@ -364,14 +882,28 @@ def test_voice_list_api(client: TestClient) -> None:
 
     assert response.status_code == 200
     payload = response.json()
+    built_in_voices = {
+        voice["name"]: voice
+        for voice in payload["voices"]
+        if voice["voice_type"] == "built_in"
+    }
+
     assert payload["engine"] == "qwen3_tts"
-    assert {voice["name"] for voice in payload["voices"]} >= {"Ethan", "Nova", "Aria", "Leo"}
+    assert set(built_in_voices) == set(VOICE_PRESETS)
+    assert built_in_voices["Ethan"]["id"] == "Ethan"
+    assert built_in_voices["Ethan"]["type"] == "built-in"
+    assert built_in_voices["Marcus"]["speaker"] == "eric"
+    assert all(
+        built_in_voices[name]["description"] == profile["description"]
+        for name, profile in VOICE_PRESETS.items()
+    )
 
 
 def test_voice_list_returns_loading_when_engine_not_ready(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
     """Voice listing should degrade quickly while the shared engine is still cold-loading."""
 
-    async def slow_get_engine():
+    async def slow_get_engine(engine_name: str | None = None):
+        del engine_name
         await asyncio.sleep(2.5)
         return SimpleNamespace(name="qwen3_tts", list_voices=lambda: [])
 
