@@ -176,6 +176,8 @@ class Qwen3TTS(TTSEngine):
         self.model: Any | None = None
         self.base_model: Any | None = None
         self._voicedesign_model: Any | None = None
+        self._active_model_name: str | None = None
+        self._lazy_load_pending = False
         self.loaded = False
         self.sample_rate = DEFAULT_SAMPLE_RATE
         self._resolved_backend: str | None = None
@@ -233,17 +235,17 @@ class Qwen3TTS(TTSEngine):
         if self._resolved_backend == "synthetic":
             logger.info("Using synthetic Qwen3-TTS backend for test-friendly audio generation")
             self.sample_rate = DEFAULT_SAMPLE_RATE
+            self._active_model_name = None
+            self._lazy_load_pending = False
             self.loaded = True
             return
 
-        self.model = self._load_mlx_model(self.model_path)
-        self.sample_rate = int(getattr(self.model, "sample_rate", DEFAULT_SAMPLE_RATE))
-        model_speakers = getattr(self.model, "supported_speakers", None)
-        if model_speakers:
-            self._supported_speakers = {str(speaker).lower() for speaker in model_speakers}
+        self.sample_rate = self._discover_sample_rate(self.model_path)
+        self._active_model_name = None
+        self._lazy_load_pending = True
         self.loaded = True
         self._chapters_since_restart = 0
-        logger.info("Loaded Qwen3-TTS model from %s", self.model_path)
+        logger.info("Prepared Qwen3-TTS engine for lazy MLX loading from %s", self.model_path)
 
     def unload(self) -> None:
         """Unload any loaded MLX models and clear transient voice state."""
@@ -251,9 +253,12 @@ class Qwen3TTS(TTSEngine):
         self.model = None
         self.base_model = None
         self._voicedesign_model = None
+        self._active_model_name = None
+        self._lazy_load_pending = False
         self.loaded = False
         self._resolved_backend = None
         self.sample_rate = DEFAULT_SAMPLE_RATE
+        self._release_model_memory()
         logger.info("Qwen3-TTS engine unloaded")
 
     @property
@@ -326,6 +331,15 @@ class Qwen3TTS(TTSEngine):
         if not 0.5 <= speed <= 2.0:
             raise ValueError("Speed must be between 0.5 and 2.0.")
 
+        voice_kind, resolved_voice = self._resolve_voice(voice)
+        if self._resolved_backend == "mlx":
+            if voice_kind == "designed":
+                self._ensure_voicedesign_model_loaded()
+            elif voice_kind == "clone":
+                self._ensure_base_model_loaded()
+            else:
+                self._ensure_exclusive_model("custom_voice")
+
         spoken_text, inline_instruction = self._extract_inline_instruction(cleaned_text)
         if not spoken_text:
             raise ValueError("Text cannot be empty.")
@@ -338,7 +352,6 @@ class Qwen3TTS(TTSEngine):
             speed=speed,
             sample_rate=self.sample_rate,
         )
-        voice_kind, resolved_voice = self._resolve_voice(voice)
         if voice_kind == "designed":
             resolved_instruction = self._compose_voice_design_instruction(resolved_voice)
             generation_text = self._prepend_instruction_note(config.text, config.instruction)
@@ -407,6 +420,9 @@ class Qwen3TTS(TTSEngine):
         if not spoken_text:
             raise ValueError("Text cannot be empty.")
 
+        if self._resolved_backend == "mlx":
+            self._ensure_voicedesign_model_loaded()
+
         composed_description = self._compose_voice_design_instruction(cleaned_description)
         generation_text = self._prepend_instruction_note(spoken_text, inline_instruction)
         config = AudioGenerationConfig(
@@ -448,6 +464,25 @@ class Qwen3TTS(TTSEngine):
 
         spk_id = config.get("talker_config", {}).get("spk_id") or {}
         return [str(speaker).lower() for speaker in spk_id]
+
+    def _discover_sample_rate(self, model_path: Path) -> int:
+        """Read sample-rate metadata from disk without loading model weights."""
+
+        config_path = model_path / "config.json"
+        if not config_path.exists():
+            return DEFAULT_SAMPLE_RATE
+
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            logger.warning("Unable to parse model config at %s", config_path)
+            return DEFAULT_SAMPLE_RATE
+
+        sample_rate = config.get("sample_rate") or config.get("talker_config", {}).get("sample_rate")
+        try:
+            return int(sample_rate or DEFAULT_SAMPLE_RATE)
+        except (TypeError, ValueError):
+            return DEFAULT_SAMPLE_RATE
 
     def _load_mlx_model(self, path: Path) -> Any:
         """Load an MLX model instance from disk without triggering mlx-audio's hanging post-load compile."""
@@ -599,37 +634,134 @@ class Qwen3TTS(TTSEngine):
     def _ensure_base_model_loaded(self) -> Any:
         """Load the Base model on demand for voice-cloned synthesis."""
 
-        if self.base_model is not None:
-            return self.base_model
-
-        if not self.base_model_path.exists():
-            raise RuntimeError(
-                f"Base model not found at {self.base_model_path}. "
-                "Voice cloning requires Qwen3-TTS-12Hz-1.7B-Base-8bit."
-            )
-
-        self.base_model = self._load_mlx_model(self.base_model_path)
+        self._ensure_exclusive_model("base")
         return self.base_model
 
     def _ensure_voicedesign_model_loaded(self) -> Any:
         """Load the VoiceDesign model on first use and cache it."""
 
-        if self._voicedesign_model is not None:
-            return self._voicedesign_model
-
-        voicedesign_path = self._voicedesign_model_path()
-        if not voicedesign_path.exists():
-            raise RuntimeError(
-                f"VoiceDesign model not found at {voicedesign_path}. "
-                "Download it with: "
-                f"huggingface-cli download mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit --local-dir {voicedesign_path}"
-            )
-
-        logger.info("Loading VoiceDesign model from %s", voicedesign_path)
-        self._voicedesign_model = self._load_mlx_model(voicedesign_path)
-        logger.info("VoiceDesign model loaded successfully")
-        self._log_combined_model_memory()
+        self._ensure_exclusive_model("voicedesign")
         return self._voicedesign_model
+
+    def _ensure_exclusive_model(self, needed: str) -> None:
+        """Unload all other models, then load only the requested one."""
+
+        if self._resolved_backend != "mlx":
+            return
+
+        current_model = self._loaded_model_instance(needed)
+        if current_model is not None and self._active_model_name == needed:
+            self.sample_rate = int(getattr(current_model, "sample_rate", self.sample_rate))
+            self._lazy_load_pending = False
+            return
+
+        self._check_memory_pressure()
+        had_loaded_models = any(model is not None for model in (self.model, self.base_model, self._voicedesign_model))
+        self.model = None
+        self.base_model = None
+        self._voicedesign_model = None
+        self._active_model_name = None
+        if had_loaded_models:
+            self._release_model_memory()
+
+        if needed == "custom_voice":
+            loaded_model = self._load_mlx_model(self.model_path)
+            self.model = loaded_model
+            model_speakers = getattr(loaded_model, "supported_speakers", None)
+            if model_speakers:
+                self._supported_speakers = {str(speaker).lower() for speaker in model_speakers}
+        elif needed == "base":
+            if not self.base_model_path.exists():
+                raise RuntimeError(
+                    f"Base model not found at {self.base_model_path}. "
+                    "Voice cloning requires Qwen3-TTS-12Hz-1.7B-Base-8bit."
+                )
+            loaded_model = self._load_mlx_model(self.base_model_path)
+            self.base_model = loaded_model
+        elif needed == "voicedesign":
+            voicedesign_path = self._voicedesign_model_path()
+            if not voicedesign_path.exists():
+                raise RuntimeError(
+                    f"VoiceDesign model not found at {voicedesign_path}. "
+                    "Download it with: "
+                    f"huggingface-cli download mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign-8bit --local-dir {voicedesign_path}"
+                )
+            loaded_model = self._load_mlx_model(voicedesign_path)
+            self._voicedesign_model = loaded_model
+        else:
+            raise ValueError(f"Unknown exclusive model target: {needed}")
+
+        self.sample_rate = int(getattr(loaded_model, "sample_rate", self.sample_rate))
+        self._active_model_name = needed
+        self._lazy_load_pending = False
+        logger.info(
+            "Model swap: unloaded previous, loaded %s (RSS: %.0f MB)",
+            needed,
+            self.current_process_memory_mb(),
+        )
+
+    def _loaded_model_instance(self, model_name: str) -> Any | None:
+        """Return the loaded model instance for the requested residency slot."""
+
+        if model_name == "custom_voice":
+            return self.model
+        if model_name == "base":
+            return self.base_model
+        if model_name == "voicedesign":
+            return self._voicedesign_model
+        raise ValueError(f"Unknown model slot: {model_name}")
+
+    def _release_model_memory(self) -> None:
+        """Force release of Python and Metal caches after a model unload."""
+
+        gc.collect()
+        self.clear_mlx_metal_cache()
+
+    def _check_memory_pressure(self) -> bool:
+        """Return whether macOS appears to have enough headroom for another model load."""
+
+        try:
+            result = subprocess.run(
+                ["vm_stat"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except Exception as exc:
+            logger.debug("Unable to read vm_stat for memory pressure: %s", exc)
+            return True
+
+        if result.returncode != 0:
+            logger.debug("vm_stat exited with %s: %s", result.returncode, result.stderr.strip())
+            return True
+
+        page_size = 4096
+        free_pages = 0
+        speculative_pages = 0
+        for line in result.stdout.splitlines():
+            normalized = line.strip()
+            if "page size of" in normalized:
+                match = re.search(r"page size of (\d+) bytes", normalized)
+                if match is not None:
+                    page_size = int(match.group(1))
+                continue
+            if normalized.startswith("Pages free:"):
+                free_pages = int(normalized.split(":", maxsplit=1)[1].strip().rstrip("."))
+                continue
+            if normalized.startswith("Pages speculative:"):
+                speculative_pages = int(normalized.split(":", maxsplit=1)[1].strip().rstrip("."))
+
+        free_mb = ((free_pages + speculative_pages) * page_size) / (1024 * 1024)
+        projected_free_mb = free_mb - APPROX_QWEN_MODEL_MEMORY_MB
+        enough_headroom = projected_free_mb >= 1024
+        if not enough_headroom:
+            logger.warning(
+                "Low free memory before model load: free=%.0f MB projected_after_load=%.0f MB. "
+                "Close other apps to avoid OOM kills.",
+                free_mb,
+                projected_free_mb,
+            )
+        return enough_headroom
 
     def _voicedesign_model_path(self) -> Path:
         """Return the VoiceDesign model directory next to the primary CustomVoice model."""
@@ -1172,7 +1304,16 @@ class Qwen3TTS(TTSEngine):
 
             return round(psutil.Process().memory_info().rss / (1024 * 1024), 3)
         except Exception:
-            return 0.0
+            try:
+                import resource
+                import sys
+
+                rss = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+                if sys.platform == "darwin":
+                    return round(rss / (1024 * 1024), 3)
+                return round(rss / 1024, 3)
+            except Exception:
+                return 0.0
 
     def record_completed_chapter(self) -> None:
         """Track one completed chapter for restart-status reporting."""

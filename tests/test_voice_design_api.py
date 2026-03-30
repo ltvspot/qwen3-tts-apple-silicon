@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ from pydub.audio_segment import AudioSegment
 from src.api import generation_runtime, voice_lab
 from src.config import settings
 from src.database import ClonedVoice, DesignedVoice
+from src.engines.qwen3_tts import BASE_MODEL_DIR_NAME, MODEL_DIR_NAME, VOICEDESIGN_MODEL_DIR_NAME, Qwen3TTS
 
 
 @pytest.fixture(autouse=True)
@@ -22,6 +24,21 @@ def isolated_voice_outputs(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> N
     monkeypatch.setattr(settings, "VOICES_PATH", str(tmp_path / "voices"))
     yield
     voice_lab.release_engine()
+
+
+def _create_stub_qwen_model_dirs(tmp_path: Path) -> Path:
+    """Create minimal model directories for route-level Qwen3 engine tests."""
+
+    root = tmp_path / "models"
+    custom_path = root / MODEL_DIR_NAME
+    for directory, payload in (
+        (custom_path, {"talker_config": {"spk_id": {"aiden": 1}}}),
+        (root / BASE_MODEL_DIR_NAME, {}),
+        (root / VOICEDESIGN_MODEL_DIR_NAME, {}),
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "config.json").write_text(json.dumps(payload), encoding="utf-8")
+    return custom_path
 
 
 def test_voice_design_status_reports_availability(client, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -341,6 +358,93 @@ def test_lock_designed_voice_creates_clone_assets_and_db_record(
     assert stored_clone.display_name == "Commander (Locked)"
     assert stored_clone.reference_audio_path == str(audio_path)
     assert stored_clone.transcript_path == str(transcript_path)
+
+
+def test_lock_designed_voice_swaps_to_voicedesign_then_clone_generation_swaps_back(
+    client,
+    test_db,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Locking should force the VoiceDesign model, then later clone generation should swap back to Base."""
+
+    test_db.add(
+        DesignedVoice(
+            voice_name="commander",
+            display_name="Commander",
+            voice_description="A steady, resonant command voice.",
+        )
+    )
+    test_db.commit()
+
+    model_path = _create_stub_qwen_model_dirs(tmp_path)
+    engine = Qwen3TTS(model_path=model_path, backend="mlx")
+    engine.load()
+
+    class FakeBaseModel:
+        def __init__(self) -> None:
+            self.sample_rate = 22050
+            self.calls: list[dict[str, object]] = []
+
+        def generate(self, **kwargs):
+            self.calls.append(dict(kwargs))
+            yield SimpleNamespace(audio=[0.0] * 22050, sample_rate=22050)
+
+    class FakeVoiceDesignModel:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+            self.sample_rate = 22050
+
+        def generate_voice_design(self, **kwargs):
+            self.calls.append(dict(kwargs))
+            yield SimpleNamespace(audio=[0.0] * 22050, sample_rate=22050)
+
+    base_model = FakeBaseModel()
+    voicedesign_model = FakeVoiceDesignModel()
+    load_calls: list[str] = []
+
+    def fake_load(path: Path):
+        load_calls.append(path.name)
+        if path.name == BASE_MODEL_DIR_NAME:
+            return base_model
+        if path.name == VOICEDESIGN_MODEL_DIR_NAME:
+            return voicedesign_model
+        raise AssertionError(f"Unexpected model load: {path}")
+
+    class FakeManager:
+        @asynccontextmanager
+        async def generation_session(self, *, timeout_seconds: float | None = None):
+            assert timeout_seconds == 60.0
+            yield engine
+
+    monkeypatch.setattr(engine, "_load_mlx_model", fake_load)
+    monkeypatch.setattr(engine, "_check_memory_pressure", lambda: True)
+    monkeypatch.setattr(generation_runtime, "get_engine_manager", lambda engine_name: FakeManager())
+
+    engine._ensure_exclusive_model("base")
+    assert engine._active_model_name == "base"
+    assert engine.base_model is base_model
+
+    response = client.post("/api/voice-lab/voice-design/commander/lock")
+
+    assert response.status_code == 200
+    assert engine._active_model_name == "voicedesign"
+    assert engine.base_model is None
+    assert engine._voicedesign_model is voicedesign_model
+    assert voicedesign_model.calls
+
+    clone_audio = engine.generate("Hold the line.", voice="commander", speed=1.0)
+
+    assert len(clone_audio) > 0
+    assert engine._active_model_name == "base"
+    assert engine.base_model is base_model
+    assert engine._voicedesign_model is None
+    assert base_model.calls
+    assert load_calls == [
+        BASE_MODEL_DIR_NAME,
+        VOICEDESIGN_MODEL_DIR_NAME,
+        BASE_MODEL_DIR_NAME,
+    ]
 
 
 def test_unlock_designed_voice_removes_clone_assets_and_record(client, test_db) -> None:

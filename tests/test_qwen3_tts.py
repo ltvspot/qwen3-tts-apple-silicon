@@ -19,7 +19,14 @@ from src.database import get_db
 from src.engines.model_manager import ModelManager
 from src.config import settings
 from src.engines import AudioStitcher, Qwen3TTS, TextChunker
-from src.engines.qwen3_tts import AudioGenerationConfig, DesignedVoiceProfile, VOICE_PRESETS
+from src.engines.qwen3_tts import (
+    AudioGenerationConfig,
+    BASE_MODEL_DIR_NAME,
+    DesignedVoiceProfile,
+    MODEL_DIR_NAME,
+    VOICEDESIGN_MODEL_DIR_NAME,
+    VOICE_PRESETS,
+)
 from src.main import app
 
 
@@ -32,6 +39,21 @@ def reset_voice_lab_engine(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> N
     monkeypatch.setattr(settings, "VOICES_PATH", str(tmp_path))
     yield
     voice_lab.release_engine()
+
+
+def _create_stub_qwen_model_dirs(tmp_path: Path) -> Path:
+    """Create minimal on-disk model directories for lazy-load engine tests."""
+
+    root = tmp_path / "models"
+    custom_path = root / MODEL_DIR_NAME
+    for directory, payload in (
+        (custom_path, {"talker_config": {"spk_id": {"aiden": 1}}}),
+        (root / BASE_MODEL_DIR_NAME, {}),
+        (root / VOICEDESIGN_MODEL_DIR_NAME, {}),
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "config.json").write_text(json.dumps(payload), encoding="utf-8")
+    return custom_path
 
 
 def test_qwen3_engine_init() -> None:
@@ -56,6 +78,30 @@ def test_qwen3_engine_load_and_unload() -> None:
 
     engine.unload()
     assert engine.loaded is False
+
+
+def test_mlx_load_defers_model_weights_until_generation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """MLX startup should stay lightweight until the first real generation request."""
+
+    model_path = _create_stub_qwen_model_dirs(tmp_path)
+    engine = Qwen3TTS(model_path=model_path, backend="mlx")
+    load_calls: list[Path] = []
+
+    monkeypatch.setattr(engine, "_load_mlx_model", lambda path: load_calls.append(path) or object())
+
+    engine.load()
+
+    assert engine.loaded is True
+    assert engine.model is None
+    assert engine.base_model is None
+    assert engine._voicedesign_model is None
+    assert engine._active_model_name is None
+    assert engine._lazy_load_pending is True
+    assert engine._supported_speakers == {"aiden"}
+    assert load_calls == []
 
 
 def test_manual_mlx_loader_bypasses_generic_load_model(
@@ -246,6 +292,113 @@ def test_generate_rejects_unknown_voice() -> None:
 
     with pytest.raises(ValueError, match="Unknown voice"):
         engine.generate("Hello world.", voice="Unknown Voice")
+
+
+def test_generate_swaps_models_by_voice_kind(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Generation should keep exactly one MLX model resident and swap when voice kinds change."""
+
+    model_path = _create_stub_qwen_model_dirs(tmp_path)
+    engine = Qwen3TTS(model_path=model_path, backend="mlx")
+    engine.load()
+
+    class FakeModel:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.sample_rate = 22050
+
+    load_calls: list[str] = []
+    snapshots: list[tuple[str | None, bool, bool, bool]] = []
+
+    def fake_load(path: Path) -> FakeModel:
+        load_calls.append(path.name)
+        return FakeModel(path.name)
+
+    def fake_resolve(voice: str) -> tuple[str, str]:
+        if voice == "commander":
+            return ("clone", "commander")
+        if voice == "designer":
+            return ("designed", "A resonant command voice.")
+        return ("speaker", "aiden")
+
+    def capture_state(*_args, **_kwargs) -> AudioSegment:
+        snapshots.append(
+            (
+                engine._active_model_name,
+                engine.model is not None,
+                engine.base_model is not None,
+                engine._voicedesign_model is not None,
+            )
+        )
+        return AudioSegment.silent(duration=100, frame_rate=22050)
+
+    monkeypatch.setattr(engine, "_load_mlx_model", fake_load)
+    monkeypatch.setattr(engine, "_check_memory_pressure", lambda: True)
+    monkeypatch.setattr(engine, "_resolve_voice", fake_resolve)
+    monkeypatch.setattr(engine, "_normalize_audio", lambda audio: audio)
+    monkeypatch.setattr(engine, "_generate_cloned_audio", capture_state)
+    monkeypatch.setattr(engine, "_generate_voicedesign_audio", capture_state)
+    monkeypatch.setattr(engine, "_generate_mlx_audio", capture_state)
+
+    engine.generate("Clone chunk", voice="commander")
+    engine.generate("Designed chunk", voice="designer")
+    engine.generate("Speaker chunk", voice="Ethan")
+
+    assert snapshots == [
+        ("base", False, True, False),
+        ("voicedesign", False, False, True),
+        ("custom_voice", True, False, False),
+    ]
+    assert load_calls == [
+        BASE_MODEL_DIR_NAME,
+        VOICEDESIGN_MODEL_DIR_NAME,
+        MODEL_DIR_NAME,
+    ]
+
+
+def test_generate_clone_voice_reuses_base_model_without_reloading(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Repeated clone chunks should stay on the Base model without extra swaps."""
+
+    model_path = _create_stub_qwen_model_dirs(tmp_path)
+    engine = Qwen3TTS(model_path=model_path, backend="mlx")
+    engine.load()
+
+    class FakeBaseModel:
+        def __init__(self) -> None:
+            self.sample_rate = 22050
+
+    load_calls: list[str] = []
+    model_ids: list[int] = []
+    active_names: list[str | None] = []
+
+    monkeypatch.setattr(engine, "_check_memory_pressure", lambda: True)
+    monkeypatch.setattr(engine, "_resolve_voice", lambda voice: ("clone", "commander"))
+    monkeypatch.setattr(engine, "_normalize_audio", lambda audio: audio)
+    monkeypatch.setattr(
+        engine,
+        "_load_mlx_model",
+        lambda path: load_calls.append(path.name) or FakeBaseModel(),
+    )
+
+    def fake_generate_cloned_audio(*_args, **_kwargs) -> AudioSegment:
+        active_names.append(engine._active_model_name)
+        model_ids.append(id(engine.base_model))
+        return AudioSegment.silent(duration=100, frame_rate=22050)
+
+    monkeypatch.setattr(engine, "_generate_cloned_audio", fake_generate_cloned_audio)
+
+    engine.generate("Chunk one", voice="commander")
+    engine.generate("Chunk two", voice="commander")
+    engine.generate("Chunk three", voice="commander")
+
+    assert load_calls == [BASE_MODEL_DIR_NAME]
+    assert active_names == ["base", "base", "base"]
+    assert len(set(model_ids)) == 1
 
 
 def test_voicedesign_temperature_default() -> None:
