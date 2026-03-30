@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import gc
+import hashlib
 import inspect
 import json
 import logging
@@ -339,12 +340,13 @@ class Qwen3TTS(TTSEngine):
         )
         voice_kind, resolved_voice = self._resolve_voice(voice)
         if voice_kind == "designed":
-            resolved_instruction = self._compose_voice_design_instruction(resolved_voice, config.instruction)
+            resolved_instruction = self._compose_voice_design_instruction(resolved_voice)
+            generation_text = self._prepend_instruction_note(config.text, config.instruction)
             voicedesign_config = AudioGenerationConfig(
-                text=config.text,
+                text=generation_text,
                 voice=config.voice,
                 emotion=config.emotion,
-                instruction=resolved_instruction,
+                instruction=None,
                 speed=config.speed,
                 sample_rate=config.sample_rate,
             )
@@ -405,11 +407,12 @@ class Qwen3TTS(TTSEngine):
         if not spoken_text:
             raise ValueError("Text cannot be empty.")
 
-        composed_description = self._compose_voice_design_instruction(cleaned_description, inline_instruction)
+        composed_description = self._compose_voice_design_instruction(cleaned_description)
+        generation_text = self._prepend_instruction_note(spoken_text, inline_instruction)
         config = AudioGenerationConfig(
-            text=spoken_text,
+            text=generation_text,
             voice="voice_design",
-            instruction=composed_description,
+            instruction=None,
             speed=speed,
             sample_rate=self.sample_rate,
         )
@@ -689,13 +692,13 @@ class Qwen3TTS(TTSEngine):
         if not normalized:
             raise ValueError("Voice cannot be empty.")
 
-        designed_voice = self._find_designed_voice_profile(normalized)
-        if designed_voice is not None:
-            return ("designed", designed_voice.voice_description)
-
         clone_assets = self.voice_cloner.get_voice_assets(normalized)
         if clone_assets is not None:
             return ("clone", clone_assets["voice_name"])
+
+        designed_voice = self._find_designed_voice_profile(normalized)
+        if designed_voice is not None:
+            return ("designed", designed_voice.voice_description)
 
         for alias, profile in VOICE_PRESETS.items():
             if alias.lower() == normalized.lower():
@@ -758,6 +761,11 @@ class Qwen3TTS(TTSEngine):
             "instruct": voice_description,
             "temperature": self._voicedesign_temperature,
         }
+        logger.debug(
+            "Voice instruct is stable: len=%d, hash=%s",
+            len(voice_description),
+            hashlib.md5(voice_description.encode("utf-8")).hexdigest()[:8],
+        )
         logger.info(
             "VoiceDesign generation: temperature=%.2f, text_len=%d, instruct_len=%d",
             self._voicedesign_temperature,
@@ -983,14 +991,10 @@ class Qwen3TTS(TTSEngine):
     def _compose_voice_design_instruction(
         self,
         voice_description: str,
-        inline_instruction: str | None,
     ) -> str:
-        """Fold extra style instructions into the saved VoiceDesign description."""
+        """Return the saved VoiceDesign description without any modifications."""
 
-        cleaned_description = voice_description.strip()
-        if not inline_instruction:
-            return cleaned_description
-        return f"{cleaned_description} Additional speaking direction: {inline_instruction.strip()}"
+        return voice_description.strip()
 
     def _extract_inline_instruction(self, text: str) -> tuple[str, str | None]:
         """Remove the internal instruction wrapper before speaking the text."""
@@ -1000,6 +1004,13 @@ class Qwen3TTS(TTSEngine):
             return (text, None)
         spoken_text = text[match.end():].lstrip()
         return (spoken_text, match.group("instruction").strip() or None)
+
+    def _prepend_instruction_note(self, text: str, instruction: str | None) -> str:
+        """Attach non-identity guidance to the spoken text instead of the voice instruct."""
+
+        if not instruction:
+            return text
+        return f"[Note: {instruction.strip()}] {text}"
 
     def _enhance_prompt(self, text: str, emotion: str | None) -> str:
         """Return a prompt-like representation used by the synthetic backend."""

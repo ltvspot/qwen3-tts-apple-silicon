@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import re
@@ -106,8 +107,6 @@ class AudiobookGenerator:
         Returns a summary dictionary with status, counts, duration, and errors.
         """
 
-        await self._get_engine()
-
         book = (
             db_session.query(Book)
             .options(selectinload(Book.chapters))
@@ -116,6 +115,15 @@ class AudiobookGenerator:
         )
         if book is None:
             raise ValueError(f"Book {book_id} not found")
+
+        if self.model_manager is not None:
+            engine_name = getattr(book, "tts_engine", "qwen3_tts") or "qwen3_tts"
+            from src.api import generation_runtime
+
+            self.model_manager = generation_runtime.get_engine_manager(engine_name)
+            self.engine = None
+
+        await self._get_engine()
 
         chapters = list(book.chapters)
         if not chapters:
@@ -272,6 +280,7 @@ class AudiobookGenerator:
             chapter.number,
             chapter.word_count or 0,
         )
+        self._log_voice_resolution(engine, voice_name, chapter.number)
 
         chunk_plans = TextChunker.chunk_text_with_metadata(text_content, engine.max_chunk_chars)
         chunk_plans = self._merge_minimum_word_chunks(chunk_plans)
@@ -842,23 +851,88 @@ class AudiobookGenerator:
     ) -> AudioSegment | None:
         """Generate a single audio chunk, using engine-level timeouts when available."""
 
-        engine = await self._get_engine()
         started_at = asyncio.get_running_loop().time()
-        timeout_generate = getattr(engine, "generate_chunk_with_timeout", None)
-        if callable(timeout_generate):
-            audio = await timeout_generate(text, voice_name, emotion=emotion, speed=speed)
+        if self.model_manager is not None:
+            async with self.model_manager.generation_session() as engine:
+                self.engine = engine
+                timeout_generate = getattr(engine, "generate_chunk_with_timeout", None)
+                if callable(timeout_generate):
+                    audio = await timeout_generate(text, voice_name, emotion=emotion, speed=speed)
+                else:
+                    audio = await asyncio.to_thread(
+                        engine.generate,
+                        text,
+                        voice_name,
+                        emotion,
+                        speed,
+                    )
         else:
-            audio = await asyncio.to_thread(
-                engine.generate,
-                text,
-                voice_name,
-                emotion,
-                speed,
-            )
+            engine = await self._get_engine()
+            timeout_generate = getattr(engine, "generate_chunk_with_timeout", None)
+            if callable(timeout_generate):
+                audio = await timeout_generate(text, voice_name, emotion=emotion, speed=speed)
+            else:
+                audio = await asyncio.to_thread(
+                    engine.generate,
+                    text,
+                    voice_name,
+                    emotion,
+                    speed,
+                )
 
         if audio is not None and self.model_manager is not None:
             self.model_manager.record_chunk(asyncio.get_running_loop().time() - started_at)
         return audio
+
+    def _log_voice_resolution(self, engine: TTSEngine, voice_name: str, chapter_number: int) -> None:
+        """Emit one high-signal voice resolution log for the chapter."""
+
+        if not isinstance(engine, Qwen3TTS):
+            logger.info(
+                "Chapter %d voice resolution: name=%s, kind=engine-default, instruct_stable=n/a",
+                chapter_number,
+                voice_name,
+            )
+            return
+
+        try:
+            voice_kind, resolved_voice = engine._resolve_voice(voice_name)
+        except Exception as exc:
+            logger.warning(
+                "Chapter %d voice resolution failed for '%s': %s",
+                chapter_number,
+                voice_name,
+                exc,
+            )
+            return
+
+        logger.info(
+            "Chapter %d voice resolution: name=%s, kind=%s, instruct_stable=%s",
+            chapter_number,
+            voice_name,
+            voice_kind,
+            "yes" if voice_kind == "clone" else "check_logs",
+        )
+
+        if voice_kind == "clone":
+            clone_assets = engine.voice_cloner.get_voice_assets(resolved_voice)
+            if clone_assets is not None:
+                logger.info(
+                    "Chapter %d clone reference: name=%s, ref_audio_path=%s",
+                    chapter_number,
+                    resolved_voice,
+                    clone_assets["ref_audio_path"],
+                )
+            return
+
+        if voice_kind == "designed":
+            description_hash = hashlib.md5(resolved_voice.encode("utf-8")).hexdigest()[:8]
+            logger.info(
+                "Chapter %d designed voice prompt: len=%d, hash=%s",
+                chapter_number,
+                len(resolved_voice),
+                description_hash,
+            )
 
     def _flag_manual_review(self, chapter: Chapter, notes: list[str]) -> None:
         """Mark chapters with generation warnings for manual QA review."""

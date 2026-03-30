@@ -573,6 +573,7 @@ def test_generate_passes_raw_voice_description_to_voicedesign(monkeypatch: pytes
         voice_description: str,
         raw_voice_description: str | None = None,
     ) -> AudioSegment:
+        captured["text"] = config.text
         captured["instruction"] = config.instruction
         captured["voice_description"] = voice_description
         captured["raw_voice_description"] = raw_voice_description
@@ -584,8 +585,9 @@ def test_generate_passes_raw_voice_description_to_voicedesign(monkeypatch: pytes
 
     assert isinstance(audio, AudioSegment)
     assert captured == {
-        "instruction": "Commander raw description Additional speaking direction: Warm, reassuring audiobook narration with gentle energy.",
-        "voice_description": "Commander raw description Additional speaking direction: Warm, reassuring audiobook narration with gentle energy.",
+        "text": "[Note: Warm, reassuring audiobook narration with gentle energy.] Hello world",
+        "instruction": None,
+        "voice_description": "Commander raw description",
         "raw_voice_description": "Commander raw description",
     }
 
@@ -625,6 +627,93 @@ def test_generate_with_voice_description_uses_voicedesign_model(
     ]
 
 
+def test_generate_with_voice_description_keeps_inline_instruction_out_of_voice_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Inline pronunciation hints should move into the text note, not the voice description."""
+
+    captured: dict[str, object] = {}
+    engine = Qwen3TTS(backend="synthetic")
+    monkeypatch.setattr(engine, "_normalize_audio", lambda audio: audio)
+
+    def fake_generate_voicedesign_audio(
+        config: AudioGenerationConfig,
+        voice_description: str,
+        raw_voice_description: str | None = None,
+    ) -> AudioSegment:
+        captured["text"] = config.text
+        captured["instruction"] = config.instruction
+        captured["voice_description"] = voice_description
+        captured["raw_voice_description"] = raw_voice_description
+        return AudioSegment.silent(duration=100, frame_rate=22050)
+
+    monkeypatch.setattr(engine, "_generate_voicedesign_audio", fake_generate_voicedesign_audio)
+
+    audio = engine.generate_with_voice_description(
+        "[[alexandria-instruct:Use the pronunciation ALEX-ANN-dree-uh.]] Hello from the designer.",
+        "A deep, authoritative American male narrator.",
+        speed=1.0,
+    )
+
+    assert isinstance(audio, AudioSegment)
+    assert captured == {
+        "text": "[Note: Use the pronunciation ALEX-ANN-dree-uh.] Hello from the designer.",
+        "instruction": None,
+        "voice_description": "A deep, authoritative American male narrator.",
+        "raw_voice_description": "A deep, authoritative American male narrator.",
+    }
+
+
+def test_designed_voice_hints_do_not_change_voice_description(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Different pronunciation hints should leave the designed voice instruct unchanged."""
+
+    captured_calls: list[dict[str, object]] = []
+    engine = Qwen3TTS(backend="mlx")
+    engine.loaded = True
+    engine.sample_rate = 22050
+    engine._resolved_backend = "mlx"
+
+    monkeypatch.setattr(engine, "_resolve_voice", lambda voice: ("designed", "Commander raw description"))
+    monkeypatch.setattr(engine, "_normalize_audio", lambda audio: audio)
+
+    def fake_generate_voicedesign_audio(
+        config: AudioGenerationConfig,
+        voice_description: str,
+        raw_voice_description: str | None = None,
+    ) -> AudioSegment:
+        captured_calls.append(
+            {
+                "text": config.text,
+                "voice_description": voice_description,
+                "raw_voice_description": raw_voice_description,
+            }
+        )
+        return AudioSegment.silent(duration=100, frame_rate=22050)
+
+    monkeypatch.setattr(engine, "_generate_voicedesign_audio", fake_generate_voicedesign_audio)
+
+    engine.generate(
+        "[[alexandria-instruct:Use the pronunciation ALEX-ANN-dree-uh.]] Hello world",
+        voice="Commander",
+    )
+    engine.generate(
+        "[[alexandria-instruct:Use the pronunciation kom-MAN-der with sharper emphasis.]] Hello world",
+        voice="Commander",
+    )
+
+    assert [call["voice_description"] for call in captured_calls] == [
+        "Commander raw description",
+        "Commander raw description",
+    ]
+    assert [call["raw_voice_description"] for call in captured_calls] == [
+        "Commander raw description",
+        "Commander raw description",
+    ]
+    assert captured_calls[0]["text"] != captured_calls[1]["text"]
+
+
 def test_generate_with_voice_description_uses_speed_fallback_when_needed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -653,8 +742,8 @@ def test_generate_with_voice_description_uses_speed_fallback_when_needed(
     assert calls == [1.2]
 
 
-def test_resolve_voice_prioritizes_designed_voices(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Designed voice IDs should resolve before clones, aliases, or raw speakers."""
+def test_resolve_voice_prioritizes_locked_clones(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Locked clone assets should override same-name designed voices."""
 
     engine = Qwen3TTS(backend="synthetic")
     monkeypatch.setattr(
@@ -672,8 +761,8 @@ def test_resolve_voice_prioritizes_designed_voices(monkeypatch: pytest.MonkeyPat
 
     voice_kind, resolved_voice = engine._resolve_voice("Ethan")
 
-    assert voice_kind == "designed"
-    assert resolved_voice == "A custom designed narration voice."
+    assert voice_kind == "clone"
+    assert resolved_voice == "ethan-clone"
 
 
 def test_text_chunker_preserves_text_and_limits_chunk_size() -> None:
