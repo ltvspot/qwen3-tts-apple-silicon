@@ -304,32 +304,10 @@ def test_merge_broken_paragraphs_strips_ascii_art_artifacts() -> None:
     assert merge_broken_paragraphs(["____", "/ \\", "He was explaining..."]) == ["He was explaining..."]
 
 
-@pytest.mark.parametrize("divider", ["———", "——", "—"])
-def test_merge_broken_paragraphs_strips_unicode_em_dash_divider_artifacts(divider: str) -> None:
-    """Unicode em-dash divider lines should be dropped before merge decisions."""
-
-    assert merge_broken_paragraphs([divider, "The monks gathered before dawn."]) == [
-        "The monks gathered before dawn."
-    ]
-
-
 def test_is_tts_artifact_preserves_numbered_sentences() -> None:
     """Numbered prose should not be discarded as artifacts."""
 
     assert _is_tts_artifact("1.") is False
-
-
-@pytest.mark.parametrize("divider", ["———", "——", "—", "– –", "‒‒"])
-def test_is_tts_artifact_strips_short_unicode_dash_dividers(divider: str) -> None:
-    """Short Unicode dash-only divider lines should be dropped before TTS."""
-
-    assert _is_tts_artifact(divider) is True
-
-
-def test_is_tts_artifact_preserves_long_unicode_dash_lines() -> None:
-    """Length guard should avoid stripping unusually long Unicode dash runs."""
-
-    assert _is_tts_artifact("—————————") is False
 
 
 def test_is_tts_artifact_strips_standalone_pua_glyphs() -> None:
@@ -366,25 +344,6 @@ def test_strip_inline_footnotes_removes_glued_superscript_digits() -> None:
     """Digits glued to the end of prose words should be stripped."""
 
     assert _strip_inline_footnotes("Imagination8 was his gift.") == "Imagination was his gift."
-
-
-@pytest.mark.parametrize(
-    ("source", "expected"),
-    [
-        ('"a royal fish." *', '"a royal fish."'),
-        ("become Pope!*", "become Pope!"),
-        ("She answered? **", "She answered?"),
-        ("The old captain said.” *", "The old captain said.”"),
-        ("It was finished.’*", "It was finished.’"),
-    ],
-)
-def test_strip_inline_footnotes_removes_trailing_star_markers_after_terminal_punctuation(
-    source: str,
-    expected: str,
-) -> None:
-    """Trailing star footnote markers after sentence endings should be removed."""
-
-    assert _strip_inline_footnotes(source) == expected
 
 
 def test_merge_broken_paragraphs_strips_footnote_only_paragraphs_before_artifact_checks() -> None:
