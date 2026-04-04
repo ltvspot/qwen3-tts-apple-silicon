@@ -214,6 +214,7 @@ _BARE_NUMBER_RE = re.compile(r"^\d{1,3}$")
 _BARE_ROMAN_RE = re.compile(r"^[IVXLCDM]+\.?\s*$")
 _ASTERISK_SEP_RE = re.compile(r"^\*[\s\*]+\*$")
 _ASCII_ART_RE = re.compile(r"^(?=.*[_\-\*/\\|=])[_\-\*/\\|=\s]{3,}$")
+_EM_DASH_DIV_RE = re.compile(r"^[\u2014\u2013\u2012\s]+$")
 _PUA_RE = re.compile(r"^[\ue000-\uf8ff\s]+$")
 _CURLY_BRACE_FOOTNOTE_RE = re.compile(r"\{\d+\}")
 _TRAILING_DOT_ASTERISK_RE = re.compile(r"(?:\s*\.\*)+\s*$")
@@ -351,6 +352,8 @@ def _is_tts_artifact(para: str) -> bool:
         return True
     if _ASCII_ART_RE.match(stripped):
         return True
+    if len(stripped) <= 8 and _EM_DASH_DIV_RE.match(stripped):
+        return True
     return False
 
 
@@ -360,6 +363,7 @@ def _strip_inline_footnotes(text: str) -> str:
     text = _CURLY_BRACE_FOOTNOTE_RE.sub("", text)
     text = _GLUED_FOOTNOTE_DIGIT_RE.sub(r"\1", text)
     text = _TRAILING_DOT_ASTERISK_RE.sub("", text)
+    text = re.sub(r'(?<=[.?!"\'\u201d\u2019])\s*\*{1,2}\s*$', "", text)
     text = re.sub(r"[ \t]{2,}", " ", text)
     return text.strip()
 
