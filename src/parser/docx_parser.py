@@ -415,7 +415,7 @@ class DocxParser:
 
         self.chapter_patterns: tuple[re.Pattern[str], ...] = (
             re.compile(
-                r"^chapter\s+(?P<number>[ivxlcdm]+|\d+|[a-z][a-z-]*)\s*[:.\-]?\s*(?P<title>.*)$",
+                r"^chapter\s+(?P<number>[ivxlcdm]+|\d+|[a-z][a-z-]*)\s*[:.\-\u2013\u2014]?\s*(?P<title>.*)$",
                 re.IGNORECASE,
             ),
             re.compile(r"^(?P<number>[ivxlcdm]+|\d+)\s*[:.\-]\s*(?P<title>.+)$", re.IGNORECASE),

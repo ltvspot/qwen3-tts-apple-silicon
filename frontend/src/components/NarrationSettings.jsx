@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from "react";
 import ConfirmDialog from "./ConfirmDialog";
 import VoiceSelector from "./VoiceSelector";
+import { getChapterLabel } from "./generationStatus";
 
 const EMOTION_PRESETS = [
   "neutral",
@@ -53,21 +54,7 @@ function getChapterSummary(selectedChapter) {
     return "No chapter selected";
   }
 
-  if (selectedChapter.type === "opening_credits") {
-    return "Opening Credits";
-  }
-
-  if (selectedChapter.type === "closing_credits") {
-    return "Closing Credits";
-  }
-
-  if (selectedChapter.type === "introduction") {
-    return selectedChapter.title ? `Introduction: ${selectedChapter.title}` : "Introduction";
-  }
-
-  return selectedChapter.title
-    ? `Chapter ${selectedChapter.number}: ${selectedChapter.title}`
-    : `Chapter ${selectedChapter.number}`;
+  return getChapterLabel(selectedChapter);
 }
 
 export default function NarrationSettings({

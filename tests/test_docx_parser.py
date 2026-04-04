@@ -920,6 +920,25 @@ def test_explicit_chapter_heading_detection() -> None:
     assert parser._is_explicit_chapter_heading("1: Some Title") is False
 
 
+@pytest.mark.parametrize("separator", ["–", "—"])
+def test_parse_chapter_heading_with_unicode_dash_separator(separator: str) -> None:
+    """Unicode dash separators should be stripped from parsed chapter titles."""
+
+    parser = DocxParser()
+
+    is_heading, data = parser._is_chapter_heading(
+        f"Chapter 6 {separator} Weak Points and Strong",
+        "Heading 1",
+    )
+
+    assert is_heading is True
+    assert data == {
+        "number": 6,
+        "title": "Weak Points and Strong",
+        "type": "chapter",
+    }
+
+
 def test_build_chapter_returns_none_for_empty_body() -> None:
     """Empty section bodies should be skipped instead of raising exceptions."""
 

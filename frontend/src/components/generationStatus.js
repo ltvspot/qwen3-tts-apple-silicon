@@ -130,8 +130,8 @@ export function getChapterLabel(chapter) {
   }
 
   if (chapter.type === "introduction") {
-    return chapter.title ? `Introduction: ${chapter.title}` : "Introduction";
+    return chapter.title || "Introduction";
   }
 
-  return chapter.title ? `Chapter ${chapter.number}: ${chapter.title}` : `Chapter ${chapter.number}`;
+  return chapter.title || `Chapter ${chapter.number}`;
 }

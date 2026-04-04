@@ -101,6 +101,31 @@ def test_epub_heading_detection(tmp_path: Path) -> None:
     assert chapters[-1].title == "Six"
 
 
+@pytest.mark.parametrize("separator", ["–", "—"])
+def test_epub_heading_strips_unicode_dash_separator(tmp_path: Path, separator: str) -> None:
+    """Unicode dash separators should not leak into parsed EPUB chapter titles."""
+
+    epub_path = tmp_path / "unicode-dash.epub"
+    create_sample_epub(
+        epub_path,
+        title="The Art of War",
+        subtitle=None,
+        author="Sun Tzu",
+        sections=[
+            SectionSpec(
+                f"Chapter 6 {separator} Weak Points and Strong",
+                ["Attack where the enemy is unprepared."],
+            ),
+        ],
+    )
+
+    _metadata, chapters = EPUBParser().parse(epub_path)
+
+    assert len(chapters) == 1
+    assert chapters[0].number == 6
+    assert chapters[0].title == "Weak Points and Strong"
+
+
 def test_epub_corrupted_file(tmp_path: Path) -> None:
     """Raise a ValueError for invalid EPUB payloads."""
 

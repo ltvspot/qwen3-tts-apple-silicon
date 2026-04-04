@@ -1,4 +1,5 @@
 import React from "react";
+import { getChapterLabel } from "./generationStatus";
 
 function getWordCount(text) {
   if (!text?.trim()) {
@@ -13,19 +14,7 @@ function getChapterDisplayName(chapter) {
     return "No Chapter Selected";
   }
 
-  if (chapter.type === "opening_credits") {
-    return "Opening Credits";
-  }
-
-  if (chapter.type === "closing_credits") {
-    return "Closing Credits";
-  }
-
-  if (chapter.type === "introduction") {
-    return chapter.title ? `Introduction: ${chapter.title}` : "Introduction";
-  }
-
-  return chapter.title ? `Chapter ${chapter.number}: ${chapter.title}` : `Chapter ${chapter.number}`;
+  return getChapterLabel(chapter);
 }
 
 export default function TextPreview({
