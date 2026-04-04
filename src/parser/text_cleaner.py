@@ -133,6 +133,8 @@ _NON_TERMINAL_WORDS: frozenset[str] = frozenset(
 )
 _SENTENCE_ENDERS: frozenset[str] = frozenset('.!?:;"\')\u201d\u2019\u2014\u2013')
 _TRAILING_WORD_RE = re.compile(r"\b(\w+)\s*$")
+_LEADING_CONTINUATION_CHARS = "\"'“‘(["
+_MIN_LOWERCASE_CONTINUATION_PARAGRAPH_CHARS = 40
 
 
 def _cardinal_word(number: int) -> str | None:
@@ -187,25 +189,40 @@ def _expand_roman_numerals(text: str) -> str:
     return text
 
 
-def _is_mid_sentence_break(para: str) -> bool:
+def _starts_like_sentence_continuation(para: str) -> bool:
+    """Return True when a paragraph visibly starts mid-sentence."""
+
+    stripped = para.lstrip()
+    while stripped and stripped[0] in _LEADING_CONTINUATION_CHARS:
+        stripped = stripped[1:].lstrip()
+    if not stripped:
+        return False
+    first_char = stripped[0]
+    return first_char.islower() or first_char.isdigit()
+
+
+def _is_mid_sentence_break(para: str, next_para: str) -> bool:
     """Return True if this paragraph appears to end mid-sentence.
 
     A paragraph is mid-sentence if:
     - It ends with a comma (never ends a sentence), OR
     - Its last word is a grammatical non-terminal (preposition, article,
-      conjunction, auxiliary verb) that cannot end a sentence.
+      conjunction, auxiliary verb) that cannot end a sentence, OR
+    - A longer prose paragraph ends without terminal punctuation and the
+      following paragraph starts with a lowercase continuation.
 
     We deliberately do NOT trigger on ambiguous endings (proper nouns,
     adjectives, etc.) to avoid merging sub-section headings with body text.
     """
 
-    if not para:
+    if not para or not next_para:
         return False
     last_char = para[-1]
     if last_char == ",":
         return True
-    if last_char in _SENTENCE_ENDERS:
-        return False
+    if last_char not in _SENTENCE_ENDERS:
+        if len(para) >= _MIN_LOWERCASE_CONTINUATION_PARAGRAPH_CHARS and _starts_like_sentence_continuation(next_para):
+            return True
     match = _TRAILING_WORD_RE.search(para)
     if match:
         last_word = match.group(1).lower()
@@ -235,7 +252,7 @@ def merge_broken_paragraphs(paragraphs: list[str]) -> list[str]:
         para = para.strip()
         if not para:
             continue
-        if result and _is_mid_sentence_break(result[-1]):
+        if result and _is_mid_sentence_break(result[-1], para):
             result[-1] = result[-1] + " " + para
         else:
             result.append(para)

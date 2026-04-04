@@ -131,6 +131,37 @@ def test_merge_broken_paragraphs_chain() -> None:
     ]
 
 
+def test_merge_broken_paragraphs_lowercase_continuation_after_arbitrary_word() -> None:
+    """Long prose paragraphs that continue with lowercase text should merge."""
+
+    paragraphs = [
+        (
+            "And could it really be believed that it finally seems to us as though "
+            "the problem had never been raised before, as though we were the first"
+        ),
+        "to see it, to notice it, and to DARE raise it?",
+    ]
+
+    assert merge_broken_paragraphs(paragraphs) == [
+        (
+            "And could it really be believed that it finally seems to us as though "
+            "the problem had never been raised before, as though we were the first "
+            "to see it, to notice it, and to DARE raise it?"
+        )
+    ]
+
+
+def test_merge_broken_paragraphs_preserves_short_heading_before_lowercase_body() -> None:
+    """Short heading lines should stay separate even if the body starts lowercase."""
+
+    paragraphs = [
+        "Zarathustra's Prologue",
+        "then Zarathustra turned thirty and went into the mountains.",
+    ]
+
+    assert merge_broken_paragraphs(paragraphs) == paragraphs
+
+
 def test_merge_broken_paragraphs_empty_paragraphs_skipped() -> None:
     """Empty input entries should be ignored."""
 
