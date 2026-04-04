@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from src.parser.text_cleaner import TextCleaner, _expand_roman_numerals, merge_broken_paragraphs
+from src.parser.text_cleaner import (
+    TextCleaner,
+    _expand_roman_numerals,
+    _is_tts_artifact,
+    _strip_inline_footnotes,
+    merge_broken_paragraphs,
+)
 
 
 @pytest.mark.parametrize(
@@ -95,6 +101,19 @@ def test_merge_broken_paragraphs_ends_with_comma() -> None:
     ]
 
 
+def test_merge_broken_paragraphs_ends_with_em_dash() -> None:
+    """Paragraph ending with an em dash should merge with the next."""
+
+    paragraphs = [
+        "He leaned forward and whispered—",
+        "then vanished into the crowd.",
+    ]
+
+    assert merge_broken_paragraphs(paragraphs) == [
+        "He leaned forward and whispered— then vanished into the crowd."
+    ]
+
+
 def test_merge_broken_paragraphs_preserves_complete_sentences() -> None:
     """Complete sentences should remain separate paragraphs."""
 
@@ -117,6 +136,40 @@ def test_merge_broken_paragraphs_preserves_headings() -> None:
     assert merge_broken_paragraphs(paragraphs) == paragraphs
 
 
+def test_merge_broken_paragraphs_preserves_multi_em_dash_attribution() -> None:
+    """Multi-em-dash attribution lines should not merge into following body text."""
+
+    paragraphs = [
+        "——— Helen King and Edward Mason",
+        "in the middle of the night the dogs began to bark.",
+    ]
+
+    assert merge_broken_paragraphs(paragraphs) == paragraphs
+
+
+def test_merge_broken_paragraphs_preserves_terminal_closing_bracket() -> None:
+    """Paragraphs ending with a closing bracket should stay separate."""
+
+    paragraphs = [
+        "The phrase appears in the text (as written)",
+        "and deserves a closer reading.",
+    ]
+
+    assert merge_broken_paragraphs(paragraphs) == paragraphs
+
+
+@pytest.mark.parametrize("quote", ["“", "‘"])
+def test_merge_broken_paragraphs_preserves_sentence_enders_before_left_quotes(quote: str) -> None:
+    """Paragraphs ending in sentence punctuation plus a left quote should stay separate."""
+
+    paragraphs = [
+        f"The guide finished the story and stepped back into silence.{quote}",
+        "then the hall went still.",
+    ]
+
+    assert merge_broken_paragraphs(paragraphs) == paragraphs
+
+
 def test_merge_broken_paragraphs_chain() -> None:
     """Multiple consecutive broken paragraphs should merge into one sentence."""
 
@@ -128,6 +181,19 @@ def test_merge_broken_paragraphs_chain() -> None:
 
     assert merge_broken_paragraphs(paragraphs) == [
         "The natural flow of the universe cannot be controlled, for it is beyond all effort."
+    ]
+
+
+def test_merge_broken_paragraphs_expanded_non_terminal_word_list() -> None:
+    """Expanded non-terminal words should merge even before uppercase proper nouns."""
+
+    paragraphs = [
+        "The central dispute had always been about",
+        "Nietzsche's refusal to accept inherited morality.",
+    ]
+
+    assert merge_broken_paragraphs(paragraphs) == [
+        "The central dispute had always been about Nietzsche's refusal to accept inherited morality."
     ]
 
 
@@ -155,9 +221,18 @@ def test_merge_broken_paragraphs_preserves_short_heading_before_lowercase_body()
     """Short heading lines should stay separate even if the body starts lowercase."""
 
     paragraphs = [
-        "Zarathustra's Prologue",
-        "then Zarathustra turned thirty and went into the mountains.",
+        "Origins and Early Life",
+        "he was born into a world of collapsing empires and old certainties.",
     ]
+
+    assert merge_broken_paragraphs(paragraphs) == paragraphs
+
+
+def test_merge_broken_paragraphs_preserves_very_long_paragraph_blocks() -> None:
+    """Huge prose blocks without punctuation should not be treated as wrapped visual lines."""
+
+    repeated = " ".join(["strategy"] * 120)
+    paragraphs = [repeated, repeated]
 
     assert merge_broken_paragraphs(paragraphs) == paragraphs
 
@@ -168,3 +243,55 @@ def test_merge_broken_paragraphs_empty_paragraphs_skipped() -> None:
     paragraphs = ["First sentence.", "", "Second sentence.", ""]
 
     assert merge_broken_paragraphs(paragraphs) == ["First sentence.", "Second sentence."]
+
+
+def test_merge_broken_paragraphs_strips_bare_number_artifacts() -> None:
+    """Bare section numbers should be removed before merge decisions."""
+
+    assert merge_broken_paragraphs(["1", "In the middle of the night..."]) == [
+        "In the middle of the night..."
+    ]
+
+
+def test_merge_broken_paragraphs_strips_asterisk_separator_artifacts() -> None:
+    """Asterisk-only separator lines should be dropped."""
+
+    assert merge_broken_paragraphs(["* * * * *", "It was September 3rd."]) == ["It was September 3rd."]
+
+
+def test_merge_broken_paragraphs_strips_ascii_art_artifacts() -> None:
+    """ASCII-art divider lines should be removed before merge decisions."""
+
+    assert merge_broken_paragraphs(["____", "/ \\", "He was explaining..."]) == ["He was explaining..."]
+
+
+def test_is_tts_artifact_preserves_numbered_sentences() -> None:
+    """Numbered prose should not be discarded as artifacts."""
+
+    assert _is_tts_artifact("1.") is False
+
+
+def test_is_tts_artifact_preserves_numbers_with_words() -> None:
+    """Lines with real text after a number should remain."""
+
+    assert _is_tts_artifact("12 people") is False
+
+
+def test_strip_inline_footnotes_removes_curly_markers_and_trailing_dot_star() -> None:
+    """Curly-brace footnotes and trailing dot-star markers should be removed."""
+
+    assert _strip_inline_footnotes("Tom {13} turned back.*") == "Tom turned back"
+
+
+def test_strip_inline_footnotes_removes_glued_superscript_digits() -> None:
+    """Digits glued to the end of prose words should be stripped."""
+
+    assert _strip_inline_footnotes("Imagination8 was his gift.") == "Imagination was his gift."
+
+
+def test_merge_broken_paragraphs_strips_footnote_only_paragraphs_before_artifact_checks() -> None:
+    """Footnote-only paragraphs should vanish before artifact filtering and merge logic."""
+
+    assert merge_broken_paragraphs(["{5}", "Tom was about to blurt out something important."]) == [
+        "Tom was about to blurt out something important."
+    ]

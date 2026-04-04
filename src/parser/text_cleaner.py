@@ -48,93 +48,179 @@ _CARDINAL_TENS: dict[int, str] = {
 }
 _NON_TERMINAL_WORDS: frozenset[str] = frozenset(
     [
-        "the",
         "a",
-        "an",
-        "of",
-        "in",
-        "on",
-        "at",
-        "to",
-        "for",
-        "and",
-        "or",
-        "but",
-        "with",
-        "by",
-        "from",
-        "that",
-        "which",
-        "who",
-        "whose",
-        "as",
-        "its",
-        "their",
-        "my",
-        "your",
-        "his",
-        "her",
-        "our",
-        "this",
-        "these",
-        "those",
-        "such",
-        "than",
-        "into",
-        "onto",
-        "upon",
-        "within",
-        "without",
-        "between",
-        "through",
-        "during",
-        "around",
-        "if",
-        "when",
-        "where",
-        "while",
-        "though",
-        "although",
-        "because",
-        "since",
+        "about",
+        "above",
+        "across",
         "after",
-        "before",
-        "not",
-        "no",
-        "nor",
-        "yet",
-        "so",
-        "both",
-        "either",
-        "neither",
-        "was",
-        "were",
-        "is",
+        "against",
+        "all",
+        "along",
+        "alongside",
+        "although",
+        "amid",
+        "among",
+        "amongst",
+        "am",
+        "an",
+        "and",
+        "another",
+        "any",
         "are",
+        "around",
+        "as",
+        "at",
         "be",
+        "because",
         "been",
+        "before",
         "being",
-        "have",
-        "has",
-        "had",
-        "will",
-        "would",
-        "could",
-        "should",
-        "may",
-        "might",
-        "must",
-        "shall",
+        "behind",
+        "below",
+        "beneath",
+        "beside",
+        "besides",
+        "between",
+        "beyond",
+        "both",
+        "but",
+        "by",
         "can",
+        "could",
+        "despite",
+        "did",
         "do",
         "does",
-        "did",
+        "down",
+        "during",
+        "each",
+        "either",
+        "enough",
+        "every",
+        "except",
+        "few",
+        "for",
+        "from",
+        "had",
+        "has",
+        "have",
+        "he",
+        "her",
+        "his",
+        "if",
+        "in",
+        "inside",
+        "into",
+        "is",
+        "it",
+        "its",
+        "like",
+        "many",
+        "may",
+        "might",
+        "more",
+        "most",
+        "much",
+        "must",
+        "my",
+        "near",
+        "neither",
+        "no",
+        "nor",
+        "not",
+        "of",
+        "off",
+        "on",
+        "once",
+        "onto",
+        "or",
+        "other",
+        "our",
+        "out",
+        "outside",
+        "over",
+        "past",
+        "rather",
+        "several",
+        "shall",
+        "she",
+        "should",
+        "since",
+        "so",
+        "some",
+        "such",
+        "than",
+        "that",
+        "the",
+        "their",
+        "them",
+        "these",
+        "they",
+        "this",
+        "those",
+        "though",
+        "through",
+        "throughout",
+        "to",
+        "toward",
+        "towards",
+        "under",
+        "underneath",
+        "unless",
+        "until",
+        "up",
+        "upon",
+        "via",
+        "was",
+        "we",
+        "were",
+        "what",
+        "whatever",
+        "when",
+        "whenever",
+        "where",
+        "whereas",
+        "wherever",
+        "whether",
+        "which",
+        "whichever",
+        "while",
+        "who",
+        "whoever",
+        "whom",
+        "whose",
+        "will",
+        "with",
+        "within",
+        "without",
+        "would",
+        "yet",
+        "you",
+        "your",
     ]
 )
-_SENTENCE_ENDERS: frozenset[str] = frozenset('.!?:;"\')\u201d\u2019\u2014\u2013')
-_TRAILING_WORD_RE = re.compile(r"\b(\w+)\s*$")
+_EM_DASH_ENDERS: frozenset[str] = frozenset({"—", "–", "─", "−"})
+_TERMINAL_PUNCTUATION: frozenset[str] = frozenset({".", "!", "?", ";", ":"})
+_CLOSING_TERMINATORS: frozenset[str] = frozenset({'"', "'", ")", "]", "}", "”", "’"})
+_SENTENCE_ENDERS: frozenset[str] = frozenset(
+    _TERMINAL_PUNCTUATION | _CLOSING_TERMINATORS | _EM_DASH_ENDERS | {"“", "‘"}
+)
+_ATTRIBUTION_RE = re.compile(r'^[~—–]{1,4}\s*\w|^\*{1,2}[^*]+\*{1,2}$')
+_TRAILING_WORD_RE = re.compile(r"([A-Za-z]+(?:['’][A-Za-z]+)?)\s*$")
+_WORD_RE = re.compile(r"\b[\w]+(?:['’][\w]+)?\b")
 _LEADING_CONTINUATION_CHARS = "\"'“‘(["
-_MIN_LOWERCASE_CONTINUATION_PARAGRAPH_CHARS = 40
+_MIN_LOWERCASE_CONTINUATION_WORDS = 5
+_MIN_LOWERCASE_CONTINUATION_PARAGRAPH_CHARS = 50
+_MAX_LOWERCASE_CONTINUATION_WORDS = 80
+_BARE_NUMBER_RE = re.compile(r"^\d{1,3}$")
+_ASTERISK_SEP_RE = re.compile(r"^\*[\s\*]+\*$")
+_ASCII_ART_RE = re.compile(r"^(?=.*[_\-\*/\\|=])[_\-\*/\\|=\s]{3,}$")
+_CURLY_BRACE_FOOTNOTE_RE = re.compile(r"\{\d+\}")
+_TRAILING_DOT_ASTERISK_RE = re.compile(r"(?:\s*\.\*)+\s*$")
+_GLUED_FOOTNOTE_DIGIT_RE = re.compile(
+    r"(\b[A-Za-z]+(?:[-'’][A-Za-z]+)*)"
+    r"([0-9\u00b2\u00b3\u00b9\u2070-\u2079]{1,3})(?=(?:\s|[\"'”’)\].,;:!?]|$))"
+)
 
 
 def _cardinal_word(number: int) -> str | None:
@@ -189,53 +275,132 @@ def _expand_roman_numerals(text: str) -> str:
     return text
 
 
-def _starts_like_sentence_continuation(para: str) -> bool:
-    """Return True when a paragraph visibly starts mid-sentence."""
+def _starts_with_lowercase_continuation(para: str) -> bool:
+    """Return True when a paragraph visibly starts with lowercase continuation text."""
 
     stripped = para.lstrip()
     while stripped and stripped[0] in _LEADING_CONTINUATION_CHARS:
         stripped = stripped[1:].lstrip()
     if not stripped:
         return False
-    first_char = stripped[0]
-    return first_char.islower() or first_char.isdigit()
+    return stripped[0].islower()
+
+
+def _strip_trailing_closers(text: str) -> str:
+    """Remove trailing quotes/brackets before inspecting sentence-ending punctuation."""
+
+    stripped = text.rstrip()
+    while stripped and stripped[-1] in _CLOSING_TERMINATORS:
+        stripped = stripped[:-1].rstrip()
+    return stripped
+
+
+def _is_prose_like_paragraph(para: str) -> bool:
+    """Return True for paragraphs long enough to safely treat as body prose."""
+
+    return (
+        len(_WORD_RE.findall(para)) >= _MIN_LOWERCASE_CONTINUATION_WORDS
+        or len(para) >= _MIN_LOWERCASE_CONTINUATION_PARAGRAPH_CHARS
+    )
+
+
+def _is_line_wrap_sized_paragraph(para: str) -> bool:
+    """Return True when a paragraph is short enough to plausibly be a wrapped prose line."""
+
+    return len(_WORD_RE.findall(para)) <= _MAX_LOWERCASE_CONTINUATION_WORDS
+
+
+def _is_attribution(para: str) -> bool:
+    """Return True for standalone attribution/signature lines."""
+
+    return bool(_ATTRIBUTION_RE.match(para.strip()))
+
+
+def _is_tts_artifact(para: str) -> bool:
+    """Return True for structural extraction artifacts that should be dropped before TTS."""
+
+    stripped = para.strip()
+    if not stripped:
+        return True
+    if _BARE_NUMBER_RE.match(stripped):
+        return True
+    if _ASTERISK_SEP_RE.match(stripped):
+        return True
+    if _ASCII_ART_RE.match(stripped):
+        return True
+    return False
+
+
+def _strip_inline_footnotes(text: str) -> str:
+    """Remove inline footnote markers that would otherwise be read aloud by TTS."""
+
+    text = _CURLY_BRACE_FOOTNOTE_RE.sub("", text)
+    text = _GLUED_FOOTNOTE_DIGIT_RE.sub(r"\1", text)
+    text = _TRAILING_DOT_ASTERISK_RE.sub("", text)
+    text = re.sub(r"[ \t]{2,}", " ", text)
+    return text.strip()
 
 
 def _is_mid_sentence_break(para: str, next_para: str) -> bool:
     """Return True if this paragraph appears to end mid-sentence.
 
     A paragraph is mid-sentence if:
-    - It ends with a comma (never ends a sentence), OR
-    - Its last word is a grammatical non-terminal (preposition, article,
-      conjunction, auxiliary verb) that cannot end a sentence, OR
+    - It ends with an em dash interruption, OR
+    - It ends with a comma, OR
     - A longer prose paragraph ends without terminal punctuation and the
-      following paragraph starts with a lowercase continuation.
+      next paragraph starts with lowercase continuation text, OR
+    - Its last word is a grammatical non-terminal in a prose-sized paragraph.
 
-    We deliberately do NOT trigger on ambiguous endings (proper nouns,
-    adjectives, etc.) to avoid merging sub-section headings with body text.
+    We do not merge short heading-like phrases into following body text.
     """
 
     if not para or not next_para:
         return False
-    last_char = para[-1]
+
+    stripped_para = para.rstrip()
+    stripped_next = next_para.lstrip()
+    if not stripped_para or not stripped_next:
+        return False
+    if _is_attribution(stripped_para):
+        return False
+
+    core_para = _strip_trailing_closers(stripped_para)
+    if not core_para:
+        return False
+
+    last_char = core_para[-1]
+    if last_char in _EM_DASH_ENDERS:
+        return True
     if last_char == ",":
         return True
-    if last_char not in _SENTENCE_ENDERS:
-        if len(para) >= _MIN_LOWERCASE_CONTINUATION_PARAGRAPH_CHARS and _starts_like_sentence_continuation(next_para):
-            return True
-    match = _TRAILING_WORD_RE.search(para)
-    if match:
-        last_word = match.group(1).lower()
-        return last_word in _NON_TERMINAL_WORDS
-    return False
+    if stripped_para[-1] in _SENTENCE_ENDERS or last_char in _SENTENCE_ENDERS:
+        return False
+
+    if (
+        _starts_with_lowercase_continuation(stripped_next)
+        and _is_prose_like_paragraph(stripped_para)
+        and _is_line_wrap_sized_paragraph(stripped_para)
+    ):
+        return True
+
+    if not _is_prose_like_paragraph(stripped_para):
+        return False
+
+    match = _TRAILING_WORD_RE.search(core_para)
+    if not match:
+        return False
+
+    return match.group(1).lower() in _NON_TERMINAL_WORDS
 
 
 def merge_broken_paragraphs(paragraphs: list[str]) -> list[str]:
     """Merge consecutive paragraphs that form part of the same sentence.
 
-    When a DOCX paragraph ends mid-sentence (detected by ending with a
-    non-terminal word or a comma), the following paragraph is appended to it
-    with a single space instead of being treated as a new paragraph.
+    When a DOCX paragraph ends mid-sentence, the following paragraph is
+    appended with a single space instead of being treated as a new paragraph.
+    The detector handles explicit interruption punctuation first (em dashes,
+    commas), refuses to merge after terminal punctuation or closing brackets,
+    and uses lowercase continuation plus non-terminal word cues for prose.
 
     This preserves intentional paragraph breaks between complete sentences
     while healing broken sentences caused by Word line-wrap artefacts.
@@ -246,6 +411,9 @@ def merge_broken_paragraphs(paragraphs: list[str]) -> list[str]:
     Returns:
         New list with mid-sentence paragraphs merged.
     """
+
+    paragraphs = [_strip_inline_footnotes(paragraph) for paragraph in paragraphs]
+    paragraphs = [paragraph for paragraph in paragraphs if not _is_tts_artifact(paragraph.strip())]
 
     result: list[str] = []
     for para in paragraphs:
