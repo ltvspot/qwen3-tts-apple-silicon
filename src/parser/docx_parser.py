@@ -16,6 +16,8 @@ from docx.oxml.ns import qn
 from docx.opc.exceptions import PackageNotFoundError
 from docx.text.paragraph import Paragraph
 
+from .text_cleaner import merge_broken_paragraphs
+
 logger = logging.getLogger(__name__)
 
 
@@ -1419,7 +1421,8 @@ class DocxParser:
     def _build_chapter(self, heading: dict[str, Any], body_paragraphs: list[str]) -> Chapter | None:
         """Build a chapter object from a heading plus collected body paragraphs."""
 
-        raw_text = "\n\n".join(paragraph for paragraph in body_paragraphs if paragraph).strip()
+        merged_paragraphs = merge_broken_paragraphs([paragraph for paragraph in body_paragraphs if paragraph])
+        raw_text = "\n\n".join(merged_paragraphs).strip()
         if not raw_text:
             logger.warning(
                 "Skipping %s '%s' — heading found but no body text.",
