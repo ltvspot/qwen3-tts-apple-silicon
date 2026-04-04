@@ -213,6 +213,7 @@ _MIN_LOWERCASE_CONTINUATION_WORDS = 5
 _MIN_LOWERCASE_CONTINUATION_PARAGRAPH_CHARS = 50
 _MAX_LOWERCASE_CONTINUATION_WORDS = 80
 _BARE_NUMBER_RE = re.compile(r"^\d{1,3}$")
+_BARE_ROMAN_RE = re.compile(r"^[IVXLCDM]+\.?\s*$")
 _ASTERISK_SEP_RE = re.compile(r"^\*[\s\*]+\*$")
 _ASCII_ART_RE = re.compile(r"^(?=.*[_\-\*/\\|=])[_\-\*/\\|=\s]{3,}$")
 _CURLY_BRACE_FOOTNOTE_RE = re.compile(r"\{\d+\}")
@@ -323,6 +324,8 @@ def _is_tts_artifact(para: str) -> bool:
     if not stripped:
         return True
     if _BARE_NUMBER_RE.match(stripped):
+        return True
+    if _BARE_ROMAN_RE.match(stripped) and len(stripped.rstrip(".").strip()) <= 7:
         return True
     if _ASTERISK_SEP_RE.match(stripped):
         return True

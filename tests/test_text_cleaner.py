@@ -253,6 +253,23 @@ def test_merge_broken_paragraphs_strips_bare_number_artifacts() -> None:
     ]
 
 
+@pytest.mark.parametrize("marker", ["I", "II", "IV", "XIV", "XV", "MMXXV"])
+def test_merge_broken_paragraphs_strips_bare_roman_artifacts(marker: str) -> None:
+    """Standalone uppercase Roman stanza markers should be removed."""
+
+    assert merge_broken_paragraphs([marker, "The snow still drifted through the dark."]) == [
+        "The snow still drifted through the dark."
+    ]
+
+
+def test_merge_broken_paragraphs_strips_bare_roman_artifacts_with_period() -> None:
+    """Standalone Roman markers with trailing punctuation should also be removed."""
+
+    assert merge_broken_paragraphs(["XIV.", "The snow still drifted through the dark."]) == [
+        "The snow still drifted through the dark."
+    ]
+
+
 def test_merge_broken_paragraphs_strips_asterisk_separator_artifacts() -> None:
     """Asterisk-only separator lines should be dropped."""
 
@@ -275,6 +292,18 @@ def test_is_tts_artifact_preserves_numbers_with_words() -> None:
     """Lines with real text after a number should remain."""
 
     assert _is_tts_artifact("12 people") is False
+
+
+def test_is_tts_artifact_preserves_lowercase_roman_lines() -> None:
+    """Only uppercase standalone Roman markers should be stripped."""
+
+    assert _is_tts_artifact("xiv") is False
+
+
+def test_is_tts_artifact_preserves_long_roman_like_strings() -> None:
+    """Length guard should avoid over-matching suspicious all-Roman strings."""
+
+    assert _is_tts_artifact("MMXVIIIX") is False
 
 
 def test_strip_inline_footnotes_removes_curly_markers_and_trailing_dot_star() -> None:
