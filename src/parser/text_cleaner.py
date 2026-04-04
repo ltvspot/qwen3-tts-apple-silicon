@@ -202,9 +202,7 @@ _NON_TERMINAL_WORDS: frozenset[str] = frozenset(
 _EM_DASH_ENDERS: frozenset[str] = frozenset({"—", "–", "─", "−"})
 _TERMINAL_PUNCTUATION: frozenset[str] = frozenset({".", "!", "?", ";", ":"})
 _CLOSING_TERMINATORS: frozenset[str] = frozenset({'"', "'", ")", "]", "}", "”", "’"})
-_SENTENCE_ENDERS: frozenset[str] = frozenset(
-    _TERMINAL_PUNCTUATION | _CLOSING_TERMINATORS | _EM_DASH_ENDERS | {"“", "‘"}
-)
+_SENTENCE_ENDERS: frozenset[str] = frozenset(_TERMINAL_PUNCTUATION | _EM_DASH_ENDERS | {"“", "‘", "…"})
 _ATTRIBUTION_RE = re.compile(r'^[~—–]{1,4}\s*\w|^\*{1,2}[^*]+\*{1,2}$')
 _TRAILING_WORD_RE = re.compile(r"([A-Za-z]+(?:['’][A-Za-z]+)?)\s*$")
 _WORD_RE = re.compile(r"\b[\w]+(?:['’][\w]+)?\b")
@@ -216,6 +214,8 @@ _BARE_NUMBER_RE = re.compile(r"^\d{1,3}$")
 _BARE_ROMAN_RE = re.compile(r"^[IVXLCDM]+\.?\s*$")
 _ASTERISK_SEP_RE = re.compile(r"^\*[\s\*]+\*$")
 _ASCII_ART_RE = re.compile(r"^(?=.*[_\-\*/\\|=])[_\-\*/\\|=\s]{3,}$")
+_EM_DASH_DIV_RE = re.compile(r"^[\u2014\u2013\u2012\s]+$")
+_PUA_RE = re.compile(r"^[\ue000-\uf8ff\s]+$")
 _CURLY_BRACE_FOOTNOTE_RE = re.compile(r"\{\d+\}")
 _TRAILING_DOT_ASTERISK_RE = re.compile(r"(?:\s*\.\*)+\s*$")
 _GLUED_FOOTNOTE_DIGIT_RE = re.compile(
@@ -317,11 +317,32 @@ def _is_attribution(para: str) -> bool:
     return bool(_ATTRIBUTION_RE.match(para.strip()))
 
 
+def _is_terminal(para: str) -> bool:
+    """Return True when a paragraph visibly ends a sentence or closed clause."""
+
+    stripped = para.rstrip()
+    if not stripped:
+        return False
+
+    saw_closer = False
+    while stripped and stripped[-1] in _CLOSING_TERMINATORS:
+        saw_closer = True
+        stripped = stripped[:-1].rstrip()
+
+    if saw_closer:
+        return True
+    if not stripped:
+        return False
+    return stripped[-1] in _SENTENCE_ENDERS
+
+
 def _is_tts_artifact(para: str) -> bool:
     """Return True for structural extraction artifacts that should be dropped before TTS."""
 
     stripped = para.strip()
     if not stripped:
+        return True
+    if _PUA_RE.match(stripped):
         return True
     if _BARE_NUMBER_RE.match(stripped):
         return True
@@ -330,6 +351,8 @@ def _is_tts_artifact(para: str) -> bool:
     if _ASTERISK_SEP_RE.match(stripped):
         return True
     if _ASCII_ART_RE.match(stripped):
+        return True
+    if len(stripped) <= 8 and _EM_DASH_DIV_RE.match(stripped):
         return True
     return False
 
@@ -340,6 +363,7 @@ def _strip_inline_footnotes(text: str) -> str:
     text = _CURLY_BRACE_FOOTNOTE_RE.sub("", text)
     text = _GLUED_FOOTNOTE_DIGIT_RE.sub(r"\1", text)
     text = _TRAILING_DOT_ASTERISK_RE.sub("", text)
+    text = re.sub(r'(?<=[.?!"\'\u201d\u2019])\s*\*{1,2}\s*$', "", text)
     text = re.sub(r"[ \t]{2,}", " ", text)
     return text.strip()
 
@@ -376,7 +400,7 @@ def _is_mid_sentence_break(para: str, next_para: str) -> bool:
         return True
     if last_char == ",":
         return True
-    if stripped_para[-1] in _SENTENCE_ENDERS or last_char in _SENTENCE_ENDERS:
+    if _is_terminal(stripped_para):
         return False
 
     if (
