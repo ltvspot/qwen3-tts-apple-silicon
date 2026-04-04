@@ -56,19 +56,43 @@ class ManuscriptParserFactory:
 
     @staticmethod
     def parse_manuscript(manuscript_folder: str | Path) -> tuple[BookMetadata, list[Chapter], Path]:
-        """Auto-detect the best format in a folder and parse it."""
+        """Auto-detect the best format in a folder and parse it, falling back on read failures."""
 
-        parser, manuscript_path = ManuscriptParserFactory.get_parser(manuscript_folder)
-        if parser is None or manuscript_path is None:
-            folder_name = Path(manuscript_folder).name or str(manuscript_folder)
+        folder = Path(manuscript_folder)
+        folder_name = folder.name or str(manuscript_folder)
+
+        candidates: list[tuple[ManuscriptParser, Path]] = []
+        docx_path = ManuscriptParserFactory._find_docx_file(folder)
+        if docx_path is not None:
+            candidates.append((DocxParser(), docx_path))
+        epub_path = ManuscriptParserFactory._find_epub_file(folder)
+        if epub_path is not None:
+            candidates.append((EPUBParser(), epub_path))
+        pdf_path = ManuscriptParserFactory._find_pdf_file(folder)
+        if pdf_path is not None:
+            candidates.append((PDFParser(), pdf_path))
+
+        if not candidates:
             raise ValueError(f"No supported manuscript format in {folder_name}")
 
-        folder_name = Path(manuscript_folder).name
-        if isinstance(parser, DocxParser):
-            metadata, chapters = parser.parse_with_folder_hint(manuscript_path, folder_name)
-        else:
-            metadata, chapters = parser.parse(manuscript_path)
-        return metadata, chapters, manuscript_path
+        errors: list[str] = []
+        for parser, manuscript_path in candidates:
+            try:
+                if isinstance(parser, DocxParser):
+                    metadata, chapters = parser.parse_with_folder_hint(manuscript_path, folder_name)
+                else:
+                    metadata, chapters = parser.parse(manuscript_path)
+                return metadata, chapters, manuscript_path
+            except ValueError as exc:
+                logger.warning(
+                    "Failed to parse %s with %s: %s",
+                    manuscript_path.name,
+                    parser.__class__.__name__,
+                    exc,
+                )
+                errors.append(f"{manuscript_path.name}: {exc}")
+
+        raise ValueError(f"Unable to parse {folder_name} with any supported format. {' | '.join(errors)}")
 
     @staticmethod
     def _find_docx_file(folder_path: Path) -> Path | None:

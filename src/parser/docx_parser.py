@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import logging
 import re
+from collections import Counter
 from dataclasses import dataclass, replace
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from docx import Document as load_document
 from docx.document import Document as DocxDocument
+from docx.oxml.ns import qn
 from docx.opc.exceptions import PackageNotFoundError
 from docx.text.paragraph import Paragraph
 
@@ -417,21 +420,63 @@ class DocxParser:
             ),
             re.compile(r"^(?P<number>[ivxlcdm]+|\d+)\s*[:.\-]\s*(?P<title>.+)$", re.IGNORECASE),
         )
+        self.book_patterns: tuple[re.Pattern[str], ...] = (
+            re.compile(
+                r"^book\s+(?:the\s+)?(?P<number>[ivxlcdm]+|\d+|[a-z][a-z-]*)(?:\s*[:.\-]?\s*(?P<title>.*))?$",
+                re.IGNORECASE,
+            ),
+            re.compile(
+                r"^(?P<number>first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth"
+                r"|eleventh|twelfth|thirteenth|fourteenth|fifteenth|sixteenth|seventeenth"
+                r"|eighteenth|nineteenth|twentieth)\s+book\b(?:\s*[:.\-–—\s]\s*(?P<title>.*))?$",
+                re.IGNORECASE,
+            ),
+        )
+        self.part_patterns: tuple[re.Pattern[str], ...] = (
+            re.compile(
+                r"^part\s+(?:the\s+)?(?P<number>[ivxlcdm]+|\d+|[a-z][a-z-]*)(?:\s*[:.\-–—]?\s*(?P<title>.*))?$",
+                re.IGNORECASE,
+            ),
+        )
+        self.maxim_patterns: tuple[re.Pattern[str], ...] = (
+            re.compile(
+                r"^maxim\s+(?P<number>[ivxlcdm]+|\d+)\b(?:\s*[:.\-]?\s*(?P<title>.*))?$",
+                re.IGNORECASE,
+            ),
+        )
         self.intro_patterns: tuple[re.Pattern[str], ...] = (
             re.compile(
                 r"^(?P<label>introduction|preface|prologue)\b(?:\s*[:.\-]\s*(?P<title>.*))?$",
                 re.IGNORECASE,
             ),
         )
+        reader_note_patterns: tuple[re.Pattern[str], ...] = (
+            re.compile(r"^preface(?:\s*[—-]\s*|\s+)message to the reader\b", re.IGNORECASE),
+            re.compile(r"^message\s+to\s+the\s+reader\b", re.IGNORECASE),
+            re.compile(r"^(?:a\s+)?note\s+to\s+the\s+reader\b", re.IGNORECASE),
+        )
+        outro_note_patterns: tuple[re.Pattern[str], ...] = (
+            re.compile(r"^outro\b", re.IGNORECASE),
+            re.compile(r"^closing\s+note\b", re.IGNORECASE),
+            re.compile(r"^afterword\b", re.IGNORECASE),
+            re.compile(r"^(?:a\s+word\s+from\s+the\s+author|from\s+the\s+author)\b", re.IGNORECASE),
+            re.compile(r"^author(?:s|\s+s)?\s+note\b", re.IGNORECASE),
+        )
         self.front_matter_patterns: tuple[re.Pattern[str], ...] = (
             re.compile(r"^(copyright|©)\b", re.IGNORECASE),
             re.compile(r"^(table of contents|contents)\b", re.IGNORECASE),
-            re.compile(r"^preface(?:\s*[—-]\s*|\s+)message to the reader\b", re.IGNORECASE),
+            re.compile(r"^(about\s+the\s+author|about\s+this\s+translation|translator.?s\s+note)\b", re.IGNORECASE),
+            re.compile(r"^foreword\b", re.IGNORECASE),
+            *reader_note_patterns,
+            *outro_note_patterns,
         )
         self.back_matter_patterns: tuple[re.Pattern[str], ...] = (
             re.compile(r"^thank(?:s| you)?\s+you\s+for\s+reading\b", re.IGNORECASE),
             re.compile(r"^thank\s+for\s+reading\b", re.IGNORECASE),
             re.compile(r"^epilogue\b", re.IGNORECASE),
+            re.compile(r"^the\s+end(?:\s*[.!?])?\s*$", re.IGNORECASE),
+            *reader_note_patterns,
+            *outro_note_patterns,
         )
         self.author_patterns: tuple[re.Pattern[str], ...] = (
             re.compile(r"^(?:by|written by)\s+(?P<author>.+)$", re.IGNORECASE),
@@ -460,6 +505,26 @@ class DocxParser:
             "eighteen": 18,
             "nineteen": 19,
             "twenty": 20,
+            "first": 1,
+            "second": 2,
+            "third": 3,
+            "fourth": 4,
+            "fifth": 5,
+            "sixth": 6,
+            "seventh": 7,
+            "eighth": 8,
+            "ninth": 9,
+            "tenth": 10,
+            "eleventh": 11,
+            "twelfth": 12,
+            "thirteenth": 13,
+            "fourteenth": 14,
+            "fifteenth": 15,
+            "sixteenth": 16,
+            "seventeenth": 17,
+            "eighteenth": 18,
+            "nineteenth": 19,
+            "twentieth": 20,
         }
         self.last_toc_entries: list[str] = []
 
@@ -491,9 +556,9 @@ class DocxParser:
             raise ValueError(f"Failed to read DOCX file: {path}") from exc
 
         metadata = self._extract_metadata(document)
-        chapters = self._extract_chapters(document)
+        chapters = self._extract_chapters(document, metadata.title, metadata.author)
         if not chapters:
-            chapters = self._fallback_single_chapter(document, path)
+            chapters = self._fallback_single_chapter(document, path, metadata_title=metadata.title)
         if not chapters:
             total_paragraphs = len(document.paragraphs)
             non_empty_paragraphs = sum(1 for paragraph in document.paragraphs if paragraph.text.strip())
@@ -571,11 +636,18 @@ class DocxParser:
 
         return ordered
 
-    def _fallback_single_chapter(self, doc: DocxDocument, path: Path) -> list[Chapter]:
+    def _fallback_single_chapter(
+        self,
+        doc: DocxDocument,
+        path: Path,
+        *,
+        metadata_title: str | None = None,
+    ) -> list[Chapter]:
         """Return a single fallback chapter when no headings are detected."""
 
         del path
         paragraphs = self._collect_paragraphs(doc)
+        running_headers = self._detect_running_headers(paragraphs, metadata_title=metadata_title)
         body_started = False
         collecting_toc = False
         body_paragraphs: list[str] = []
@@ -606,6 +678,15 @@ class DocxParser:
                     continue
                 body_started = True
 
+            if self._is_running_header_paragraph(
+                text,
+                style,
+                running_headers,
+                metadata_title=metadata_title,
+            ):
+                logger.debug("Skipping running header '%s' in fallback chapter", text)
+                continue
+
             body_paragraphs.append(text)
 
         fallback = self._build_chapter(
@@ -633,16 +714,40 @@ class DocxParser:
             original_publisher=original_publisher,
         )
 
-    def _extract_chapters(self, doc: DocxDocument) -> list[Chapter]:
+    def _extract_chapters(
+        self,
+        doc: DocxDocument,
+        metadata_title: str | None = None,
+        metadata_author: str | None = None,
+    ) -> list[Chapter]:
         """Extract narratable introduction and chapter bodies from the document."""
 
         paragraphs = self._collect_paragraphs(doc)
         chapters: list[Chapter] = []
         current_heading: dict[str, Any] | None = None
+        current_heading_style: str | None = None
         current_body: list[str] = []
         narration_started = False
+        real_chapter_started = False
         saw_numbered_chapter = False
         collecting_toc = False
+        skipping_prefatory_section = False
+        next_chapter_number = 1
+        primary_numbered_heading_level = self._detect_primary_numbered_heading_level(paragraphs)
+        has_standalone_chapter_markers = any(
+            self._standalone_chapter_marker_number(paragraph.text, paragraph.style) is not None
+            for paragraph in paragraphs
+        )
+        used_dominant_heading_fallback = False
+        if primary_numbered_heading_level is None and not has_standalone_chapter_markers:
+            primary_numbered_heading_level = self._detect_dominant_heading_level(paragraphs)
+            used_dominant_heading_fallback = primary_numbered_heading_level is not None
+        author_key = self._normalize_text(metadata_author).casefold() if metadata_author else None
+        running_headers = self._detect_running_headers(
+            paragraphs,
+            metadata_title=metadata_title,
+        )
+        pending_standalone_chapter_number: int | None = None
         self.last_toc_entries = []
 
         for paragraph in paragraphs:
@@ -667,49 +772,169 @@ class DocxParser:
                     collecting_toc = False
                     continue
 
-            is_heading, parsed_heading = self._is_chapter_heading(text, style)
-
-            if not narration_started:
-                if self._is_skip_section(text):
-                    logger.debug("Skipping front matter paragraph %s: %s", paragraph.index, text)
+            if current_heading is not None and self._is_running_header_paragraph(
+                text,
+                style,
+                running_headers,
+                metadata_title=metadata_title,
+                current_heading_title=current_heading["title"],
+            ):
+                if (
+                    not current_body
+                    and author_key
+                    and text.casefold() == author_key
+                    and current_heading_style is not None
+                    and self._looks_like_primary_section_style(current_heading_style)
+                ):
+                    pass
+                else:
+                    logger.debug("Skipping running header '%s' in chapter '%s'", text, current_heading["title"])
                     continue
-                if not is_heading or parsed_heading is None:
-                    continue
 
+            standalone_chapter_number = self._standalone_chapter_marker_number(text, style)
+            if standalone_chapter_number is not None:
+                if current_heading is not None:
+                    built = self._build_chapter(current_heading, current_body)
+                    if built is not None:
+                        chapters.append(built)
+                    current_heading = None
+                    current_heading_style = None
+                    current_body = []
+                pending_standalone_chapter_number = standalone_chapter_number
                 narration_started = True
-                current_heading = parsed_heading
-                current_body = []
-                saw_numbered_chapter = parsed_heading["type"] == "chapter"
+                real_chapter_started = True
+                saw_numbered_chapter = True
+                next_chapter_number = max(next_chapter_number, standalone_chapter_number + 1)
                 logger.debug(
-                    "Started narratable section at paragraph %s: %s",
+                    "Captured standalone chapter marker at paragraph %s: Chapter %s",
                     paragraph.index,
-                    parsed_heading["title"],
+                    standalone_chapter_number,
                 )
                 continue
 
+            explicit_heading, parsed_heading = self._is_chapter_heading(
+                text,
+                style,
+                primary_numbered_heading_level=primary_numbered_heading_level,
+            )
+            is_heading = explicit_heading
+            if not is_heading:
+                is_heading, parsed_heading = self._is_implicit_section_heading(
+                    text,
+                    style,
+                    chapter_number=next_chapter_number,
+                    saw_numbered_chapter=saw_numbered_chapter,
+                    primary_numbered_heading_level=primary_numbered_heading_level,
+                    allow_same_level=used_dominant_heading_fallback,
+                    pending_standalone_chapter_number=pending_standalone_chapter_number,
+                )
+            is_skip_section = self._is_skip_section(text)
+            is_back_matter_section = self._is_back_matter_section(text)
+
+            if skipping_prefatory_section:
+                if standalone_chapter_number is not None:
+                    skipping_prefatory_section = False
+                elif is_heading and parsed_heading is not None and not is_skip_section and not is_back_matter_section:
+                    skipping_prefatory_section = False
+                else:
+                    logger.debug(
+                        "Skipping non-narrated prefatory paragraph %s: %s",
+                        paragraph.index,
+                        text,
+                    )
+                    continue
+
+            if not real_chapter_started and is_skip_section:
+                if current_heading is not None:
+                    built = self._build_chapter(current_heading, current_body)
+                    if built is not None:
+                        chapters.append(built)
+                    current_heading = None
+                    current_heading_style = None
+                    current_body = []
+                pending_standalone_chapter_number = None
+                skipping_prefatory_section = True
+                logger.debug("Skipping pre-chapter note section at paragraph %s: %s", paragraph.index, text)
+                continue
+
+            if not narration_started:
+                if is_skip_section:
+                    logger.debug("Skipping front matter paragraph %s: %s", paragraph.index, text)
+                    continue
+                if pending_standalone_chapter_number is not None:
+                    narration_started = True
+                    current_heading = {
+                        "number": pending_standalone_chapter_number,
+                        "title": f"Chapter {pending_standalone_chapter_number}",
+                        "type": "chapter",
+                    }
+                    current_heading_style = style
+                    current_body = []
+                    real_chapter_started = True
+                    pending_standalone_chapter_number = None
+                    logger.debug(
+                        "Started chapter from standalone marker before paragraph %s: %s",
+                        paragraph.index,
+                        current_heading["title"],
+                    )
+                if not narration_started:
+                    if not is_heading or parsed_heading is None:
+                        continue
+
+                    narration_started = True
+                    current_heading = parsed_heading
+                    current_heading_style = style
+                    current_body = []
+                    if parsed_heading["type"] == "chapter":
+                        real_chapter_started = True
+                        if explicit_heading:
+                            saw_numbered_chapter = True
+                        next_chapter_number = max(next_chapter_number, parsed_heading["number"] + 1)
+                    pending_standalone_chapter_number = None
+                    logger.debug(
+                        "Started narratable section at paragraph %s: %s",
+                        paragraph.index,
+                        parsed_heading["title"],
+                    )
+                    continue
+
             if is_heading and parsed_heading is not None:
+                pending_standalone_chapter_number = None
                 if parsed_heading["type"] == "introduction":
-                    current_body.append(text)
+                    if current_heading is None:
+                        current_heading = parsed_heading
+                        current_heading_style = style
+                        current_body = []
+                    else:
+                        current_body.append(text)
                     continue
 
                 if (
                     current_heading is not None
                     and current_heading["type"] == "introduction"
+                    and parsed_heading["type"] != "chapter"
                     and not self._is_explicit_chapter_heading(text)
+                    and not self._looks_like_primary_section_style(style)
                 ):
                     current_body.append(text)
                     continue
 
                 if current_heading is None:
                     current_heading = parsed_heading
+                    current_heading_style = style
                     current_body = []
                 else:
                     built = self._build_chapter(current_heading, current_body)
                     if built is not None:
                         chapters.append(built)
                     current_heading = parsed_heading
+                    current_heading_style = style
                     current_body = []
-                saw_numbered_chapter = True
+                if parsed_heading["type"] == "chapter":
+                    real_chapter_started = True
+                    if explicit_heading:
+                        saw_numbered_chapter = True
+                    next_chapter_number = max(next_chapter_number, parsed_heading["number"] + 1)
                 logger.debug(
                     "Detected chapter %s at paragraph %s",
                     parsed_heading["number"],
@@ -717,15 +942,86 @@ class DocxParser:
                 )
                 continue
 
-            if self._is_back_matter_section(text):
+            if is_back_matter_section:
                 logger.debug("Reached back matter at paragraph %s", paragraph.index)
                 break
 
-            if self._is_skip_section(text):
+            if is_skip_section:
                 logger.debug("Skipping non-narrated paragraph %s after start: %s", paragraph.index, text)
                 continue
 
+            if self._looks_like_chapter_style(style) and self._looks_like_generic_section_divider(text):
+                logger.debug("Skipping generic section divider at paragraph %s: %s", paragraph.index, text)
+                continue
+
+            if pending_standalone_chapter_number is not None and current_heading is None:
+                if (
+                    self._looks_like_chapter_style(style)
+                    and not self._looks_like_generic_section_divider(text)
+                    and not self._looks_like_author_heading_metadata(text)
+                    and not self._looks_like_credit_or_note(text)
+                ):
+                    current_heading = {
+                        "number": pending_standalone_chapter_number,
+                        "title": text,
+                        "type": "chapter",
+                    }
+                    current_heading_style = style
+                    current_body = []
+                    real_chapter_started = True
+                    pending_standalone_chapter_number = None
+                    logger.debug(
+                        "Promoted standalone marker to titled heading before paragraph %s: %s",
+                        paragraph.index,
+                        current_heading["title"],
+                    )
+                    continue
+                current_heading = {
+                    "number": pending_standalone_chapter_number,
+                    "title": f"Chapter {pending_standalone_chapter_number}",
+                    "type": "chapter",
+                }
+                current_heading_style = style
+                current_body = []
+                real_chapter_started = True
+                pending_standalone_chapter_number = None
+                logger.debug(
+                    "Started body-driven chapter from standalone marker before paragraph %s: %s",
+                    paragraph.index,
+                    current_heading["title"],
+                )
+
             if current_heading is not None:
+                if current_heading["type"] == "chapter" and not current_body:
+                    if (
+                        self._is_generic_chapter_title(current_heading["title"])
+                        and self._looks_like_followup_chapter_title(text, allow_long=True)
+                    ):
+                        logger.debug(
+                            "Replacing generic chapter title '%s' with follow-up title at paragraph %s: %s",
+                            current_heading["title"],
+                            paragraph.index,
+                            text,
+                        )
+                        current_heading["title"] = text
+                        continue
+
+                    if (
+                        current_heading_style is not None
+                        and self._looks_like_chapter_style(current_heading_style)
+                        and not self._is_generic_chapter_title(current_heading["title"])
+                        and len(text.split()) >= 2
+                        and self._looks_like_followup_chapter_title(text, allow_long=False)
+                    ):
+                        logger.debug(
+                            "Appending follow-up title fragment to '%s' at paragraph %s: %s",
+                            current_heading["title"],
+                            paragraph.index,
+                            text,
+                        )
+                        current_heading["title"] = f"{current_heading['title']} {text}"
+                        continue
+
                 current_body.append(text)
 
         if current_heading is not None:
@@ -738,13 +1034,112 @@ class DocxParser:
 
         return chapters
 
+    def _detect_running_headers(
+        self,
+        paragraphs: list[_ParagraphInfo],
+        *,
+        metadata_title: str | None = None,
+    ) -> set[str]:
+        """Detect repeated Normal-style phrases that behave like running headers."""
+
+        repeated_normal_phrases: Counter[str] = Counter()
+        normalized_title = self._normalize_text(metadata_title).casefold() if metadata_title else None
+
+        for paragraph in paragraphs:
+            if not paragraph.style or paragraph.style.casefold() != "normal":
+                continue
+            normalized_text = paragraph.text.casefold()
+            word_count = len(paragraph.text.split())
+            if word_count == 0:
+                continue
+            if word_count <= 5:
+                repeated_normal_phrases[normalized_text] += 1
+                continue
+            if normalized_title and (
+                normalized_text == normalized_title
+                or normalized_text.startswith(f"{normalized_title}:")
+                or normalized_text.startswith(f"{normalized_title} ")
+            ):
+                repeated_normal_phrases[normalized_text] += 1
+                continue
+            if ":" in paragraph.text and word_count <= 10:
+                repeated_normal_phrases[normalized_text] += 1
+
+        return {phrase for phrase, count in repeated_normal_phrases.items() if count >= 3}
+
+    def _is_implicit_section_heading(
+        self,
+        text: str,
+        style: str | None,
+        chapter_number: int,
+        *,
+        saw_numbered_chapter: bool,
+        primary_numbered_heading_level: int | None,
+        allow_same_level: bool = False,
+        pending_standalone_chapter_number: int | None = None,
+    ) -> tuple[bool, dict[str, Any] | None]:
+        """Treat level-one heading titles as chapter boundaries when numbering is absent."""
+
+        normalized_text = self._normalize_text(text)
+        if not normalized_text:
+            return False, None
+        heading_level = self._heading_level(style)
+        if heading_level is None:
+            return False, None
+        if primary_numbered_heading_level is None:
+            if not self._looks_like_primary_section_style(style):
+                return False, None
+        else:
+            if heading_level > primary_numbered_heading_level:
+                return False, None
+            if heading_level == 1 and primary_numbered_heading_level > 1:
+                return False, None
+            if allow_same_level and heading_level != primary_numbered_heading_level:
+                return False, None
+            if (
+                heading_level == primary_numbered_heading_level
+                and not allow_same_level
+                and pending_standalone_chapter_number is None
+            ):
+                return False, None
+            if (
+                heading_level < primary_numbered_heading_level
+                and pending_standalone_chapter_number is None
+            ):
+                if saw_numbered_chapter and (
+                    not self._looks_like_primary_section_style(style)
+                    or self._looks_like_generic_section_divider(normalized_text)
+                ):
+                    return False, None
+        if self._is_skip_section(normalized_text) or self._is_back_matter_section(normalized_text):
+            return False, None
+        if self._looks_like_author_heading_metadata(normalized_text):
+            return False, None
+        if self._looks_like_credit_or_note(normalized_text):
+            return False, None
+        if len(normalized_text.split()) > 18:
+            return False, None
+        if re.search(r"[,;:]$", normalized_text):
+            return False, None
+        return True, {
+            "number": pending_standalone_chapter_number or chapter_number,
+            "title": normalized_text,
+            "type": "chapter",
+        }
+
     def _is_explicit_chapter_heading(self, text: str) -> bool:
         """Return whether text is an explicit 'Chapter N' heading."""
 
         normalized_text = self._normalize_text(text)
         return bool(normalized_text and self.chapter_patterns[0].match(normalized_text))
 
-    def _is_chapter_heading(self, text: str, style: str | None) -> tuple[bool, dict[str, Any] | None]:
+    def _is_chapter_heading(
+        self,
+        text: str,
+        style: str | None,
+        *,
+        primary_numbered_heading_level: int | None = None,
+    ) -> tuple[bool, dict[str, Any] | None]:
         """
         Determine whether a paragraph is a chapter or introduction heading.
 
@@ -757,12 +1152,23 @@ class DocxParser:
             return False, None
         if self._is_skip_section(normalized_text):
             return False, None
+        if self._looks_like_author_heading_metadata(normalized_text):
+            return False, None
 
         style_is_heading = self._looks_like_chapter_style(style)
+        heading_level = self._heading_level(style)
+
+        if (
+            primary_numbered_heading_level is not None
+            and heading_level is not None
+            and heading_level > primary_numbered_heading_level
+        ):
+            return False, None
 
         for pattern in self.intro_patterns:
             match = pattern.match(normalized_text)
-            if match and (style_is_heading or normalized_text.lower() in {"introduction", "prologue", "preface"}):
+            intro_label = self._normalize_text(match.group("label")).casefold() if match else ""
+            if match and (style_is_heading or intro_label in {"introduction", "prologue"}):
                 title = self._normalize_text(match.group("label"))
                 return True, {"number": 0, "title": title.title(), "type": "introduction"}
 
@@ -771,6 +1177,8 @@ class DocxParser:
             if not match:
                 continue
 
+            if primary_numbered_heading_level is not None and not style_is_heading:
+                continue
             if pattern is self.chapter_patterns[1] and not style_is_heading:
                 continue
 
@@ -788,6 +1196,23 @@ class DocxParser:
                 "type": "chapter",
             }
 
+        for pattern in self.book_patterns + self.part_patterns + self.maxim_patterns:
+            match = pattern.match(normalized_text)
+            if not match:
+                continue
+            if not style_is_heading:
+                continue
+
+            chapter_number = self._coerce_chapter_number(match.group("number"))
+            if chapter_number is None:
+                continue
+
+            return True, {
+                "number": chapter_number,
+                "title": normalized_text,
+                "type": "chapter",
+            }
+
         return False, None
 
     def _is_skip_section(self, text: str) -> bool:
@@ -801,6 +1226,25 @@ class DocxParser:
 
         return len(re.findall(r"\b[\w']+\b", text))
 
+    def _standalone_chapter_marker_number(self, text: str, style: str | None) -> int | None:
+        """Return the chapter number for a standalone 'Chapter N' marker line."""
+
+        normalized_text = self._normalize_text(text)
+        if not normalized_text:
+            return None
+        if self._looks_like_chapter_style(style):
+            return None
+
+        for pattern in self.chapter_patterns:
+            match = pattern.match(normalized_text)
+            if not match:
+                continue
+            title = self._normalize_text(match.groupdict().get("title", ""))
+            if title:
+                continue
+            return self._coerce_chapter_number(match.group("number"))
+        return None
+
     def _collect_paragraphs(self, doc: DocxDocument, limit: int | None = None) -> list[_ParagraphInfo]:
         """Return normalized paragraph data for the document."""
 
@@ -808,7 +1252,7 @@ class DocxParser:
         source = doc.paragraphs if limit is None else doc.paragraphs[:limit]
 
         for index, paragraph in enumerate(source):
-            text = self._normalize_text(paragraph.text)
+            text = self._normalize_text(self._paragraph_text(paragraph))
             if not text:
                 continue
             collected.append(
@@ -821,6 +1265,68 @@ class DocxParser:
             )
 
         return collected
+
+    def _paragraph_text(self, paragraph: Paragraph) -> str:
+        """Return paragraph text, recovering dropped-cap initials from floating textboxes."""
+
+        text = paragraph.text or ""
+        if not text:
+            return text
+
+        if not any(element.tag == qn("w:drawing") for element in paragraph._p.iter()):
+            return text
+
+        text_nodes = [element.text for element in paragraph._p.iter() if element.tag == qn("w:t") and element.text]
+        if len(text_nodes) < 3:
+            return text
+
+        first = text_nodes[0].strip()
+        second = text_nodes[1].strip()
+        if (
+            len(first) == 1
+            and first.isalpha()
+            and second.casefold() == first.casefold()
+            and not text.startswith(first)
+            and not text.startswith(first.lower())
+        ):
+            if first.upper() in {"A", "I", "O"} and self._drop_cap_prefix_wants_space(first, text):
+                return f"{first} {text}"
+            return first + text
+
+        return text
+
+    @staticmethod
+    @lru_cache(maxsize=1)
+    def _system_dictionary_words() -> frozenset[str]:
+        """Return a best-effort system word list for drop-cap spacing heuristics."""
+
+        dictionary_path = Path("/usr/share/dict/words")
+        if not dictionary_path.exists():
+            return frozenset()
+        try:
+            return frozenset(
+                line.strip().casefold()
+                for line in dictionary_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+                if line.strip()
+            )
+        except OSError:
+            return frozenset()
+
+    def _drop_cap_prefix_wants_space(self, prefix: str, text: str) -> bool:
+        """Return whether a recovered drop-cap letter should stand as its own word."""
+
+        if not text[:1].islower():
+            return False
+
+        first_word_match = re.match(r"[A-Za-z’']+", text)
+        if first_word_match is None:
+            return False
+
+        combined_word = (prefix + first_word_match.group(0)).replace("’", "'").casefold()
+        dictionary_words = self._system_dictionary_words()
+        if not dictionary_words:
+            return False
+        return combined_word not in dictionary_words
 
     def _find_title(self, paragraphs: list[_ParagraphInfo]) -> tuple[int, str]:
         """Find the most likely title paragraph from the front matter."""
@@ -930,6 +1436,83 @@ class DocxParser:
             word_count=self._count_words(raw_text),
         )
 
+    def _is_generic_chapter_title(self, title: str) -> bool:
+        """Return whether a chapter title is still just a synthetic numbered placeholder."""
+
+        normalized_title = self._normalize_text(title)
+        return bool(re.fullmatch(r"(chapter|book)\s+\d+", normalized_title, re.IGNORECASE))
+
+    def _looks_like_followup_chapter_title(self, text: str, *, allow_long: bool) -> bool:
+        """Return whether a body paragraph is actually the chapter's real title."""
+
+        normalized_text = self._normalize_text(text)
+        if not normalized_text:
+            return False
+        if self._is_skip_section(normalized_text) or self._is_back_matter_section(normalized_text):
+            return False
+        if self._looks_like_credit_or_note(normalized_text):
+            return False
+        if self._looks_like_author_heading_metadata(normalized_text):
+            return False
+        if re.match(r"^[\"'“”‘’(\[]", normalized_text):
+            return False
+        if normalized_text.endswith((":", ";")):
+            return False
+
+        words = normalized_text.split()
+        max_words = 32 if allow_long else 5
+        if not 1 <= len(words) <= max_words:
+            return False
+        if len(words) == 1 and re.search(r"[.?!]$", normalized_text):
+            return False
+
+        title_stop_words = {
+            "a",
+            "an",
+            "and",
+            "as",
+            "at",
+            "but",
+            "by",
+            "for",
+            "from",
+            "in",
+            "into",
+            "nor",
+            "of",
+            "on",
+            "or",
+            "the",
+            "to",
+            "with",
+        }
+        title_like_words = 0
+        alpha_words = 0
+        for word in words:
+            for segment in re.split(r"[—–-]+", word):
+                stripped = segment.strip(".,!?;:()[]{}\"'“”‘’—–-")
+                if not stripped:
+                    continue
+                if not any(character.isalpha() for character in stripped):
+                    continue
+                alpha_words += 1
+                if (
+                    stripped.casefold() in title_stop_words
+                    or stripped.isupper()
+                    or re.fullmatch(r"[ivxlcdm]+", stripped, re.IGNORECASE)
+                    or (stripped[:1].isupper() and stripped[1:] == stripped[1:].lower())
+                ):
+                    title_like_words += 1
+
+        if alpha_words == 0:
+            return False
+
+        allowed_non_title_words = 1 if allow_long and alpha_words >= 6 else 0
+        if title_like_words < alpha_words - allowed_non_title_words:
+            return False
+
+        return not re.search(r"\b(?:said|asked|replied|cried|answered|whispered)\b[.?!]?$", normalized_text, re.IGNORECASE)
+
     def _validate_toc(self, chapters: list[Chapter]) -> None:
         """Log TOC mismatches when a table of contents was detected."""
 
@@ -970,6 +1553,60 @@ class DocxParser:
             return False
 
         return all(re.match(r"^[A-Z][A-Za-z'.’-]*$", word.strip(",.;:")) for word in words)
+
+    def _looks_like_author_heading_metadata(self, text: str) -> bool:
+        """Return whether a heading is likely just an author-credit line."""
+
+        normalized_text = self._normalize_text(text).casefold()
+        if not normalized_text or len(normalized_text.split()) > 3:
+            return False
+        return normalized_text in self.KNOWN_AUTHORS
+
+    def _looks_like_generic_section_divider(self, text: str) -> bool:
+        """Return whether a heading is just a structural divider, not narratable content."""
+
+        normalized_text = self._normalize_heading_for_skip_rules(text)
+        return bool(
+            re.match(
+                r"^(part|section|volume)\s+(?:\d+|[ivxlcdm]+|one|two|three|four|five|six|seven|eight|nine|ten)$",
+                normalized_text,
+                re.IGNORECASE,
+            )
+            or normalized_text in {"shang pian", "xia pian", "upper part", "lower part"}
+        )
+
+    def _is_running_header_paragraph(
+        self,
+        text: str,
+        style: str | None,
+        running_headers: set[str],
+        *,
+        metadata_title: str | None = None,
+        current_heading_title: str | None = None,
+    ) -> bool:
+        """Return whether a paragraph line is likely a PDF-conversion running header."""
+
+        if not style or style.casefold() != "normal":
+            return False
+
+        normalized_text = self._normalize_text(text)
+        if normalized_text.casefold() in running_headers:
+            return True
+
+        normalized_title = self._normalize_text(metadata_title).casefold() if metadata_title else ""
+        if normalized_title and (
+            normalized_text.casefold() == normalized_title
+            or normalized_text.casefold().startswith(f"{normalized_title}:")
+            or normalized_text.casefold().startswith(f"{normalized_title} ")
+        ):
+            return True
+
+        if current_heading_title and ":" in normalized_text:
+            _prefix, suffix = normalized_text.split(":", 1)
+            if self._comparison_key(suffix) == self._comparison_key(current_heading_title):
+                return True
+
+        return False
 
     def _looks_like_credit_or_note(self, text: str) -> bool:
         """Return whether a line is clearly metadata but not subtitle content."""
@@ -1024,6 +1661,115 @@ class DocxParser:
             return False
         style_lower = style.lower()
         return style_lower.startswith("heading")
+
+    def _looks_like_primary_section_style(self, style: str | None) -> bool:
+        """Return whether a paragraph style looks like a top-level section heading."""
+
+        if not style:
+            return False
+        return bool(re.match(r"^heading\s*1\b", style, re.IGNORECASE))
+
+    def _heading_level(self, style: str | None) -> int | None:
+        """Return the numeric heading level encoded in a DOCX style name."""
+
+        if not style:
+            return None
+        match = re.match(r"^heading\s*(\d+)\b", style, re.IGNORECASE)
+        if match is None:
+            return None
+        return int(match.group(1))
+
+    def _detect_primary_numbered_heading_level(self, paragraphs: list[_ParagraphInfo]) -> int | None:
+        """Infer the dominant heading level used for numbered narrative sections."""
+
+        numbered_levels: list[int] = []
+        keyword_level_counts: Counter[int] = Counter()
+        first_keyword_index = next(
+            (
+                paragraph.index
+                for paragraph in paragraphs
+                if self._heading_level(paragraph.style) is not None
+                and self._matches_keyword_numbered_section_heading(paragraph.text)
+            ),
+            None,
+        )
+        for paragraph in paragraphs:
+            heading_level = self._heading_level(paragraph.style)
+            if heading_level is None:
+                continue
+            is_keyword_heading = self._matches_keyword_numbered_section_heading(paragraph.text)
+            if (
+                first_keyword_index is not None
+                and paragraph.index < first_keyword_index
+                and not is_keyword_heading
+            ):
+                continue
+            if self._matches_numbered_section_heading(paragraph.text):
+                numbered_levels.append(heading_level)
+                if is_keyword_heading:
+                    keyword_level_counts[heading_level] += 1
+
+        if not numbered_levels:
+            return None
+
+        level_counts = Counter(numbered_levels)
+        repeating_levels = [level for level, count in level_counts.items() if count >= 2]
+        if repeating_levels:
+            return max(
+                repeating_levels,
+                key=lambda level: (level_counts[level], keyword_level_counts[level], level),
+            )
+        return min(numbered_levels)
+
+    def _detect_dominant_heading_level(self, paragraphs: list[_ParagraphInfo]) -> int | None:
+        """
+        Return the most common non-skippable heading level when no numbered headings exist.
+
+        The threshold avoids promoting a small handful of metadata headings into chapters.
+        """
+
+        level_counts: dict[int, int] = {}
+        for paragraph in paragraphs:
+            heading_level = self._heading_level(paragraph.style)
+            if heading_level is None:
+                continue
+            text = self._normalize_text(paragraph.text)
+            if not text or self._is_skip_section(text):
+                continue
+            if self._is_back_matter_section(text):
+                continue
+            level_counts[heading_level] = level_counts.get(heading_level, 0) + 1
+
+        if not level_counts:
+            return None
+
+        max_count = max(level_counts.values())
+        if max_count < 15:
+            return None
+
+        return max(level_counts, key=lambda level: (level_counts[level], level))
+
+    def _matches_numbered_section_heading(self, text: str) -> bool:
+        """Return whether a heading looks like a numbered chapter/book boundary."""
+
+        normalized_text = self._normalize_text(text)
+        if not normalized_text or self._is_skip_section(normalized_text):
+            return False
+        return any(
+            pattern.match(normalized_text)
+            for pattern in self.chapter_patterns + self.book_patterns + self.part_patterns + self.maxim_patterns
+        )
+
+    def _matches_keyword_numbered_section_heading(self, text: str) -> bool:
+        """Return whether text uses an explicit section keyword, not just a bare numeral."""
+
+        normalized_text = self._normalize_text(text)
+        if not normalized_text or self._is_skip_section(normalized_text):
+            return False
+        return any(
+            pattern.match(normalized_text)
+            for pattern in (self.chapter_patterns[0],) + self.book_patterns + self.part_patterns + self.maxim_patterns
+        )
 
     def _paragraph_is_emphasized(self, paragraph: _ParagraphInfo) -> bool:
         """Return whether paragraph formatting makes it a strong title candidate."""

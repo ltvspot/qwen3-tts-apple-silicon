@@ -95,3 +95,24 @@ def test_logging(tmp_path: Path, caplog: LogCaptureFixture) -> None:
     assert isinstance(parser, PDFParser)
     assert manuscript_path == pdf_path
     assert "Using PDF parser" in caplog.text
+
+
+def test_parse_manuscript_falls_back_when_docx_is_invalid(tmp_path: Path) -> None:
+    """A broken preferred DOCX should not block EPUB/PDF fallback parsing."""
+
+    (tmp_path / "book.docx").write_bytes(b"not a real docx")
+    epub_path = tmp_path / "book.epub"
+    create_sample_epub(
+        epub_path,
+        title="The Test Chronicle",
+        subtitle="A Detective Story",
+        author="Jane Doe",
+        sections=default_book_sections(),
+    )
+
+    metadata, chapters, manuscript_path = ManuscriptParserFactory.parse_manuscript(tmp_path)
+
+    assert metadata.title == "The Test Chronicle"
+    assert metadata.author == "Jane Doe"
+    assert manuscript_path == epub_path
+    assert len(chapters) == 3
